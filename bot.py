@@ -43,18 +43,34 @@ def get_sheet_data():
 
     try:
         data = sheet.get_all_values()
-        return pd.DataFrame(data)
+
+        df = pd.DataFrame(data)
+
+        # Ensure column B exists
+        if df.shape[1] < 2:
+            df[1] = ""
+
+        return df
+
     except Exception as e:
+
         print("Sheet read error:", e)
+
         return pd.DataFrame()
 
 
 def update_sheet_cell(row, col, value):
 
     try:
-        sheet.update_cell(row + 1, col + 1, value)
-        print(f"[SHEET UPDATED] row {row+1} col {col+1} -> {value}")
+
+        cell = f"B{row+1}"
+
+        sheet.update(cell, [[str(value)]])
+
+        print(f"[SHEET UPDATED] {cell} -> {value}")
+
     except Exception as e:
+
         print("Sheet update error:", e)
 
 
@@ -338,16 +354,16 @@ def check_ema_and_trade(symbol,row,df):
 
     tp_value=None
 
-    if len(df.columns)>1:
+    tp_raw=df.iloc[row,1]
 
-        tp_value=df.iloc[row,1]
+    if str(tp_raw).strip()!="":
 
-        if str(tp_value).upper()=="TP COMPLETED":
+        if str(tp_raw).upper()=="TP COMPLETED":
             return
 
         try:
 
-            tp_value=float(tp_value)
+            tp_value=float(tp_raw)
 
             if current_price<=tp_value:
 
@@ -371,7 +387,7 @@ def check_ema_and_trade(symbol,row,df):
 
         if pos.get("pair")==pair:
 
-            if not tp_value:
+            if tp_value is None:
 
                 tp=get_position_tp(symbol)
 
@@ -389,6 +405,8 @@ def check_ema_and_trade(symbol,row,df):
     if current_price<ema:
 
         tp=place_order("sell",symbol,current_price,ema)
+
+        print("Writing TP to sheet:",tp)
 
         update_sheet_cell(row,1,tp)
 

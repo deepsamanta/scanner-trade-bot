@@ -11,4 +11,4 @@ LEVERAGE = os.getenv("LEVERAGE", "6")
 
 # Safety check
 if not COINDCX_KEY or not COINDCX_SECRET:
-    raise ValueError("API keys missing. Please provide COINDCX_KEY and COINDCX_SECRET.")
+    raise ValueError("API keys missing. Please provide COINDCX_KEY and COINDCX_SECRET. lol")
