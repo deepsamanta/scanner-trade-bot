@@ -12,7 +12,6 @@ from google.oauth2.service_account import Credentials
 from config import COINDCX_KEY, COINDCX_SECRET, CAPITAL_USDT, LEVERAGE, SHEET_ID
 
 getcontext().prec = 28
-
 BASE_URL = "https://api.coindcx.com"
 
 
@@ -31,12 +30,11 @@ scopes=scope
 )
 
 client = gspread.authorize(creds)
-
 sheet = client.open_by_key(SHEET_ID).sheet1
 
 
 # =====================================================
-# READ SHEET DATA
+# READ SHEET
 # =====================================================
 
 def get_sheet_data():
@@ -44,54 +42,31 @@ def get_sheet_data():
     try:
 
         data = sheet.get_all_values()
-
         df = pd.DataFrame(data)
 
         if df.shape[1] < 2:
             df[1] = ""
 
-        if df.shape[1] < 3:
-            df[2] = ""
-
         return df
 
-    except Exception:
-
+    except:
         return pd.DataFrame()
 
 
 # =====================================================
-# UPDATE TP IN SHEET
+# UPDATE TP COLUMN
 # =====================================================
 
-def update_sheet_tp(row, value):
+def update_sheet_tp(row,value):
 
     try:
 
         sheet.update(f"B{row+1}", [[str(value)]])
-
-        print(f"[SHEET] TP updated row {row+1} -> {value}")
-
-    except Exception as e:
-
-        print("Sheet update error:", e)
-
-
-# =====================================================
-# UPDATE PRICE IN SHEET
-# =====================================================
-
-def update_sheet_price(row, price):
-
-    try:
-
-        sheet.update(f"C{row+1}", [[str(price)]])
-
-        print(f"[SHEET] Price updated row {row+1} -> {price}")
+        print(f"[SHEET] Row {row+1} -> {value}")
 
     except Exception as e:
 
-        print("Sheet price update error:", e)
+        print("Sheet update error:",e)
 
 
 # =====================================================
@@ -99,9 +74,6 @@ def update_sheet_price(row, price):
 # =====================================================
 
 def normalize_symbol(symbol):
-
-    if not symbol:
-        return None
 
     symbol = str(symbol).upper().strip()
 
@@ -117,12 +89,12 @@ def fut_pair(symbol):
 
 
 # =====================================================
-# SIGN COINDCX REQUEST
+# SIGN REQUEST
 # =====================================================
 
 def sign_request(body):
 
-    payload = json.dumps(body, separators=(",", ":"))
+    payload = json.dumps(body,separators=(",",":"))
 
     signature = hmac.new(
         COINDCX_SECRET.encode(),
@@ -131,12 +103,12 @@ def sign_request(body):
     ).hexdigest()
 
     headers = {
-        "Content-Type": "application/json",
-        "X-AUTH-APIKEY": COINDCX_KEY,
-        "X-AUTH-SIGNATURE": signature
+    "Content-Type":"application/json",
+    "X-AUTH-APIKEY":COINDCX_KEY,
+    "X-AUTH-SIGNATURE":signature
     }
 
-    return payload, headers
+    return payload,headers
 
 
 # =====================================================
@@ -148,13 +120,13 @@ def get_open_positions():
     try:
 
         body = {
-        "timestamp": int(time.time()*1000),
+        "timestamp":int(time.time()*1000),
         "page":"1",
         "size":"50",
         "margin_currency_short_name":["USDT"]
         }
 
-        payload, headers = sign_request(body)
+        payload,headers = sign_request(body)
 
         url = BASE_URL + "/exchange/v1/derivatives/futures/positions"
 
@@ -167,13 +139,12 @@ def get_open_positions():
         if float(pos.get("active_pos",0)) != 0
         ]
 
-    except Exception:
-
+    except:
         return []
 
 
 # =====================================================
-# GET TP FROM ACTIVE POSITION
+# GET TP FROM POSITION
 # =====================================================
 
 def get_position_tp(symbol):
@@ -195,13 +166,12 @@ def get_position_tp(symbol):
 
         return None
 
-    except Exception:
-
+    except:
         return None
 
 
 # =====================================================
-# GET QUANTITY STEP
+# GET QTY STEP
 # =====================================================
 
 def get_quantity_step(symbol):
@@ -219,18 +189,16 @@ def get_quantity_step(symbol):
         instrument=data["instrument"]
 
         quantity_increment=Decimal(str(instrument["quantity_increment"]))
-
         min_quantity=Decimal(str(instrument["min_quantity"]))
 
         return max(quantity_increment,min_quantity)
 
     except:
-
         return Decimal("1")
 
 
 # =====================================================
-# COMPUTE ORDER QUANTITY
+# COMPUTE QTY
 # =====================================================
 
 def compute_qty(entry_price,symbol):
@@ -240,7 +208,6 @@ def compute_qty(entry_price,symbol):
     step=get_quantity_step(symbol)
 
     capital=Decimal(str(CAPITAL_USDT))
-
     leverage=Decimal(str(LEVERAGE))
 
     exposure=capital*leverage
@@ -267,27 +234,17 @@ def place_order(side,symbol,entry_price,ema):
 
     qty=compute_qty(entry_price,symbol)
 
-    price_str=str(entry_price)
-
-    precision=len(price_str.split(".")[1]) if "." in price_str else 0
+    precision=len(str(entry_price).split(".")[1]) if "." in str(entry_price) else 0
 
     entry=round(entry_price,precision)
 
-    if side=="buy":
-
-        tp=entry*1.04
-        sl=entry*0.95
-
-    else:
-
-        tp=entry*0.96
-        sl=ema*1.001
+    tp=entry*0.93
+    sl=ema*1.001
 
     tp=round(tp,precision)
     sl=round(sl,precision)
 
-    print(f"[ORDER] {symbol} SELL SIGNAL")
-    print(f"[ORDER] Entry {entry} | TP {tp} | SL {sl}")
+    print(f"[ORDER] {symbol} SELL | Entry {entry} | TP {tp} | SL {sl}")
 
     body={
     "timestamp":int(time.time()*1000),
@@ -298,7 +255,7 @@ def place_order(side,symbol,entry_price,ema):
     "price":entry,
     "total_quantity":qty,
     "leverage":LEVERAGE,
-    "take_profit_trigger":tp,
+    "take_profit_price":tp,
     "stop_loss_price":sl,
     "position_margin_type":"crossed"
     }
@@ -323,7 +280,7 @@ def place_order(side,symbol,entry_price,ema):
 
 
 # =====================================================
-# EMA CHECK AND TRADING LOGIC
+# EMA CHECK
 # =====================================================
 
 def check_ema_and_trade(symbol,row,df):
@@ -367,16 +324,17 @@ def check_ema_and_trade(symbol,row,df):
     current_price=closes[-1]
 
     precision=len(str(current_price).split(".")[1]) if "." in str(current_price) else 0
-
     ema=round(ema,precision)
 
     print(f"[CHECK] {symbol} | Price {current_price} | EMA {ema}")
 
     tp_raw=df.iloc[row,1]
 
+    # Skip if TP completed
     if str(tp_raw).upper()=="TP COMPLETED":
         return
 
+    # TP hit check
     try:
 
         tp=float(tp_raw)
@@ -384,17 +342,15 @@ def check_ema_and_trade(symbol,row,df):
         if current_price<=tp:
 
             print(f"[TP HIT] {symbol}")
-
             update_sheet_tp(row,"TP COMPLETED")
-
             return
 
     except:
         tp=None
 
 
+    # Active position check
     positions=get_open_positions()
-
     pair=fut_pair(symbol)
 
     for pos in positions:
@@ -402,8 +358,6 @@ def check_ema_and_trade(symbol,row,df):
         if pos.get("pair")==pair:
 
             print(f"[ACTIVE] {symbol}")
-
-            update_sheet_price(row,current_price)
 
             if not tp:
 
@@ -415,6 +369,7 @@ def check_ema_and_trade(symbol,row,df):
             return
 
 
+    # New trade signal
     if current_price<ema:
 
         print(f"[SIGNAL] SELL {symbol}")
@@ -426,7 +381,7 @@ def check_ema_and_trade(symbol,row,df):
 
 
 # =====================================================
-# MAIN BOT LOOP
+# MAIN LOOP
 # =====================================================
 
 while True:
@@ -448,9 +403,6 @@ while True:
 
             symbol=normalize_symbol(pair)
 
-            if not symbol:
-                continue
-
             check_ema_and_trade(symbol,row,df)
 
         time.sleep(30)
@@ -458,5 +410,4 @@ while True:
     except Exception as e:
 
         print("BOT ERROR:",e)
-
         time.sleep(30)
