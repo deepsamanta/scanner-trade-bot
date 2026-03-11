@@ -42,11 +42,13 @@ sheet = client.open_by_key(SHEET_ID).sheet1
 def get_sheet_data():
 
     try:
+
         data = sheet.get_all_values()
+
+        print("[DEBUG] Sheet data:", data)
 
         df = pd.DataFrame(data)
 
-        # Ensure column B exists
         if df.shape[1] < 2:
             df[1] = ""
 
@@ -54,7 +56,7 @@ def get_sheet_data():
 
     except Exception as e:
 
-        print("Sheet read error:", e)
+        print("[ERROR] Sheet read error:", e)
 
         return pd.DataFrame()
 
@@ -63,18 +65,20 @@ def update_sheet_tp(symbol, value):
 
     try:
 
-        # find the row where the symbol exists in column A
-        cell = sheet.find(symbol)
+        print(f"[DEBUG] Writing TP for {symbol} -> {value}")
 
-        row_number = cell.row
+        cell = sheet.find(symbol, in_column=1)
 
-        sheet.update(f"B{row_number}", [[str(value)]])
+        row = cell.row
 
-        print(f"[SHEET UPDATED] {symbol} -> B{row_number} = {value}")
+        sheet.update(f"B{row}", [[str(value)]])
+
+        print(f"[SUCCESS] Updated sheet B{row} -> {value}")
 
     except Exception as e:
 
-        print("Sheet update error:", e)
+        print("[ERROR] Sheet update error:", e)
+
 
 # =====================================================
 # SYMBOL HELPERS
@@ -144,6 +148,8 @@ def get_open_positions():
 
         positions = response.json()
 
+        print("[DEBUG] Open positions:", positions)
+
         return [
         pos for pos in positions
         if float(pos.get("active_pos",0)) != 0
@@ -151,7 +157,7 @@ def get_open_positions():
 
     except Exception as e:
 
-        print("Position fetch error:",e)
+        print("[ERROR] Position fetch error:",e)
 
         return []
 
@@ -174,6 +180,8 @@ def get_position_tp(symbol):
 
                 tp = pos.get("take_profit_price")
 
+                print(f"[DEBUG] Found TP for {symbol} -> {tp}")
+
                 if tp:
                     return float(tp)
 
@@ -181,7 +189,7 @@ def get_position_tp(symbol):
 
     except Exception as e:
 
-        print("TP fetch error:",e)
+        print("[ERROR] TP fetch error:",e)
 
         return None
 
@@ -287,6 +295,8 @@ def place_order(side,symbol,entry_price,ema):
     }
     }
 
+    print("[DEBUG] Order payload:", body)
+
     payload,headers=sign_request(body)
 
     response=requests.post(
@@ -350,36 +360,30 @@ def check_ema_and_trade(symbol,row,df):
 
     ema=round(ema,precision)
 
-    print(symbol,"PRICE:",current_price,"EMA:",ema)
-
-    # ================= TP CHECK =================
-
-    tp_value=None
+    print(f"[DEBUG] {symbol} PRICE {current_price} EMA {ema}")
 
     tp_raw=df.iloc[row,1]
 
-    if str(tp_raw).strip()!="":
+    print(f"[DEBUG] Sheet TP value for {symbol}: '{tp_raw}'")
 
-        if str(tp_raw).upper()=="TP COMPLETED":
+    if str(tp_raw).upper()=="TP COMPLETED":
+        return
+
+    try:
+
+        tp=float(tp_raw)
+
+        if current_price<=tp:
+
+            print(f"[DEBUG] TP HIT for {symbol}")
+
+            update_sheet_tp(symbol,"TP COMPLETED")
+
             return
 
-        try:
+    except:
+        tp=None
 
-            tp_value=float(tp_raw)
-
-            if current_price<=tp_value:
-
-                print(symbol,"TP HIT")
-
-                update_sheet_tp(symbol, "TP COMPLETED")
-
-                return
-
-        except:
-            tp_value=None
-
-
-    # ================= ACTIVE POSITION CHECK =================
 
     positions=get_open_positions()
 
@@ -389,28 +393,28 @@ def check_ema_and_trade(symbol,row,df):
 
         if pos.get("pair")==pair:
 
-            if tp_value is None:
+            print(f"[DEBUG] Active position found for {symbol}")
+
+            if not tp:
 
                 tp=get_position_tp(symbol)
 
                 if tp:
 
-                    print(symbol,"Active trade found filling TP")
+                    print(f"[DEBUG] Filling TP in sheet {tp}")
 
-                    update_sheet_tp(symbol, tp)
+                    update_sheet_tp(symbol,tp)
 
             return
 
 
-    # ================= SIGNAL =================
-
     if current_price<ema:
+
+        print(f"[DEBUG] SELL SIGNAL {symbol}")
 
         tp=place_order("sell",symbol,current_price,ema)
 
-        print("Writing TP to sheet:",tp)
-
-        update_sheet_tp(symbol, tp)
+        update_sheet_tp(symbol,tp)
 
 
 # =====================================================
@@ -447,6 +451,6 @@ while True:
 
     except Exception as e:
 
-        print("BOT ERROR:",e)
+        print("[ERROR] BOT ERROR:",e)
 
         time.sleep(30)
