@@ -283,7 +283,6 @@ def place_order(side,symbol,entry_price,ema):
 # EMA CHECK
 # =====================================================
 
-
 def check_ema_and_trade(symbol,row,df):
 
     pair_api=fut_pair(symbol)
@@ -354,8 +353,26 @@ def check_ema_and_trade(symbol,row,df):
 
             return
 
-        # TP exists but not hit -> do nothing
+        # TP exists but not hit
         print(f"[TRACKING] {symbol} TP {tp}")
+
+        # Check active position and reverify TP
+        positions=get_open_positions()
+        pair=fut_pair(symbol)
+
+        for pos in positions:
+
+            if pos.get("pair")==pair:
+
+                exchange_tp=get_position_tp(symbol)
+
+                if exchange_tp and float(exchange_tp)!=float(tp):
+
+                    print(f"[TP UPDATE] {symbol} Sheet TP {tp} -> Exchange TP {exchange_tp}")
+
+                    update_sheet_tp(row,exchange_tp)
+
+                return
 
         return
 
@@ -364,7 +381,7 @@ def check_ema_and_trade(symbol,row,df):
 
 
     # -----------------------------------------
-    # 3. Check active positions
+    # 3. Check active positions (sheet TP empty)
     # -----------------------------------------
 
     positions=get_open_positions()
