@@ -283,6 +283,7 @@ def place_order(side,symbol,entry_price,ema):
 # EMA CHECK
 # =====================================================
 
+
 def check_ema_and_trade(symbol,row,df):
 
     pair_api=fut_pair(symbol)
@@ -300,7 +301,6 @@ def check_ema_and_trade(symbol,row,df):
     }
 
     response=requests.get(url,params=params)
-
     result=response.json()
 
     if result.get("s")!="ok":
@@ -330,11 +330,18 @@ def check_ema_and_trade(symbol,row,df):
 
     tp_raw=df.iloc[row,1]
 
-    # Skip if TP completed
+    # -----------------------------------------
+    # 1. Skip coin if TP already completed
+    # -----------------------------------------
+
     if str(tp_raw).upper()=="TP COMPLETED":
+        print(f"[SKIP] {symbol} TP already completed")
         return
 
-    # TP hit check
+    # -----------------------------------------
+    # 2. If TP exists -> check TP hit first
+    # -----------------------------------------
+
     try:
 
         tp=float(tp_raw)
@@ -342,14 +349,24 @@ def check_ema_and_trade(symbol,row,df):
         if current_price<=tp:
 
             print(f"[TP HIT] {symbol}")
+
             update_sheet_tp(row,"TP COMPLETED")
+
             return
+
+        # TP exists but not hit -> do nothing
+        print(f"[TRACKING] {symbol} TP {tp}")
+
+        return
 
     except:
         tp=None
 
 
-    # Active position check
+    # -----------------------------------------
+    # 3. Check active positions
+    # -----------------------------------------
+
     positions=get_open_positions()
     pair=fut_pair(symbol)
 
@@ -359,17 +376,18 @@ def check_ema_and_trade(symbol,row,df):
 
             print(f"[ACTIVE] {symbol}")
 
-            if not tp:
+            tp=get_position_tp(symbol)
 
-                tp=get_position_tp(symbol)
-
-                if tp:
-                    update_sheet_tp(row,tp)
+            if tp:
+                update_sheet_tp(row,tp)
 
             return
 
 
-    # New trade signal
+    # -----------------------------------------
+    # 4. Only now check new trade signal
+    # -----------------------------------------
+
     if current_price<ema:
 
         print(f"[SIGNAL] SELL {symbol}")
@@ -378,7 +396,7 @@ def check_ema_and_trade(symbol,row,df):
 
         if tp:
             update_sheet_tp(row,tp)
-
+            
 
 # =====================================================
 # MAIN LOOP
