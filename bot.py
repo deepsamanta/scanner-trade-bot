@@ -341,6 +341,7 @@ def check_ema_and_trade(symbol,row,df):
     # 2. If TP exists -> check TP hit first
     # -----------------------------------------
 
+
     try:
 
         tp=float(tp_raw)
@@ -353,16 +354,20 @@ def check_ema_and_trade(symbol,row,df):
 
             return
 
-        # TP exists but not hit
+
         print(f"[TRACKING] {symbol} TP {tp}")
 
-        # Check active position and reverify TP
+
         positions=get_open_positions()
         pair=fut_pair(symbol)
+
+        active=False
 
         for pos in positions:
 
             if pos.get("pair")==pair:
+
+                active=True
 
                 exchange_tp=get_position_tp(symbol)
 
@@ -374,7 +379,25 @@ def check_ema_and_trade(symbol,row,df):
 
                 return
 
-        return
+        # -----------------------------------------
+        # NEW LOGIC: No active position
+        # -----------------------------------------
+
+        if not active:
+
+            print(f"[INFO] No active position for {symbol}")
+
+            # possible SL happened
+            if current_price<ema:
+
+                print(f"[RE-ENTRY] SELL {symbol}")
+
+                tp=place_order("sell",symbol,current_price,ema)
+
+                if tp:
+                    update_sheet_tp(row,tp)
+
+            return
 
     except:
         tp=None
@@ -413,7 +436,7 @@ def check_ema_and_trade(symbol,row,df):
 
         if tp:
             update_sheet_tp(row,tp)
-            
+
 
 # =====================================================
 # MAIN LOOP
@@ -445,4 +468,4 @@ while True:
     except Exception as e:
 
         print("BOT ERROR:",e)
-        time.sleep(30)
+        time.sleep(60)
