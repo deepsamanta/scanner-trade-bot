@@ -36,7 +36,7 @@ sheet = client.open_by_key(SHEET_ID).sheet1
 
 
 # =====================================================
-# SHEET FUNCTIONS
+# READ SHEET DATA
 # =====================================================
 
 def get_sheet_data():
@@ -45,27 +45,26 @@ def get_sheet_data():
 
         data = sheet.get_all_values()
 
-        print("[DEBUG] Sheet data:", data)
-
         df = pd.DataFrame(data)
 
+        # Ensure TP column exists
         if df.shape[1] < 2:
             df[1] = ""
 
         return df
 
-    except Exception as e:
-
-        print("[ERROR] Sheet read error:", e)
+    except Exception:
 
         return pd.DataFrame()
 
 
+# =====================================================
+# UPDATE TP IN SHEET
+# =====================================================
+
 def update_sheet_tp(symbol, value):
 
     try:
-
-        print(f"[DEBUG] Writing TP for {symbol} -> {value}")
 
         cell = sheet.find(symbol, in_column=1)
 
@@ -73,11 +72,9 @@ def update_sheet_tp(symbol, value):
 
         sheet.update(f"B{row}", [[str(value)]])
 
-        print(f"[SUCCESS] Updated sheet B{row} -> {value}")
-
     except Exception as e:
 
-        print("[ERROR] Sheet update error:", e)
+        print("Sheet update error:", e)
 
 
 # =====================================================
@@ -103,7 +100,7 @@ def fut_pair(symbol):
 
 
 # =====================================================
-# SIGN REQUEST
+# SIGN COINDCX REQUEST
 # =====================================================
 
 def sign_request(body):
@@ -148,22 +145,18 @@ def get_open_positions():
 
         positions = response.json()
 
-        print("[DEBUG] Open positions:", positions)
-
         return [
         pos for pos in positions
         if float(pos.get("active_pos",0)) != 0
         ]
 
-    except Exception as e:
-
-        print("[ERROR] Position fetch error:",e)
+    except Exception:
 
         return []
 
 
 # =====================================================
-# GET POSITION TP
+# GET TP FROM ACTIVE POSITION
 # =====================================================
 
 def get_position_tp(symbol):
@@ -178,24 +171,20 @@ def get_position_tp(symbol):
 
             if pos.get("pair") == pair:
 
-                tp = pos.get("take_profit_price")
-
-                print(f"[DEBUG] Found TP for {symbol} -> {tp}")
+                tp = pos.get("take_profit_trigger")
 
                 if tp:
                     return float(tp)
 
         return None
 
-    except Exception as e:
-
-        print("[ERROR] TP fetch error:",e)
+    except Exception:
 
         return None
 
 
 # =====================================================
-# QUANTITY STEP
+# GET QUANTITY STEP
 # =====================================================
 
 def get_quantity_step(symbol):
@@ -224,7 +213,7 @@ def get_quantity_step(symbol):
 
 
 # =====================================================
-# COMPUTE QTY
+# COMPUTE ORDER QUANTITY
 # =====================================================
 
 def compute_qty(entry_price,symbol):
@@ -289,13 +278,11 @@ def place_order(side,symbol,entry_price,ema):
     "price":entry,
     "total_quantity":qty,
     "leverage":LEVERAGE,
-    "take_profit_price":tp,
+    "take_profit_trigger":tp,
     "stop_loss_price":sl,
     "position_margin_type":"crossed"
     }
     }
-
-    print("[DEBUG] Order payload:", body)
 
     payload,headers=sign_request(body)
 
@@ -305,13 +292,19 @@ def place_order(side,symbol,entry_price,ema):
     headers=headers
     )
 
-    print("[ORDER RESPONSE]",response.text)
+    result=response.json()
+
+    # Extract TP from response
+    try:
+        tp=result["order"]["take_profit_trigger"]
+    except:
+        tp=None
 
     return tp
 
 
 # =====================================================
-# EMA CHECK
+# EMA CHECK AND TRADING LOGIC
 # =====================================================
 
 def check_ema_and_trade(symbol,row,df):
@@ -345,13 +338,11 @@ def check_ema_and_trade(symbol,row,df):
         return
 
     period=200
-
     multiplier=2/(period+1)
 
     ema=sum(closes[:period])/period
 
     for price in closes[period:]:
-
         ema=(price-ema)*multiplier+ema
 
     current_price=closes[-1]
@@ -360,11 +351,7 @@ def check_ema_and_trade(symbol,row,df):
 
     ema=round(ema,precision)
 
-    print(f"[DEBUG] {symbol} PRICE {current_price} EMA {ema}")
-
     tp_raw=df.iloc[row,1]
-
-    print(f"[DEBUG] Sheet TP value for {symbol}: '{tp_raw}'")
 
     if str(tp_raw).upper()=="TP COMPLETED":
         return
@@ -374,8 +361,6 @@ def check_ema_and_trade(symbol,row,df):
         tp=float(tp_raw)
 
         if current_price<=tp:
-
-            print(f"[DEBUG] TP HIT for {symbol}")
 
             update_sheet_tp(symbol,"TP COMPLETED")
 
@@ -393,16 +378,11 @@ def check_ema_and_trade(symbol,row,df):
 
         if pos.get("pair")==pair:
 
-            print(f"[DEBUG] Active position found for {symbol}")
-
             if not tp:
 
                 tp=get_position_tp(symbol)
 
                 if tp:
-
-                    print(f"[DEBUG] Filling TP in sheet {tp}")
-
                     update_sheet_tp(symbol,tp)
 
             return
@@ -410,15 +390,14 @@ def check_ema_and_trade(symbol,row,df):
 
     if current_price<ema:
 
-        print(f"[DEBUG] SELL SIGNAL {symbol}")
-
         tp=place_order("sell",symbol,current_price,ema)
 
-        update_sheet_tp(symbol,tp)
+        if tp:
+            update_sheet_tp(symbol,tp)
 
 
 # =====================================================
-# MAIN LOOP
+# MAIN BOT LOOP
 # =====================================================
 
 while True:
@@ -428,9 +407,7 @@ while True:
         df=get_sheet_data()
 
         if df.empty:
-
             time.sleep(30)
-
             continue
 
         for row in range(len(df)):
@@ -451,6 +428,6 @@ while True:
 
     except Exception as e:
 
-        print("[ERROR] BOT ERROR:",e)
+        print("BOT ERROR:",e)
 
         time.sleep(30)
