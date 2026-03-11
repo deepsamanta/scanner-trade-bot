@@ -47,7 +47,6 @@ def get_sheet_data():
 
         df = pd.DataFrame(data)
 
-        # Ensure TP column exists
         if df.shape[1] < 2:
             df[1] = ""
 
@@ -71,6 +70,8 @@ def update_sheet_tp(symbol, value):
         row = cell.row
 
         sheet.update(f"B{row}", [[str(value)]])
+
+        print(f"[SHEET] {symbol} -> TP updated to {value}")
 
     except Exception as e:
 
@@ -269,6 +270,9 @@ def place_order(side,symbol,entry_price,ema):
     tp=round(tp,precision)
     sl=round(sl,precision)
 
+    print(f"[ORDER] {symbol} SELL SIGNAL")
+    print(f"[ORDER] Entry: {entry} | TP: {tp} | SL: {sl}")
+
     body={
     "timestamp":int(time.time()*1000),
     "order":{
@@ -294,7 +298,6 @@ def place_order(side,symbol,entry_price,ema):
 
     result=response.json()
 
-    # Extract TP from response
     try:
         tp=result["order"]["take_profit_trigger"]
     except:
@@ -351,6 +354,8 @@ def check_ema_and_trade(symbol,row,df):
 
     ema=round(ema,precision)
 
+    print(f"[CHECK] {symbol} | Price: {current_price} | EMA200: {ema}")
+
     tp_raw=df.iloc[row,1]
 
     if str(tp_raw).upper()=="TP COMPLETED":
@@ -361,6 +366,8 @@ def check_ema_and_trade(symbol,row,df):
         tp=float(tp_raw)
 
         if current_price<=tp:
+
+            print(f"[TP] {symbol} TAKE PROFIT HIT")
 
             update_sheet_tp(symbol,"TP COMPLETED")
 
@@ -378,6 +385,8 @@ def check_ema_and_trade(symbol,row,df):
 
         if pos.get("pair")==pair:
 
+            print(f"[INFO] Active position found for {symbol}")
+
             if not tp:
 
                 tp=get_position_tp(symbol)
@@ -389,6 +398,8 @@ def check_ema_and_trade(symbol,row,df):
 
 
     if current_price<ema:
+
+        print(f"[SIGNAL] SELL SIGNAL FOUND -> {symbol}")
 
         tp=place_order("sell",symbol,current_price,ema)
 
