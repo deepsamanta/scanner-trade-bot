@@ -405,7 +405,7 @@ while True:
 
             check_ema_and_trade(symbol,row,df)
 
-        time.sleep(30)
+        time.sleep(300)
 
     except Exception as e:
 
