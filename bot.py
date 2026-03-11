@@ -59,20 +59,22 @@ def get_sheet_data():
         return pd.DataFrame()
 
 
-def update_sheet_cell(row, col, value):
+def update_sheet_tp(symbol, value):
 
     try:
 
-        cell = f"B{row+1}"
+        # find the row where the symbol exists in column A
+        cell = sheet.find(symbol)
 
-        sheet.update(cell, [[str(value)]])
+        row_number = cell.row
 
-        print(f"[SHEET UPDATED] {cell} -> {value}")
+        sheet.update(f"B{row_number}", [[str(value)]])
+
+        print(f"[SHEET UPDATED] {symbol} -> B{row_number} = {value}")
 
     except Exception as e:
 
         print("Sheet update error:", e)
-
 
 # =====================================================
 # SYMBOL HELPERS
@@ -369,7 +371,7 @@ def check_ema_and_trade(symbol,row,df):
 
                 print(symbol,"TP HIT")
 
-                update_sheet_cell(row,1,"TP COMPLETED")
+                update_sheet_tp(symbol, "TP COMPLETED")
 
                 return
 
@@ -395,7 +397,7 @@ def check_ema_and_trade(symbol,row,df):
 
                     print(symbol,"Active trade found filling TP")
 
-                    update_sheet_cell(row,1,tp)
+                    update_sheet_tp(symbol, tp)
 
             return
 
@@ -408,7 +410,7 @@ def check_ema_and_trade(symbol,row,df):
 
         print("Writing TP to sheet:",tp)
 
-        update_sheet_cell(row,1,tp)
+        update_sheet_tp(symbol, tp)
 
 
 # =====================================================
