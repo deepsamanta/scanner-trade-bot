@@ -283,7 +283,7 @@ def place_order(side,symbol,entry_price,ema):
 # EMA CHECK
 # =====================================================
 
-def check_ema_and_trade(symbol,row,df):
+def check_ema_and_trade(symbol,row,df,allow_trade):
 
     pair_api=fut_pair(symbol)
 
@@ -329,17 +329,9 @@ def check_ema_and_trade(symbol,row,df):
 
     tp_raw=df.iloc[row,1]
 
-    # -----------------------------------------
-    # 1. Skip coin if TP already completed
-    # -----------------------------------------
-
     if str(tp_raw).upper()=="TP COMPLETED":
         print(f"[SKIP] {symbol} TP already completed")
         return
-
-    # -----------------------------------------
-    # 2. If TP exists -> check TP hit first
-    # -----------------------------------------
 
 
     try:
@@ -354,9 +346,7 @@ def check_ema_and_trade(symbol,row,df):
 
             return
 
-
         print(f"[TRACKING] {symbol} TP {tp}")
-
 
         positions=get_open_positions()
         pair=fut_pair(symbol)
@@ -379,16 +369,11 @@ def check_ema_and_trade(symbol,row,df):
 
                 return
 
-        # -----------------------------------------
-        # NEW LOGIC: No active position
-        # -----------------------------------------
-
         if not active:
 
             print(f"[INFO] No active position for {symbol}")
 
-            # possible SL happened
-            if current_price<ema:
+            if allow_trade and current_price<ema:
 
                 print(f"[RE-ENTRY] SELL {symbol}")
 
@@ -402,10 +387,6 @@ def check_ema_and_trade(symbol,row,df):
     except:
         tp=None
 
-
-    # -----------------------------------------
-    # 3. Check active positions (sheet TP empty)
-    # -----------------------------------------
 
     positions=get_open_positions()
     pair=fut_pair(symbol)
@@ -424,11 +405,7 @@ def check_ema_and_trade(symbol,row,df):
             return
 
 
-    # -----------------------------------------
-    # 4. Only now check new trade signal
-    # -----------------------------------------
-
-    if current_price<ema:
+    if allow_trade and current_price<ema:
 
         print(f"[SIGNAL] SELL {symbol}")
 
@@ -442,6 +419,8 @@ def check_ema_and_trade(symbol,row,df):
 # MAIN LOOP
 # =====================================================
 
+cycle=0
+
 while True:
 
     try:
@@ -452,6 +431,13 @@ while True:
             time.sleep(30)
             continue
 
+        allow_trade = (cycle % 10 == 0)
+
+        if allow_trade:
+            print("----- TRADE SCAN (5 MIN) -----")
+        else:
+            print("----- TP MONITOR (30s) -----")
+
         for row in range(len(df)):
 
             pair=df.iloc[row,0]
@@ -461,11 +447,14 @@ while True:
 
             symbol=normalize_symbol(pair)
 
-            check_ema_and_trade(symbol,row,df)
+            check_ema_and_trade(symbol,row,df,allow_trade)
 
-        time.sleep(300)
+        cycle+=1
+
+        time.sleep(30)
 
     except Exception as e:
 
         print("BOT ERROR:",e)
+
         time.sleep(60)
