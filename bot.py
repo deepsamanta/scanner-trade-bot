@@ -362,9 +362,10 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
     current_price=closes[-1]
 
     precision=len(str(current_price).split(".")[1]) if "." in str(current_price) else 0
+
     ema=round(ema,precision)
 
-    ema_threshold = ema * 0.995
+    ema_threshold=round(ema*0.995,precision)
 
     print(f"[CHECK] {symbol} | Price {current_price} | EMA {ema} | EntryBelow {ema_threshold}")
 
