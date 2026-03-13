@@ -171,6 +171,45 @@ def get_position_tp(symbol):
 
 
 # =====================================================
+# GET RECENT LOW (WICK DETECTION)
+# =====================================================
+
+def get_recent_low(symbol):
+
+    try:
+
+        pair_api = fut_pair(symbol)
+
+        url = "https://public.coindcx.com/market_data/candlesticks"
+
+        now = int(time.time())
+
+        params = {
+        "pair":pair_api,
+        "from":now-180,
+        "to":now,
+        "resolution":"1",
+        "pcode":"f"
+        }
+
+        response = requests.get(url,params=params)
+
+        result = response.json()
+
+        if result.get("s")!="ok":
+            return None
+
+        candles=result["data"]
+
+        lows=[float(c["low"]) for c in candles]
+
+        return min(lows)
+
+    except:
+        return None
+
+
+# =====================================================
 # GET QTY STEP
 # =====================================================
 
@@ -238,7 +277,7 @@ def place_order(side,symbol,entry_price,ema):
 
     entry=round(entry_price,precision)
 
-    tp=entry*0.93
+    tp=entry*0.955
     sl=ema*1.001
 
     tp=round(tp,precision)
@@ -341,9 +380,17 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
         if current_price<=tp:
 
             print(f"[TP HIT] {symbol}")
+            update_sheet_tp(row,"TP COMPLETED")
+            return
+
+        # Wick detection
+        recent_low=get_recent_low(symbol)
+
+        if recent_low and recent_low<=tp:
+
+            print(f"[WICK TP] {symbol} | Low {recent_low}")
 
             update_sheet_tp(row,"TP COMPLETED")
-
             return
 
         print(f"[TRACKING] {symbol} TP {tp}")
@@ -431,7 +478,7 @@ while True:
             time.sleep(30)
             continue
 
-        allow_trade = (cycle % 10 == 0)
+        allow_trade=(cycle%10==0)
 
         if allow_trade:
             print("----- TRADE SCAN (5 MIN) -----")
