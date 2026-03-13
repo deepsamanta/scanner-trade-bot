@@ -277,8 +277,8 @@ def place_order(side,symbol,entry_price,ema):
 
     entry=round(entry_price,precision)
 
-    tp=entry*0.955
-    sl=ema*1.001
+    tp=entry*0.95
+    sl=ema*1.0032
 
     tp=round(tp,precision)
     sl=round(sl,precision)
@@ -364,7 +364,9 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
     precision=len(str(current_price).split(".")[1]) if "." in str(current_price) else 0
     ema=round(ema,precision)
 
-    print(f"[CHECK] {symbol} | Price {current_price} | EMA {ema}")
+    ema_threshold = ema * 0.995
+
+    print(f"[CHECK] {symbol} | Price {current_price} | EMA {ema} | EntryBelow {ema_threshold}")
 
     tp_raw=df.iloc[row,1]
 
@@ -383,13 +385,11 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
             update_sheet_tp(row,"TP COMPLETED")
             return
 
-        # Wick detection
         recent_low=get_recent_low(symbol)
 
         if recent_low and recent_low<=tp:
 
             print(f"[WICK TP] {symbol} | Low {recent_low}")
-
             update_sheet_tp(row,"TP COMPLETED")
             return
 
@@ -410,17 +410,13 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
 
                 if exchange_tp and float(exchange_tp)!=float(tp):
 
-                    print(f"[TP UPDATE] {symbol} Sheet TP {tp} -> Exchange TP {exchange_tp}")
-
                     update_sheet_tp(row,exchange_tp)
 
                 return
 
         if not active:
 
-            print(f"[INFO] No active position for {symbol}")
-
-            if allow_trade and current_price<ema:
+            if allow_trade and current_price<=ema_threshold:
 
                 print(f"[RE-ENTRY] SELL {symbol}")
 
@@ -452,7 +448,7 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
             return
 
 
-    if allow_trade and current_price<ema:
+    if allow_trade and current_price<=ema_threshold:
 
         print(f"[SIGNAL] SELL {symbol}")
 
