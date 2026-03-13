@@ -278,7 +278,7 @@ def place_order(side,symbol,entry_price,ema):
     entry=round(entry_price,precision)
 
     tp=entry*0.95
-    sl=ema*1.025
+    sl=ema*1.021
 
     tp=round(tp,precision)
     sl=round(sl,precision)
