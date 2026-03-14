@@ -40,7 +40,6 @@ sheet = client.open_by_key(SHEET_ID).sheet1
 def get_sheet_data():
 
     try:
-
         data = sheet.get_all_values()
         df = pd.DataFrame(data)
 
@@ -103,9 +102,9 @@ def sign_request(body):
     ).hexdigest()
 
     headers = {
-    "Content-Type":"application/json",
-    "X-AUTH-APIKEY":COINDCX_KEY,
-    "X-AUTH-SIGNATURE":signature
+        "Content-Type":"application/json",
+        "X-AUTH-APIKEY":COINDCX_KEY,
+        "X-AUTH-SIGNATURE":signature
     }
 
     return payload,headers
@@ -119,28 +118,25 @@ def btc_is_bearish():
 
     try:
 
-        pair_api = "B-BTC_USDT"
+        pair_api="B-BTC_USDT"
 
-        url = "https://public.coindcx.com/market_data/candlesticks"
+        url="https://public.coindcx.com/market_data/candlesticks"
 
-        now = int(time.time())
+        now=int(time.time())
 
-        params = {
-        "pair":pair_api,
-        "from":now-(360000),
-        "to":now,
-        "resolution":"15",
-        "pcode":"f"
+        params={
+            "pair":pair_api,
+            "from":now-(360000),
+            "to":now,
+            "resolution":"15",
+            "pcode":"f"
         }
 
-        response = requests.get(url,params=params)
+        response=requests.get(url,params=params)
 
-        result = response.json()
+        data=response.json()["data"]
 
-        if result.get("s")!="ok":
-            return False
-
-        candles = sorted(result["data"],key=lambda x:x["time"])
+        candles=sorted(data,key=lambda x:x["time"])
 
         closes=[float(c["close"]) for c in candles]
 
@@ -154,70 +150,63 @@ def btc_is_bearish():
 
         btc_price=closes[-1]
 
-        if btc_price < ema:
-
-            print(f"[BTC] Bearish | Price {btc_price} < EMA {round(ema,2)}")
+        if btc_price<ema:
+            print("[BTC] Bearish")
             return True
-
         else:
-
-            print(f"[BTC] Bullish | Price {btc_price} > EMA {round(ema,2)}")
+            print("[BTC] Bullish")
             return False
 
     except:
-
         return False
 
 
 # =====================================================
-# GET OPEN POSITIONS
+# OPEN POSITIONS
 # =====================================================
 
 def get_open_positions():
 
     try:
 
-        body = {
-        "timestamp":int(time.time()*1000),
-        "page":"1",
-        "size":"50",
-        "margin_currency_short_name":["USDT"]
+        body={
+            "timestamp":int(time.time()*1000),
+            "page":"1",
+            "size":"50",
+            "margin_currency_short_name":["USDT"]
         }
 
-        payload,headers = sign_request(body)
+        payload,headers=sign_request(body)
 
-        url = BASE_URL + "/exchange/v1/derivatives/futures/positions"
+        url=BASE_URL+"/exchange/v1/derivatives/futures/positions"
 
-        response = requests.post(url,data=payload,headers=headers)
+        response=requests.post(url,data=payload,headers=headers)
 
-        positions = response.json()
+        positions=response.json()
 
-        return [
-        pos for pos in positions
-        if float(pos.get("active_pos",0)) != 0
-        ]
+        return [pos for pos in positions if float(pos.get("active_pos",0))!=0]
 
     except:
         return []
 
 
 # =====================================================
-# GET TP FROM POSITION
+# POSITION TP
 # =====================================================
 
 def get_position_tp(symbol):
 
     try:
 
-        positions = get_open_positions()
+        positions=get_open_positions()
 
-        pair = fut_pair(symbol)
+        pair=fut_pair(symbol)
 
         for pos in positions:
 
-            if pos.get("pair") == pair:
+            if pos.get("pair")==pair:
 
-                tp = pos.get("take_profit_trigger")
+                tp=pos.get("take_profit_trigger")
 
                 if tp:
                     return float(tp)
@@ -229,33 +218,30 @@ def get_position_tp(symbol):
 
 
 # =====================================================
-# WICK TP CHECK
+# WICK TP DETECTION
 # =====================================================
 
 def get_recent_low(symbol):
 
     try:
 
-        pair_api = fut_pair(symbol)
+        pair_api=fut_pair(symbol)
 
-        url = "https://public.coindcx.com/market_data/candlesticks"
+        url="https://public.coindcx.com/market_data/candlesticks"
 
-        now = int(time.time())
+        now=int(time.time())
 
-        params = {
-        "pair":pair_api,
-        "from":now-180,
-        "to":now,
-        "resolution":"1",
-        "pcode":"f"
+        params={
+            "pair":pair_api,
+            "from":now-180,
+            "to":now,
+            "resolution":"1",
+            "pcode":"f"
         }
 
-        response = requests.get(url,params=params)
+        response=requests.get(url,params=params)
 
-        result = response.json()
-
-        if result.get("s")!="ok":
-            return None
+        result=response.json()
 
         candles=result["data"]
 
@@ -268,14 +254,14 @@ def get_recent_low(symbol):
 
 
 # =====================================================
-# QTY CALCULATION
+# QUANTITY
 # =====================================================
 
 def get_quantity_step(symbol):
 
     try:
 
-        pair = fut_pair(symbol)
+        pair=fut_pair(symbol)
 
         url=f"https://api.coindcx.com/exchange/v1/derivatives/futures/data/instrument?pair={pair}&margin_currency_short_name=USDT"
 
@@ -295,8 +281,6 @@ def get_quantity_step(symbol):
 
 
 def compute_qty(entry_price,symbol):
-
-    symbol=normalize_symbol(symbol)
 
     step=get_quantity_step(symbol)
 
@@ -323,8 +307,6 @@ def compute_qty(entry_price,symbol):
 
 def place_order(side,symbol,entry_price,ema,candles):
 
-    symbol=normalize_symbol(symbol)
-
     qty=compute_qty(entry_price,symbol)
 
     precision=len(str(entry_price).split(".")[1]) if "." in str(entry_price) else 0
@@ -338,30 +320,26 @@ def place_order(side,symbol,entry_price,ema,candles):
 
     tp=round(tp,precision)
 
-    print(f"[TRADE] SELL {symbol} | Entry {entry} | TP {tp} | SL {sl}")
+    print(f"[TRADE] {symbol} SELL | Entry {entry} | TP {tp} | SL {sl}")
 
     body={
-    "timestamp":int(time.time()*1000),
-    "order":{
-    "side":side,
-    "pair":fut_pair(symbol),
-    "order_type":"limit_order",
-    "price":entry,
-    "total_quantity":qty,
-    "leverage":LEVERAGE,
-    "take_profit_price":tp,
-    "stop_loss_price":sl,
-    "position_margin_type":"crossed"
-    }
+        "timestamp":int(time.time()*1000),
+        "order":{
+            "side":side,
+            "pair":fut_pair(symbol),
+            "order_type":"limit_order",
+            "price":entry,
+            "total_quantity":qty,
+            "leverage":LEVERAGE,
+            "take_profit_price":tp,
+            "stop_loss_price":sl,
+            "position_margin_type":"crossed"
+        }
     }
 
     payload,headers=sign_request(body)
 
-    response=requests.post(
-    BASE_URL+"/exchange/v1/derivatives/futures/orders/create",
-    data=payload,
-    headers=headers
-    )
+    response=requests.post(BASE_URL+"/exchange/v1/derivatives/futures/orders/create",data=payload,headers=headers)
 
     result=response.json()
 
@@ -374,7 +352,7 @@ def place_order(side,symbol,entry_price,ema,candles):
 
 
 # =====================================================
-# EMA CHECK
+# MAIN LOGIC
 # =====================================================
 
 def check_ema_and_trade(symbol,row,df,allow_trade):
@@ -386,25 +364,18 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
     now=int(time.time())
 
     params={
-    "pair":pair_api,
-    "from":now-(360000),
-    "to":now,
-    "resolution":"15",
-    "pcode":"f"
+        "pair":pair_api,
+        "from":now-(360000),
+        "to":now,
+        "resolution":"15",
+        "pcode":"f"
     }
 
     response=requests.get(url,params=params)
-    result=response.json()
 
-    if result.get("s")!="ok":
-        return
-
-    candles=sorted(result["data"],key=lambda x:x["time"])
+    candles=sorted(response.json()["data"],key=lambda x:x["time"])
 
     closes=[float(c["close"]) for c in candles]
-
-    if len(closes)<210:
-        return
 
     period=200
     multiplier=2/(period+1)
@@ -415,19 +386,31 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
         ema=(price-ema)*multiplier+ema
 
     last_close=float(candles[-1]["close"])
+    prev_close=float(candles[-2]["close"])
 
-    precision=len(str(last_close).split(".")[1]) if "." in str(last_close) else 0
+    recent_high=max([float(c["high"]) for c in candles[-5:]])
 
-    ema=round(ema,precision)
-
-    ema_upper=round(ema*0.995,precision)
-    ema_lower=round(ema*0.99,precision)
+    ema_upper=ema*0.995
+    ema_lower=ema*0.99
 
     print(f"[CHECK] {symbol} | Close {last_close} | EMA {ema}")
 
     if not btc_is_bearish():
-        print(f"[SKIP] BTC bullish")
+        print("[SKIP] BTC bullish")
         return
+
+
+    # ==========================================
+    # ENTRY TYPE DETECTION
+    # ==========================================
+
+    sweep_entry = recent_high > ema and last_close < ema
+    breakdown_entry = last_close < ema*0.995 and prev_close < ema
+
+    if not (sweep_entry or breakdown_entry):
+        print(f"[SKIP] {symbol} no sweep or breakdown")
+        return
+
 
     tp_raw=df.iloc[row,1]
 
@@ -435,7 +418,9 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
         return
 
 
-    # ================= ACTIVE POSITION CHECK =================
+    # ==========================================
+    # ACTIVE POSITION CHECK
+    # ==========================================
 
     positions=get_open_positions()
     pair=fut_pair(symbol)
@@ -454,7 +439,9 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
             return
 
 
-    # ================= TP CHECK =================
+    # ==========================================
+    # TP CHECK
+    # ==========================================
 
     try:
 
@@ -476,11 +463,11 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
         pass
 
 
-    # ================= ENTRY =================
+    # ==========================================
+    # ENTRY
+    # ==========================================
 
     if allow_trade and ema_lower<=last_close<=ema_upper:
-
-        print(f"[ENTRY] {symbol}")
 
         tp=place_order("sell",symbol,last_close,ema,candles)
 
@@ -499,10 +486,6 @@ while True:
     try:
 
         df=get_sheet_data()
-
-        if df.empty:
-            time.sleep(30)
-            continue
 
         allow_trade=(cycle%10==0)
 
@@ -524,4 +507,5 @@ while True:
     except Exception as e:
 
         print("BOT ERROR:",e)
+
         time.sleep(60)
