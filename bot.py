@@ -112,6 +112,67 @@ def sign_request(body):
 
 
 # =====================================================
+# BTC TREND FILTER
+# =====================================================
+
+def btc_is_bearish():
+
+    try:
+
+        pair_api = "B-BTC_USDT"
+
+        url = "https://public.coindcx.com/market_data/candlesticks"
+
+        now = int(time.time())
+
+        params = {
+        "pair":pair_api,
+        "from":now-(360000),
+        "to":now,
+        "resolution":"15",
+        "pcode":"f"
+        }
+
+        response = requests.get(url,params=params)
+
+        result = response.json()
+
+        if result.get("s")!="ok":
+            return False
+
+        candles = sorted(result["data"],key=lambda x:x["time"])
+
+        closes=[float(c["close"]) for c in candles]
+
+        if len(closes) < 200:
+            return False
+
+        period=200
+        multiplier=2/(period+1)
+
+        ema=sum(closes[:period])/period
+
+        for price in closes[period:]:
+            ema=(price-ema)*multiplier+ema
+
+        btc_price=closes[-1]
+
+        if btc_price < ema:
+
+            print(f"[BTC] Bearish | Price {btc_price} < EMA {round(ema,2)}")
+            return True
+
+        else:
+
+            print(f"[BTC] Bullish | Price {btc_price} > EMA {round(ema,2)}")
+            return False
+
+    except:
+
+        return False
+
+
+# =====================================================
 # GET OPEN POSITIONS
 # =====================================================
 
@@ -171,7 +232,7 @@ def get_position_tp(symbol):
 
 
 # =====================================================
-# GET RECENT LOW (WICK DETECTION)
+# GET RECENT LOW (WICK TP DETECTION)
 # =====================================================
 
 def get_recent_low(symbol):
@@ -210,7 +271,7 @@ def get_recent_low(symbol):
 
 
 # =====================================================
-# GET QTY STEP
+# QTY CALCULATION
 # =====================================================
 
 def get_quantity_step(symbol):
@@ -235,10 +296,6 @@ def get_quantity_step(symbol):
     except:
         return Decimal("1")
 
-
-# =====================================================
-# COMPUTE QTY
-# =====================================================
 
 def compute_qty(entry_price,symbol):
 
@@ -284,7 +341,7 @@ def place_order(side,symbol,entry_price,ema,candles):
 
     tp=round(tp,precision)
 
-    print(f"[ORDER] {symbol} SELL | Entry {entry} | TP {tp} | SL {sl}")
+    print(f"[TRADE] SELL {symbol} | Entry {entry} | TP {tp} | SL {sl}")
 
     body={
     "timestamp":int(time.time()*1000),
@@ -343,6 +400,7 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
     result=response.json()
 
     if result.get("s")!="ok":
+        print(f"[SKIP] {symbol} data error")
         return
 
     candles=sorted(result["data"],key=lambda x:x["time"])
@@ -350,6 +408,7 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
     closes=[float(c["close"]) for c in candles]
 
     if len(closes)<210:
+        print(f"[SKIP] {symbol} not enough candles")
         return
 
     period=200
@@ -369,31 +428,29 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
     ema_upper=round(ema*0.995,precision)
     ema_lower=round(ema*0.99,precision)
 
+    distance=((ema-current_price)/ema)*100
+
+    if distance<0.4:
+        print(f"[SKIP] {symbol} weak EMA breakdown {distance:.3f}%")
+        return
+
     last_open=float(candles[-1]["open"])
     last_close=float(candles[-1]["close"])
 
     if last_close>=last_open:
+        print(f"[SKIP] {symbol} candle bullish")
         return
 
-    ema_past=sum(closes[:period])/period
-
-    for price in closes[period:-10]:
-        ema_past=(price-ema_past)*multiplier+ema_past
-
-    if ema>=ema_past:
+    if not btc_is_bearish():
+        print(f"[SKIP] {symbol} BTC bullish - avoiding short")
         return
 
-    slope_percent=((ema_past-ema)/ema)*100
-
-    if slope_percent < 0.05:
-        print(f"[SKIP] {symbol} EMA slope too flat ({slope_percent:.4f}%)")
-        return
-
-    print(f"[CHECK] {symbol} | Price {current_price} | EMA {ema} | Slope {slope_percent:.3f}%")
+    print(f"[CHECK] {symbol} | Price {current_price} | EMA {ema}")
 
     tp_raw=df.iloc[row,1]
 
     if str(tp_raw).upper()=="TP COMPLETED":
+        print(f"[SKIP] {symbol} TP already completed")
         return
 
     try:
@@ -401,21 +458,28 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
         tp=float(tp_raw)
 
         if current_price<=tp:
+
+            print(f"[TP] {symbol} target hit")
             update_sheet_tp(row,"TP COMPLETED")
             return
 
         recent_low=get_recent_low(symbol)
 
         if recent_low and recent_low<=tp:
+
+            print(f"[TP WICK] {symbol} wick hit TP")
             update_sheet_tp(row,"TP COMPLETED")
             return
 
         positions=get_open_positions()
+
         pair=fut_pair(symbol)
 
         for pos in positions:
 
             if pos.get("pair")==pair:
+
+                print(f"[ACTIVE] {symbol} trade running")
 
                 exchange_tp=get_position_tp(symbol)
 
@@ -426,7 +490,7 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
 
         if allow_trade and ema_lower<=current_price<=ema_upper:
 
-            print(f"[RE-ENTRY] SELL {symbol}")
+            print(f"[ENTRY] {symbol} signal confirmed")
 
             tp=place_order("sell",symbol,current_price,ema,candles)
 
@@ -438,29 +502,10 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
     except:
         pass
 
-    positions=get_open_positions()
-    pair=fut_pair(symbol)
 
-    for pos in positions:
-
-        if pos.get("pair")==pair:
-
-            tp=get_position_tp(symbol)
-
-            if tp:
-                update_sheet_tp(row,tp)
-
-            return
-
-    if allow_trade and ema_lower<=current_price<=ema_upper:
-
-        print(f"[SIGNAL] SELL {symbol}")
-
-        tp=place_order("sell",symbol,current_price,ema,candles)
-
-        if tp:
-            update_sheet_tp(row,tp)
-
+# =====================================================
+# MAIN LOOP
+# =====================================================
 
 cycle=0
 
@@ -494,5 +539,4 @@ while True:
     except Exception as e:
 
         print("BOT ERROR:",e)
-
         time.sleep(60)
