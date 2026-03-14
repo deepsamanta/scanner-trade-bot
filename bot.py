@@ -59,12 +59,10 @@ def get_sheet_data():
 def update_sheet_tp(row,value):
 
     try:
-
         sheet.update(f"B{row+1}", [[str(value)]])
         print(f"[SHEET] Row {row+1} -> {value}")
 
     except Exception as e:
-
         print("Sheet update error:",e)
 
 
@@ -134,9 +132,7 @@ def btc_is_bearish():
 
         response=requests.get(url,params=params)
 
-        data=response.json()["data"]
-
-        candles=sorted(data,key=lambda x:x["time"])
+        candles=sorted(response.json()["data"],key=lambda x:x["time"])
 
         closes=[float(c["close"]) for c in candles]
 
@@ -241,9 +237,7 @@ def get_recent_low(symbol):
 
         response=requests.get(url,params=params)
 
-        result=response.json()
-
-        candles=result["data"]
+        candles=response.json()["data"]
 
         lows=[float(c["low"]) for c in candles]
 
@@ -388,10 +382,14 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
     last_close=float(candles[-1]["close"])
     prev_close=float(candles[-2]["close"])
 
+    precision=len(str(last_close).split(".")[1]) if "." in str(last_close) else 0
+
+    ema=round(ema,precision)
+
     recent_high=max([float(c["high"]) for c in candles[-5:]])
 
-    ema_upper=ema*0.995
-    ema_lower=ema*0.99
+    ema_upper=round(ema*0.995,precision)
+    ema_lower=round(ema*0.99,precision)
 
     print(f"[CHECK] {symbol} | Close {last_close} | EMA {ema}")
 
@@ -399,10 +397,6 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
         print("[SKIP] BTC bullish")
         return
 
-
-    # ==========================================
-    # ENTRY TYPE DETECTION
-    # ==========================================
 
     sweep_entry = recent_high > ema and last_close < ema
     breakdown_entry = last_close < ema*0.995 and prev_close < ema
@@ -417,10 +411,6 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
     if str(tp_raw).upper()=="TP COMPLETED":
         return
 
-
-    # ==========================================
-    # ACTIVE POSITION CHECK
-    # ==========================================
 
     positions=get_open_positions()
     pair=fut_pair(symbol)
@@ -438,10 +428,6 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
 
             return
 
-
-    # ==========================================
-    # TP CHECK
-    # ==========================================
 
     try:
 
@@ -462,10 +448,6 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
     except:
         pass
 
-
-    # ==========================================
-    # ENTRY
-    # ==========================================
 
     if allow_trade and ema_lower<=last_close<=ema_upper:
 
