@@ -100,9 +100,9 @@ def sign_request(body):
     ).hexdigest()
 
     headers = {
-        "Content-Type":"application/json",
-        "X-AUTH-APIKEY":COINDCX_KEY,
-        "X-AUTH-SIGNATURE":signature
+    "Content-Type":"application/json",
+    "X-AUTH-APIKEY":COINDCX_KEY,
+    "X-AUTH-SIGNATURE":signature
     }
 
     return payload,headers
@@ -388,15 +388,15 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
 
     recent_high=max([float(c["high"]) for c in candles[-5:]])
 
+    # UPDATED ENTRY ZONE
     ema_upper=round(ema*0.995,precision)
-    ema_lower=round(ema*0.99,precision)
+    ema_lower=round(ema*0.97,precision)
 
     print(f"[CHECK] {symbol} | Close {last_close} | EMA {ema}")
 
     if not btc_is_bearish():
         print("[SKIP] BTC bullish")
         return
-
 
     sweep_entry = recent_high > ema and last_close < ema
     breakdown_entry = last_close < ema*0.995 and prev_close < ema
@@ -405,12 +405,10 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
         print(f"[SKIP] {symbol} no sweep or breakdown")
         return
 
-
     tp_raw=df.iloc[row,1]
 
     if str(tp_raw).upper()=="TP COMPLETED":
         return
-
 
     positions=get_open_positions()
     pair=fut_pair(symbol)
@@ -428,26 +426,22 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
 
             return
 
-
     try:
 
         tp=float(tp_raw)
 
         if last_close<=tp:
-
             update_sheet_tp(row,"TP COMPLETED")
             return
 
         recent_low=get_recent_low(symbol)
 
         if recent_low and recent_low<=tp:
-
             update_sheet_tp(row,"TP COMPLETED")
             return
 
     except:
         pass
-
 
     if allow_trade and ema_lower<=last_close<=ema_upper:
 
