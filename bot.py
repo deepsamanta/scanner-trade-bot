@@ -144,9 +144,6 @@ def btc_is_bearish():
 
         closes=[float(c["close"]) for c in candles]
 
-        if len(closes) < 200:
-            return False
-
         period=200
         multiplier=2/(period+1)
 
@@ -232,7 +229,7 @@ def get_position_tp(symbol):
 
 
 # =====================================================
-# GET RECENT LOW (WICK TP DETECTION)
+# WICK TP CHECK
 # =====================================================
 
 def get_recent_low(symbol):
@@ -400,7 +397,6 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
     result=response.json()
 
     if result.get("s")!="ok":
-        print(f"[SKIP] {symbol} data error")
         return
 
     candles=sorted(result["data"],key=lambda x:x["time"])
@@ -408,7 +404,6 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
     closes=[float(c["close"]) for c in candles]
 
     if len(closes)<210:
-        print(f"[SKIP] {symbol} not enough candles")
         return
 
     period=200
@@ -419,47 +414,54 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
     for price in closes[period:]:
         ema=(price-ema)*multiplier+ema
 
-    current_price=closes[-1]
+    last_close=float(candles[-1]["close"])
 
-    precision=len(str(current_price).split(".")[1]) if "." in str(current_price) else 0
+    precision=len(str(last_close).split(".")[1]) if "." in str(last_close) else 0
 
     ema=round(ema,precision)
 
     ema_upper=round(ema*0.995,precision)
     ema_lower=round(ema*0.99,precision)
 
-    distance=((ema-current_price)/ema)*100
-
-    if distance<0.4:
-        print(f"[SKIP] {symbol} weak EMA breakdown {distance:.3f}%")
-        return
-
-    last_open=float(candles[-1]["open"])
-    last_close=float(candles[-1]["close"])
-
-    if last_close>=last_open:
-        print(f"[SKIP] {symbol} candle bullish")
-        return
+    print(f"[CHECK] {symbol} | Close {last_close} | EMA {ema}")
 
     if not btc_is_bearish():
-        print(f"[SKIP] {symbol} BTC bullish - avoiding short")
+        print(f"[SKIP] BTC bullish")
         return
-
-    print(f"[CHECK] {symbol} | Price {current_price} | EMA {ema}")
 
     tp_raw=df.iloc[row,1]
 
     if str(tp_raw).upper()=="TP COMPLETED":
-        print(f"[SKIP] {symbol} TP already completed")
         return
+
+
+    # ================= ACTIVE POSITION CHECK =================
+
+    positions=get_open_positions()
+    pair=fut_pair(symbol)
+
+    for pos in positions:
+
+        if pos.get("pair")==pair:
+
+            print(f"[ACTIVE] {symbol}")
+
+            tp=get_position_tp(symbol)
+
+            if tp:
+                update_sheet_tp(row,tp)
+
+            return
+
+
+    # ================= TP CHECK =================
 
     try:
 
         tp=float(tp_raw)
 
-        if current_price<=tp:
+        if last_close<=tp:
 
-            print(f"[TP] {symbol} target hit")
             update_sheet_tp(row,"TP COMPLETED")
             return
 
@@ -467,40 +469,23 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
 
         if recent_low and recent_low<=tp:
 
-            print(f"[TP WICK] {symbol} wick hit TP")
             update_sheet_tp(row,"TP COMPLETED")
             return
 
-        positions=get_open_positions()
-
-        pair=fut_pair(symbol)
-
-        for pos in positions:
-
-            if pos.get("pair")==pair:
-
-                print(f"[ACTIVE] {symbol} trade running")
-
-                exchange_tp=get_position_tp(symbol)
-
-                if exchange_tp and float(exchange_tp)!=float(tp):
-                    update_sheet_tp(row,exchange_tp)
-
-                return
-
-        if allow_trade and ema_lower<=current_price<=ema_upper:
-
-            print(f"[ENTRY] {symbol} signal confirmed")
-
-            tp=place_order("sell",symbol,current_price,ema,candles)
-
-            if tp:
-                update_sheet_tp(row,tp)
-
-        return
-
     except:
         pass
+
+
+    # ================= ENTRY =================
+
+    if allow_trade and ema_lower<=last_close<=ema_upper:
+
+        print(f"[ENTRY] {symbol}")
+
+        tp=place_order("sell",symbol,last_close,ema,candles)
+
+        if tp:
+            update_sheet_tp(row,tp)
 
 
 # =====================================================
