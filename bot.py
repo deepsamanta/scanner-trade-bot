@@ -267,7 +267,7 @@ def compute_qty(entry_price,symbol):
 # PLACE ORDER
 # =====================================================
 
-def place_order(side,symbol,entry_price,ema):
+def place_order(side,symbol,entry_price,ema,candles):
 
     symbol=normalize_symbol(symbol)
 
@@ -278,10 +278,11 @@ def place_order(side,symbol,entry_price,ema):
     entry=round(entry_price,precision)
 
     tp=entry*0.95
-    sl=ema*1.021
+
+    previous_high=float(candles[-2]["high"])
+    sl=round(previous_high*1.001,precision)
 
     tp=round(tp,precision)
-    sl=round(sl,precision)
 
     print(f"[ORDER] {symbol} SELL | Entry {entry} | TP {tp} | SL {sl}")
 
@@ -348,7 +349,7 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
 
     closes=[float(c["close"]) for c in candles]
 
-    if len(closes)<200:
+    if len(closes)<210:
         return
 
     period=200
@@ -365,72 +366,77 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
 
     ema=round(ema,precision)
 
-    ema_threshold=round(ema*0.995,precision)
+    ema_upper=round(ema*0.995,precision)
+    ema_lower=round(ema*0.99,precision)
 
-    print(f"[CHECK] {symbol} | Price {current_price} | EMA {ema} | EntryBelow {ema_threshold}")
+    last_open=float(candles[-1]["open"])
+    last_close=float(candles[-1]["close"])
+
+    if last_close>=last_open:
+        return
+
+    ema_past=sum(closes[:period])/period
+
+    for price in closes[period:-10]:
+        ema_past=(price-ema_past)*multiplier+ema_past
+
+    if ema>=ema_past:
+        return
+
+    slope_percent=((ema_past-ema)/ema)*100
+
+    if slope_percent < 0.05:
+        print(f"[SKIP] {symbol} EMA slope too flat ({slope_percent:.4f}%)")
+        return
+
+    print(f"[CHECK] {symbol} | Price {current_price} | EMA {ema} | Slope {slope_percent:.3f}%")
 
     tp_raw=df.iloc[row,1]
 
     if str(tp_raw).upper()=="TP COMPLETED":
-        print(f"[SKIP] {symbol} TP already completed")
         return
-
 
     try:
 
         tp=float(tp_raw)
 
         if current_price<=tp:
-
-            print(f"[TP HIT] {symbol}")
             update_sheet_tp(row,"TP COMPLETED")
             return
 
         recent_low=get_recent_low(symbol)
 
         if recent_low and recent_low<=tp:
-
-            print(f"[WICK TP] {symbol} | Low {recent_low}")
             update_sheet_tp(row,"TP COMPLETED")
             return
 
-        print(f"[TRACKING] {symbol} TP {tp}")
-
         positions=get_open_positions()
         pair=fut_pair(symbol)
-
-        active=False
 
         for pos in positions:
 
             if pos.get("pair")==pair:
 
-                active=True
-
                 exchange_tp=get_position_tp(symbol)
 
                 if exchange_tp and float(exchange_tp)!=float(tp):
-
                     update_sheet_tp(row,exchange_tp)
 
                 return
 
-        if not active:
+        if allow_trade and ema_lower<=current_price<=ema_upper:
 
-            if allow_trade and current_price<=ema_threshold:
+            print(f"[RE-ENTRY] SELL {symbol}")
 
-                print(f"[RE-ENTRY] SELL {symbol}")
+            tp=place_order("sell",symbol,current_price,ema,candles)
 
-                tp=place_order("sell",symbol,current_price,ema)
+            if tp:
+                update_sheet_tp(row,tp)
 
-                if tp:
-                    update_sheet_tp(row,tp)
-
-            return
+        return
 
     except:
-        tp=None
-
+        pass
 
     positions=get_open_positions()
     pair=fut_pair(symbol)
@@ -439,8 +445,6 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
 
         if pos.get("pair")==pair:
 
-            print(f"[ACTIVE] {symbol}")
-
             tp=get_position_tp(symbol)
 
             if tp:
@@ -448,20 +452,15 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
 
             return
 
-
-    if allow_trade and current_price<=ema_threshold:
+    if allow_trade and ema_lower<=current_price<=ema_upper:
 
         print(f"[SIGNAL] SELL {symbol}")
 
-        tp=place_order("sell",symbol,current_price,ema)
+        tp=place_order("sell",symbol,current_price,ema,candles)
 
         if tp:
             update_sheet_tp(row,tp)
 
-
-# =====================================================
-# MAIN LOOP
-# =====================================================
 
 cycle=0
 
@@ -476,11 +475,6 @@ while True:
             continue
 
         allow_trade=(cycle%10==0)
-
-        if allow_trade:
-            print("----- TRADE SCAN (5 MIN) -----")
-        else:
-            print("----- TP MONITOR (30s) -----")
 
         for row in range(len(df)):
 
