@@ -569,6 +569,31 @@ def place_order(side, symbol, entry_price, candles, atr, precision, entry_reason
 
 def check_ema_and_trade(symbol, row, df):
 
+    pair = fut_pair(symbol)
+
+    # ── Check active position FIRST — no need to run any filters ─────────────
+    positions = get_open_positions()
+    for pos in positions:
+        if pos.get("pair") == pair:
+            print(f"[ACTIVE TRADE] {symbol} — position already open, skipping filters")
+            precision = get_precision(
+                requests.get(
+                    "https://public.coindcx.com/market_data/candlesticks",
+                    params={"pair": pair, "from": int(time.time()) - 900,
+                            "to": int(time.time()), "resolution": "15", "pcode": "f"}
+                ).json()["data"][-1]["close"]
+            )
+            tp_live = get_position_tp(symbol)
+            if tp_live:
+                update_sheet_tp(row, tp_live)
+            maybe_update_trailing_sl(symbol, row, df, precision)
+            return
+
+    # ── Check active order — unfilled limit order already on the book ─────────
+    if has_active_order(symbol):
+        print(f"[ACTIVE ORDER] {symbol} — order already on the book, skipping filters")
+        return
+
     pair_api = fut_pair(symbol)
     url      = "https://public.coindcx.com/market_data/candlesticks"
     now      = int(time.time())
@@ -667,24 +692,6 @@ def check_ema_and_trade(symbol, row, df):
             return
     except Exception:
         pass
-
-    # ── Active position check: refresh TP + trailing SL ──────────────────────
-    positions = get_open_positions()
-    pair      = fut_pair(symbol)
-
-    for pos in positions:
-        if pos.get("pair") == pair:
-            print(f"[ACTIVE] {symbol}")
-            tp_live = get_position_tp(symbol)
-            if tp_live:
-                update_sheet_tp(row, tp_live)
-            maybe_update_trailing_sl(symbol, row, df, precision)
-            return
-
-    # ── Active order check: skip if unfilled order already on the book ────────
-    if has_active_order(symbol):
-        print(f"[SKIP] {symbol} already has an active order on the book")
-        return
 
     # ── New trade entry ───────────────────────────────────────────────────────
     tp_confirmed, sl_placed = place_order(
