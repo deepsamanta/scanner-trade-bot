@@ -655,10 +655,24 @@ def check_ema_and_trade(symbol, row, df):
             print(f"[SKIP] {symbol} RSI {rsi} outside [{RSI_MIN}, {RSI_MAX}]")
             return
 
-    # ── Filter 5: Dual-path volume check ──────────────────────────────────────
+    # ── Filter 5: Last 2 CLOSED candles must both be red ─────────────────────
+    #   Mandatory for ALL entries regardless of spike or gradual path.
+    #   candles[-3] = 1st closed red candle  ← SL will go above this high
+    #   candles[-2] = 2nd closed red candle  ← confirms bearish structure
+    #   candles[-1] = current live candle    ← entry price only, not checked
+    c1_close = float(candles[-3]["close"])
+    c1_open  = float(candles[-3]["open"])
+    c2_close = float(candles[-2]["close"])
+    c2_open  = float(candles[-2]["open"])
+
+    if c1_close >= c1_open or c2_close >= c2_open:
+        print(f"[SKIP] {symbol} last 2 closed candles not both red")
+        return
+
+    # ── Filter 6: Dual-path volume check ──────────────────────────────────────
     #   Path A — SPIKE:   candles[-2] volume > 1.3x average
-    #   Path B — GRADUAL: candles[-3] and candles[-2] both closed red,
-    #                     each lower close, sufficient cumulative volume
+    #   Path B — GRADUAL: candles[-3] and candles[-2] each close lower
+    #                     than the one before, sufficient cumulative volume
     #   candles[-1] = current LIVE candle, never checked for color
     spike   = volume_spike(candles)
     gradual = gradual_decline(candles)
