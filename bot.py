@@ -17,7 +17,7 @@ BASE_URL = "https://api.coindcx.com"
 # ─── TUNEABLE CONSTANTS ────────────────────────────────────────────────────────
 EMA_PERIOD           = 200
 ATR_PERIOD           = 14        # candles for ATR
-TP_PCT               = 0.05      # TP = entry * (1 - 0.05)  → fixed 5% below entry
+TP_PCT               = 0.05      # TP = entry * (1 - 0.05) → fixed 5% below entry
 ATR_SL_MULT          = 1.2       # SL = sl_candle_high + ATR * mult
 MIN_RR               = 1.8       # skip trade if reward/risk < this
 EMA_ENTRY_PCT_HI     = 0.995     # entry zone upper bound  (0.5% below EMA)
@@ -103,7 +103,9 @@ def fut_pair(symbol):
 def sign_request(body):
     payload   = json.dumps(body, separators=(",", ":"))
     signature = hmac.new(
-        COINDCX_SECRET.encode(), payload.encode(), hashlib.sha256
+        bytes(COINDCX_SECRET, encoding="utf-8"),
+        payload.encode(),
+        hashlib.sha256
     ).hexdigest()
     headers = {
         "Content-Type":     "application/json",
@@ -434,20 +436,12 @@ def place_order(side, symbol, entry_price, candles, atr, precision, entry_reason
     entry = round(entry_price, precision)
 
     # ── TP: fixed 5% below entry ─────────────────────────────────────────────
-    #   Simple and consistent across all coins regardless of ATR size.
-    #   For MBOX example: entry 0.01803 → TP = 0.01803 * 0.95 = 0.017129
     tp = round(entry * (1 - TP_PCT), precision)
 
     # ── SL candle selection ───────────────────────────────────────────────────
-    #   GRADUAL: 2 red candles fired
-    #       candles[-2] = 1st red candle ← SL above this high
-    #       candles[-1] = 2nd red candle ← entry candle
-    #   SPIKE: single candle signal
-    #       candles[-2] = previous candle ← SL above this high
-    if entry_reason == "GRADUAL":
-        sl_candle_high = float(candles[-2]["high"])   # 1st of the 2 red candles
-    else:
-        sl_candle_high = float(candles[-2]["high"])   # previous candle (spike)
+    #   GRADUAL: candles[-2] = 1st red candle → SL above its high
+    #   SPIKE:   candles[-2] = previous candle → SL above its high
+    sl_candle_high = float(candles[-2]["high"])
 
     # ── SL: candle high + ATR buffer ─────────────────────────────────────────
     if atr:
@@ -472,18 +466,18 @@ def place_order(side, symbol, entry_price, candles, atr, precision, entry_reason
         f"| RR {round(reward / risk, 2)} | Qty {qty} | {entry_reason}"
     )
 
+    # ── Order body — matches official CoinDCX API spec exactly ───────────────
     body = {
         "timestamp": int(time.time() * 1000),
         "order": {
-            "side":                 side,
-            "pair":                 fut_pair(symbol),
-            "order_type":           "limit_order",
-            "price":                entry,
-            "total_quantity":       qty,
-            "leverage":             LEVERAGE,
-            "take_profit_price":    tp,
-            "stop_loss_price":      sl_base,
-            "position_margin_type": "crossed",
+            "side":             side,
+            "pair":             fut_pair(symbol),
+            "order_type":       "limit_order",
+            "price":            entry,
+            "total_quantity":   qty,
+            "leverage":         LEVERAGE,
+            "take_profit_price": tp,
+            "stop_loss_price":  sl_base,
         },
     }
 
@@ -494,6 +488,14 @@ def place_order(side, symbol, entry_price, candles, atr, precision, entry_reason
         headers=headers,
     )
     result = response.json()
+
+    # ── Log full exchange response so rejections are visible ─────────────────
+    print(f"[API] {symbol} response: {result}")
+
+    # ── Bail out if exchange rejected the order ───────────────────────────────
+    if "order" not in result:
+        print(f"[ERROR] {symbol} order not placed: {result}")
+        return None, None
 
     try:
         tp_confirmed = result["order"]["take_profit_trigger"]
@@ -574,8 +576,7 @@ def check_ema_and_trade(symbol, row, df):
     #   Path A — SPIKE:   latest candle volume > 1.3x average
     #   Path B — GRADUAL: candles[-2] and candles[-1] both bearish lower-closes
     #                     with cumulative volume >= 1 avg candle
-    #   Latest candle body is NOT checked — entry fires on current price
-    #   regardless of whether latest candle is red or green.
+    #   Latest candle body is NOT checked — entry on current price regardless.
     spike   = volume_spike(candles)
     gradual = gradual_decline(candles)
 
@@ -623,9 +624,6 @@ def check_ema_and_trade(symbol, row, df):
             return
 
     # ── New trade entry ───────────────────────────────────────────────────────
-    #   No allow_trade gate — if all filters passed and no active position,
-    #   place immediately. Previously the gate was causing valid signals
-    #   on monitor cycles (30s) to be silently missed.
     tp_confirmed, sl_placed = place_order(
         "sell", symbol, last_close, candles, atr, precision, entry_reason
     )
