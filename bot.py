@@ -27,7 +27,7 @@ RSI_MIN              = 35        # only short when RSI >= this
 RSI_MAX              = 65        # only short when RSI <= this
 EMA_SLOPE_BARS       = 5         # candles to measure EMA slope
 VOL_SPIKE_MULT       = 1.3       # current vol must be > avg_vol * this (Path A)
-GRADUAL_CONSEC       = 2         # 2 consecutive lower bearish closes (Path B)
+GRADUAL_CONSEC       = 2         # 2 consecutive closed red candles (Path B)
 GRADUAL_VOL_LOOKBACK = 20        # candles to compute avg vol for gradual check
 TRAIL_TRIGGER_PCT    = 0.015     # move SL to break-even once price drops 1.5%
 # ──────────────────────────────────────────────────────────────────────────────
@@ -190,13 +190,17 @@ def compute_rsi(closes, period=RSI_PERIOD):
 def volume_spike(candles, lookback=20, mult=VOL_SPIKE_MULT):
     """
     PATH A — single-candle spike.
-    True if the latest candle volume > mult * average of prior `lookback` candles.
+    Checks candles[-2] (last CLOSED candle) volume vs average.
+    candles[-1] is the live candle and is excluded.
+
+    True if candles[-2] volume > mult * average of prior `lookback` candles.
     """
-    if len(candles) < lookback + 1:
+    if len(candles) < lookback + 2:
         return True
     vols    = [float(c.get("volume", 0)) for c in candles]
-    avg_vol = sum(vols[-(lookback + 1):-1]) / lookback
-    cur_vol = vols[-1]
+    # avg of the lookback candles before the last closed candle
+    avg_vol = sum(vols[-(lookback + 2):-2]) / lookback
+    cur_vol = vols[-2]   # last CLOSED candle
     if avg_vol == 0:
         return True
     return cur_vol >= avg_vol * mult
@@ -206,24 +210,29 @@ def gradual_decline(candles,
                     lookback=GRADUAL_VOL_LOOKBACK,
                     consec=GRADUAL_CONSEC):
     """
-    PATH B — 2 consecutive bearish lower-closes.
+    PATH B — 2 consecutive CLOSED bearish lower-closes.
 
-    Structure (GRADUAL_CONSEC = 2):
-        candles[-3]  prior candle       (comparison reference only)
-        candles[-2]  1st red candle  <- SL goes above this one's high
-        candles[-1]  2nd red candle  <- signal / entry candle
+    candles[-1] is the current live candle — completely ignored here.
+
+    Structure:
+        candles[-4]  prior candle       (comparison reference only)
+        candles[-3]  1st red candle  ← SL goes above THIS high
+        candles[-2]  2nd red candle  ← confirmed closed red
+        candles[-1]  current candle  ← live, entry price only
 
     Returns True when ALL of:
-      1. Each of the 2 candles closes lower than the one before it.
-      2. Each of the 2 candles has a bearish body (close < open).
-      3. Cumulative volume of those 2 candles >= one average candle volume.
+      1. candles[-3] and candles[-2] each close lower than the one before.
+      2. Both have bearish bodies (close < open).
+      3. Their combined volume >= one average candle volume.
     """
-    if len(candles) < lookback + consec + 1:
+    if len(candles) < lookback + consec + 2:
         return False
 
-    recent  = candles[-(consec + 1):]
+    # window excludes candles[-1] (live candle)
+    # recent = [candles[-4], candles[-3], candles[-2]]
+    recent  = candles[-(consec + 2):-1]
     vols    = [float(c.get("volume", 0)) for c in candles]
-    avg_vol = sum(vols[-(lookback + consec):-consec]) / lookback
+    avg_vol = sum(vols[-(lookback + consec + 1):-(consec + 1)]) / lookback
 
     for i in range(1, consec + 1):
         c          = recent[i]
@@ -232,17 +241,18 @@ def gradual_decline(candles,
         open_      = float(c["open"])
         prev_close = float(c_prev["close"])
 
-        if close >= prev_close:
+        if close >= prev_close:   # not closing lower
             return False
-        if close >= open_:
+        if close >= open_:        # not a bearish body
             return False
 
+    # cumulative volume of the 2 closed red candles
     cum_vol = sum(
-        float(candles[-(consec + i)].get("volume", 0))
+        float(candles[-(consec + i + 1)].get("volume", 0))
         for i in range(consec)
     )
     if avg_vol > 0 and cum_vol < avg_vol:
-        return False
+        return False              # too quiet — noise, not real selling
 
     return True
 
@@ -439,9 +449,20 @@ def place_order(side, symbol, entry_price, candles, atr, precision, entry_reason
     tp = round(entry * (1 - TP_PCT), precision)
 
     # ── SL candle selection ───────────────────────────────────────────────────
-    #   GRADUAL: candles[-2] = 1st red candle → SL above its high
-    #   SPIKE:   candles[-2] = previous candle → SL above its high
-    sl_candle_high = float(candles[-2]["high"])
+    #
+    #   GRADUAL path:
+    #       candles[-3] = 1st closed red candle → SL above THIS high
+    #       candles[-2] = 2nd closed red candle
+    #       candles[-1] = current live candle   → entry only
+    #
+    #   SPIKE path:
+    #       candles[-2] = last closed candle    → SL above this high
+    #       candles[-1] = current live candle   → entry only
+    #
+    if entry_reason == "GRADUAL":
+        sl_candle_high = float(candles[-3]["high"])   # 1st closed red candle
+    else:
+        sl_candle_high = float(candles[-2]["high"])   # last closed candle
 
     # ── SL: candle high + ATR buffer ─────────────────────────────────────────
     if atr:
@@ -466,18 +487,18 @@ def place_order(side, symbol, entry_price, candles, atr, precision, entry_reason
         f"| RR {round(reward / risk, 2)} | Qty {qty} | {entry_reason}"
     )
 
-    # ── Order body — matches official CoinDCX API spec exactly ───────────────
+    # ── Order body — matches official CoinDCX API spec ────────────────────────
     body = {
         "timestamp": int(time.time() * 1000),
         "order": {
-            "side":             side,
-            "pair":             fut_pair(symbol),
-            "order_type":       "limit_order",
-            "price":            entry,
-            "total_quantity":   qty,
-            "leverage":         LEVERAGE,
+            "side":              side,
+            "pair":              fut_pair(symbol),
+            "order_type":        "limit_order",
+            "price":             entry,
+            "total_quantity":    qty,
+            "leverage":          LEVERAGE,
             "take_profit_price": tp,
-            "stop_loss_price":  sl_base,
+            "stop_loss_price":   sl_base,
         },
     }
 
@@ -489,16 +510,17 @@ def place_order(side, symbol, entry_price, candles, atr, precision, entry_reason
     )
     result = response.json()
 
-    # ── Log full exchange response so rejections are visible ─────────────────
+    # ── Log full exchange response ────────────────────────────────────────────
     print(f"[API] {symbol} response: {result}")
 
-    # ── Bail out if exchange rejected the order ───────────────────────────────
-    if "order" not in result:
+    # ── Bail out if exchange rejected ────────────────────────────────────────
+    if "order" not in result and not isinstance(result, list):
         print(f"[ERROR] {symbol} order not placed: {result}")
         return None, None
 
     try:
-        tp_confirmed = result["order"]["take_profit_trigger"]
+        order = result[0] if isinstance(result, list) else result["order"]
+        tp_confirmed = order.get("take_profit_price", tp)
     except Exception:
         tp_confirmed = tp
 
@@ -550,12 +572,12 @@ def check_ema_and_trade(symbol, row, df):
             print(f"[SKIP] {symbol} EMA slope not down ({round(slope, precision)})")
             return
 
-    # ── Filter 2: Previous candle closed below EMA ───────────────────────────
+    # ── Filter 2: Previous closed candle below EMA ───────────────────────────
     if prev_close >= ema:
         print(f"[SKIP] {symbol} prev close {prev_close} >= EMA {ema}")
         return
 
-    # ── Filter 3: Price must be inside entry zone ─────────────────────────────
+    # ── Filter 3: Current price must be inside entry zone ────────────────────
     ema_upper = round(ema * EMA_ENTRY_PCT_HI, precision)
     ema_lower = round(ema * EMA_ENTRY_PCT_LO, precision)
 
@@ -573,10 +595,20 @@ def check_ema_and_trade(symbol, row, df):
             return
 
     # ── Filter 5: Dual-path volume check ──────────────────────────────────────
-    #   Path A — SPIKE:   latest candle volume > 1.3x average
-    #   Path B — GRADUAL: candles[-2] and candles[-1] both bearish lower-closes
-    #                     with cumulative volume >= 1 avg candle
-    #   Latest candle body is NOT checked — entry on current price regardless.
+    #
+    #   Path A — SPIKE:
+    #       candles[-2] (last CLOSED candle) has volume > 1.3x average
+    #       SL → above candles[-2] high
+    #
+    #   Path B — GRADUAL:
+    #       candles[-3] and candles[-2] are both closed red candles,
+    #       each closing lower, with sufficient cumulative volume.
+    #       SL → above candles[-3] high (1st red candle)
+    #            break above it = setup fully invalidated
+    #
+    #   candles[-1] = current LIVE candle, never checked for color.
+    #   Entry is just taken at current price if filters pass.
+    #
     spike   = volume_spike(candles)
     gradual = gradual_decline(candles)
 
