@@ -198,7 +198,6 @@ def volume_spike(candles, lookback=20, mult=VOL_SPIKE_MULT):
     if len(candles) < lookback + 2:
         return True
     vols    = [float(c.get("volume", 0)) for c in candles]
-    # avg of the lookback candles before the last closed candle
     avg_vol = sum(vols[-(lookback + 2):-2]) / lookback
     cur_vol = vols[-2]   # last CLOSED candle
     if avg_vol == 0:
@@ -306,6 +305,43 @@ def get_position_entry(symbol):
         return None
     except Exception:
         return None
+
+
+# =====================================================
+# ACTIVE ORDERS CHECK
+# =====================================================
+
+def has_active_order(symbol):
+    """
+    Returns True if there is any open/pending order for this pair
+    that has not yet been filled or cancelled.
+    Statuses considered active: initial, open, partially_filled.
+    This prevents placing a duplicate order when one is already sitting
+    on the book waiting to be filled.
+    """
+    try:
+        body = {
+            "timestamp":                  int(time.time() * 1000),
+            "page":                       1,
+            "size":                       50,
+            "margin_currency_short_name": "USDT",
+            "status":                     ["initial", "open", "partially_filled"],
+        }
+        payload, headers = sign_request(body)
+        url      = BASE_URL + "/exchange/v1/derivatives/futures/orders"
+        response = requests.post(url, data=payload, headers=headers)
+        orders   = response.json()
+
+        pair = fut_pair(symbol)
+        if isinstance(orders, list):
+            for o in orders:
+                if o.get("pair") == pair:
+                    return True
+        return False
+
+    except Exception as e:
+        print(f"has_active_order error ({symbol}):", e)
+        return False   # don't block trade on API error
 
 
 # =====================================================
@@ -513,13 +549,13 @@ def place_order(side, symbol, entry_price, candles, atr, precision, entry_reason
     # ── Log full exchange response ────────────────────────────────────────────
     print(f"[API] {symbol} response: {result}")
 
-    # ── Bail out if exchange rejected ────────────────────────────────────────
+    # ── Bail out if exchange rejected ─────────────────────────────────────────
     if "order" not in result and not isinstance(result, list):
         print(f"[ERROR] {symbol} order not placed: {result}")
         return None, None
 
     try:
-        order = result[0] if isinstance(result, list) else result["order"]
+        order        = result[0] if isinstance(result, list) else result["order"]
         tp_confirmed = order.get("take_profit_price", tp)
     except Exception:
         tp_confirmed = tp
@@ -595,20 +631,10 @@ def check_ema_and_trade(symbol, row, df):
             return
 
     # ── Filter 5: Dual-path volume check ──────────────────────────────────────
-    #
-    #   Path A — SPIKE:
-    #       candles[-2] (last CLOSED candle) has volume > 1.3x average
-    #       SL → above candles[-2] high
-    #
-    #   Path B — GRADUAL:
-    #       candles[-3] and candles[-2] are both closed red candles,
-    #       each closing lower, with sufficient cumulative volume.
-    #       SL → above candles[-3] high (1st red candle)
-    #            break above it = setup fully invalidated
-    #
-    #   candles[-1] = current LIVE candle, never checked for color.
-    #   Entry is just taken at current price if filters pass.
-    #
+    #   Path A — SPIKE:   candles[-2] volume > 1.3x average
+    #   Path B — GRADUAL: candles[-3] and candles[-2] both closed red,
+    #                     each lower close, sufficient cumulative volume
+    #   candles[-1] = current LIVE candle, never checked for color
     spike   = volume_spike(candles)
     gradual = gradual_decline(candles)
 
@@ -642,7 +668,7 @@ def check_ema_and_trade(symbol, row, df):
     except Exception:
         pass
 
-    # ── Active position: refresh TP + trailing SL ────────────────────────────
+    # ── Active position check: refresh TP + trailing SL ──────────────────────
     positions = get_open_positions()
     pair      = fut_pair(symbol)
 
@@ -654,6 +680,11 @@ def check_ema_and_trade(symbol, row, df):
                 update_sheet_tp(row, tp_live)
             maybe_update_trailing_sl(symbol, row, df, precision)
             return
+
+    # ── Active order check: skip if unfilled order already on the book ────────
+    if has_active_order(symbol):
+        print(f"[SKIP] {symbol} already has an active order on the book")
+        return
 
     # ── New trade entry ───────────────────────────────────────────────────────
     tp_confirmed, sl_placed = place_order(
