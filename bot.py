@@ -181,11 +181,6 @@ def compute_rsi(closes, period=RSI_PERIOD):
     return round(100 - (100 / (1 + rs)), 2)
 
 
-def bearish_candle(candle):
-    """True if the candle closed below its open (bearish body)."""
-    return float(candle["close"]) < float(candle["open"])
-
-
 # =====================================================
 # VOLUME FILTERS  (dual-path)
 # =====================================================
@@ -212,9 +207,9 @@ def gradual_decline(candles,
     PATH B — 2 consecutive bearish lower-closes.
 
     Structure (GRADUAL_CONSEC = 2):
-        candles[-3]  prior candle  (for comparison only)
-        candles[-2]  1st red candle  ← SL goes above this one's high
-        candles[-1]  2nd red candle  ← signal / entry candle
+        candles[-3]  prior candle       (comparison reference only)
+        candles[-2]  1st red candle  <- SL goes above this one's high
+        candles[-1]  2nd red candle  <- signal / entry candle
 
     Returns True when ALL of:
       1. Each of the 2 candles closes lower than the one before it.
@@ -459,11 +454,11 @@ def place_order(side, symbol, entry_price, candles, atr, precision, entry_reason
 
     # ── Dynamic TP / SL via ATR ──────────────────────────────────────────────
     if atr:
-        tp      = round(entry - atr * ATR_TP_MULT,              precision)
-        sl_base = round(sl_candle_high + atr * ATR_SL_MULT,     precision)
+        tp      = round(entry - atr * ATR_TP_MULT,           precision)
+        sl_base = round(sl_candle_high + atr * ATR_SL_MULT,  precision)
     else:
-        tp      = round(entry * 0.95,                            precision)
-        sl_base = round(sl_candle_high * 1.001,                  precision)
+        tp      = round(entry * 0.95,                         precision)
+        sl_base = round(sl_candle_high * 1.001,               precision)
 
     # ── Reward / Risk gate ───────────────────────────────────────────────────
     reward = entry - tp
@@ -564,7 +559,8 @@ def check_ema_and_trade(symbol, row, df, allow_trade):
         return
 
     # ── Filter 3: Price must be inside entry zone ─────────────────────────────
-    #   Checked before RSI/volume so we don't waste cycles on far-away prices.
+    #   Checked before RSI/volume so we skip expensive checks when price
+    #   is far from EMA — no point scanning volume on a coin 15% away.
     ema_upper = round(ema * EMA_ENTRY_PCT_HI, precision)   # 0.5% below EMA
     ema_lower = round(ema * EMA_ENTRY_PCT_LO, precision)   # 3.0% below EMA
 
@@ -582,22 +578,21 @@ def check_ema_and_trade(symbol, row, df, allow_trade):
             print(f"[SKIP] {symbol} RSI {rsi} outside [{RSI_MIN}, {RSI_MAX}]")
             return
 
-    # ── Filter 5: Current candle must be bearish ──────────────────────────────
-    if not bearish_candle(candles[-1]):
-        print(f"[SKIP] {symbol} latest candle not bearish")
-        return
-
-    # ── Filter 6: Dual-path volume check ──────────────────────────────────────
+    # ── Filter 5: Dual-path volume check ──────────────────────────────────────
+    #
+    #   No check on the latest (current) candle body — it can be bullish,
+    #   doji, or anything. What matters is the past 2 candles (Path B)
+    #   or a volume spike (Path A).
     #
     #   Path A — SPIKE:
-    #       One big candle with volume > 1.3x average.
+    #       Latest candle volume > 1.3x average.
     #       SL → above candles[-2] high (previous candle).
     #
     #   Path B — GRADUAL:
-    #       2 consecutive bearish candles each closing lower,
-    #       cumulative volume >= 1 average candle.
+    #       candles[-2] and candles[-1] are both bearish and each closes
+    #       lower than the one before. Cumulative volume >= 1 avg candle.
     #       SL → above candles[-2] high (1st of the 2 red candles).
-    #            A break above it fully invalidates the setup.
+    #            Break above it invalidates the full setup.
     #
     #   Both fail → dead volume / noise → skip.
     #
