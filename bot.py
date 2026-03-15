@@ -316,7 +316,7 @@ def has_active_order(symbol):
     Returns True if there is any open/pending order for this pair
     that has not yet been filled or cancelled.
     Statuses considered active: initial, open, partially_filled.
-    This prevents placing a duplicate order when one is already sitting
+    Prevents placing a duplicate order when one is already sitting
     on the book waiting to be filled.
     """
     try:
@@ -449,23 +449,22 @@ def get_quantity_step(symbol):
         return Decimal("1")
 
 
-def compute_qty(entry_price, symbol, atr):
+def compute_qty(entry_price, symbol):
     """
-    Risk-adjusted sizing: risk exactly 1% of capital per trade.
-    qty = (capital * 0.01) / (ATR * ATR_SL_MULT)
-    Falls back to leverage-based sizing when ATR is unavailable.
+    Fixed sizing: always spend exactly CAPITAL_USDT * LEVERAGE.
+    qty = (CAPITAL_USDT * LEVERAGE) / entry_price
+
+    Example — CAPITAL_USDT=5, LEVERAGE=6, entry=0.01793:
+        exposure = 5 * 6 = 30 USDT
+        qty      = 30 / 0.01793 = 1673 coins
+    This is consistent across all coins regardless of ATR or volatility.
     """
     step     = get_quantity_step(symbol)
     capital  = Decimal(str(CAPITAL_USDT))
     leverage = Decimal(str(LEVERAGE))
 
-    if atr and atr > 0:
-        risk_amount = capital * Decimal("0.01")
-        sl_distance = Decimal(str(atr)) * Decimal(str(ATR_SL_MULT))
-        raw_qty     = risk_amount / sl_distance
-    else:
-        exposure = capital * leverage
-        raw_qty  = exposure / Decimal(str(entry_price))
+    exposure = capital * leverage
+    raw_qty  = exposure / Decimal(str(entry_price))
 
     qty = (raw_qty / step).quantize(Decimal("1")) * step
     if qty <= 0:
@@ -516,7 +515,8 @@ def place_order(side, symbol, entry_price, candles, atr, precision, entry_reason
         )
         return None, None
 
-    qty = compute_qty(entry_price, symbol, atr)
+    # ── Quantity: fixed capital * leverage / price ────────────────────────────
+    qty = compute_qty(entry_price, symbol)
 
     print(
         f"[TRADE] {symbol} SELL | Entry {entry} | TP {tp} | SL {sl_base} "
