@@ -100,61 +100,12 @@ def sign_request(body):
     ).hexdigest()
 
     headers = {
-    "Content-Type":"application/json",
-    "X-AUTH-APIKEY":COINDCX_KEY,
-    "X-AUTH-SIGNATURE":signature
+        "Content-Type":"application/json",
+        "X-AUTH-APIKEY":COINDCX_KEY,
+        "X-AUTH-SIGNATURE":signature
     }
 
     return payload,headers
-
-
-# =====================================================
-# BTC TREND FILTER
-# =====================================================
-
-def btc_is_bearish():
-
-    try:
-
-        pair_api="B-BTC_USDT"
-
-        url="https://public.coindcx.com/market_data/candlesticks"
-
-        now=int(time.time())
-
-        params={
-            "pair":pair_api,
-            "from":now-(360000),
-            "to":now,
-            "resolution":"15",
-            "pcode":"f"
-        }
-
-        response=requests.get(url,params=params)
-
-        candles=sorted(response.json()["data"],key=lambda x:x["time"])
-
-        closes=[float(c["close"]) for c in candles]
-
-        period=200
-        multiplier=2/(period+1)
-
-        ema=sum(closes[:period])/period
-
-        for price in closes[period:]:
-            ema=(price-ema)*multiplier+ema
-
-        btc_price=closes[-1]
-
-        if btc_price<ema:
-            print("[BTC] Bearish")
-            return True
-        else:
-            print("[BTC] Bullish")
-            return False
-
-    except:
-        return False
 
 
 # =====================================================
@@ -307,12 +258,10 @@ def place_order(side,symbol,entry_price,ema,candles):
 
     entry=round(entry_price,precision)
 
-    tp=entry*0.95
+    tp=round(entry*0.95,precision)
 
     previous_high=float(candles[-2]["high"])
     sl=round(previous_high*1.001,precision)
-
-    tp=round(tp,precision)
 
     print(f"[TRADE] {symbol} SELL | Entry {entry} | TP {tp} | SL {sl}")
 
@@ -386,29 +335,59 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
 
     ema=round(ema,precision)
 
-    recent_high=max([float(c["high"]) for c in candles[-5:]])
-
-    # UPDATED ENTRY ZONE
+    # ENTRY ZONE
     ema_upper=round(ema*0.995,precision)
     ema_lower=round(ema*0.97,precision)
 
-    print(f"[CHECK] {symbol} | Close {last_close} | EMA {ema}")
+    print(f"[CHECK] {symbol} | Price {last_close} | EMA {ema}")
 
-    if not btc_is_bearish():
-        print("[SKIP] BTC bullish")
+    # =====================================================
+    # NEW CONDITION: LAST 2 CANDLES MUST BE RED
+    # =====================================================
+
+    prev1_open=float(candles[-2]["open"])
+    prev1_close=float(candles[-2]["close"])
+
+    prev2_open=float(candles[-3]["open"])
+    prev2_close=float(candles[-3]["close"])
+
+    if not (prev1_close < prev1_open and prev2_close < prev2_open):
+
+        print(f"[SKIP] {symbol} last two candles not red")
         return
 
-    sweep_entry = recent_high > ema and last_close < ema
-    breakdown_entry = last_close < ema*0.995 and prev_close < ema
-
-    if not (sweep_entry or breakdown_entry):
-        print(f"[SKIP] {symbol} no sweep or breakdown")
-        return
+    # =====================================================
+    # TP LOGIC
+    # =====================================================
 
     tp_raw=df.iloc[row,1]
 
     if str(tp_raw).upper()=="TP COMPLETED":
         return
+
+    try:
+
+        tp=float(tp_raw)
+
+        if last_close<=tp:
+
+            update_sheet_tp(row,"TP COMPLETED")
+            return
+
+        recent_low=get_recent_low(symbol)
+
+        if recent_low and recent_low<=tp:
+
+            update_sheet_tp(row,"TP COMPLETED")
+            return
+
+    except:
+        pass
+
+
+    # =====================================================
+    # ACTIVE POSITION CHECK
+    # =====================================================
 
     positions=get_open_positions()
     pair=fut_pair(symbol)
@@ -426,24 +405,12 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
 
             return
 
-    try:
 
-        tp=float(tp_raw)
+    # =====================================================
+    # ENTRY
+    # =====================================================
 
-        if last_close<=tp:
-            update_sheet_tp(row,"TP COMPLETED")
-            return
-
-        recent_low=get_recent_low(symbol)
-
-        if recent_low and recent_low<=tp:
-            update_sheet_tp(row,"TP COMPLETED")
-            return
-
-    except:
-        pass
-
-    if allow_trade and ema_lower<=last_close<=ema_upper:
+    if allow_trade and ema_lower <= last_close <= ema_upper:
 
         tp=place_order("sell",symbol,last_close,ema,candles)
 
@@ -463,7 +430,16 @@ while True:
 
         df=get_sheet_data()
 
+        if df.empty:
+            time.sleep(30)
+            continue
+
         allow_trade=(cycle%10==0)
+
+        if allow_trade:
+            print("----- TRADE SCAN (5 MIN) -----")
+        else:
+            print("----- TP MONITOR (30s) -----")
 
         for row in range(len(df)):
 
@@ -483,5 +459,4 @@ while True:
     except Exception as e:
 
         print("BOT ERROR:",e)
-
         time.sleep(60)
