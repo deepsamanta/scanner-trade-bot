@@ -320,45 +320,41 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
 
     closes=[float(c["close"]) for c in candles]
 
+    if len(closes)<200:
+        return
+
     period=200
     multiplier=2/(period+1)
 
     ema=sum(closes[:period])/period
+    ema_values=[ema]
 
     for price in closes[period:]:
         ema=(price-ema)*multiplier+ema
+        ema_values.append(ema)
 
     last_close=float(candles[-1]["close"])
     prev_close=float(candles[-2]["close"])
 
     precision=len(str(last_close).split(".")[1]) if "." in str(last_close) else 0
-
     ema=round(ema,precision)
 
-    # ENTRY ZONE
+    # EMA slope filter
+    if len(ema_values) > 5:
+        slope = ema_values[-1] - ema_values[-5]
+        if slope >= 0:
+            print(f"[SKIP] {symbol} EMA slope not down")
+            return
+
+    # previous candle close below EMA
+    if prev_close >= ema:
+        print(f"[SKIP] {symbol} previous candle not below EMA")
+        return
+
     ema_upper=round(ema*0.995,precision)
     ema_lower=round(ema*0.97,precision)
 
     print(f"[CHECK] {symbol} | Price {last_close} | EMA {ema}")
-
-    # =====================================================
-    # NEW CONDITION: LAST 2 CANDLES MUST BE RED
-    # =====================================================
-
-    prev1_open=float(candles[-2]["open"])
-    prev1_close=float(candles[-2]["close"])
-
-    prev2_open=float(candles[-3]["open"])
-    prev2_close=float(candles[-3]["close"])
-
-    if not (prev1_close < prev1_open and prev2_close < prev2_open):
-
-        print(f"[SKIP] {symbol} last two candles not red")
-        return
-
-    # =====================================================
-    # TP LOGIC
-    # =====================================================
 
     tp_raw=df.iloc[row,1]
 
@@ -370,24 +366,17 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
         tp=float(tp_raw)
 
         if last_close<=tp:
-
             update_sheet_tp(row,"TP COMPLETED")
             return
 
         recent_low=get_recent_low(symbol)
 
         if recent_low and recent_low<=tp:
-
             update_sheet_tp(row,"TP COMPLETED")
             return
 
     except:
         pass
-
-
-    # =====================================================
-    # ACTIVE POSITION CHECK
-    # =====================================================
 
     positions=get_open_positions()
     pair=fut_pair(symbol)
@@ -404,11 +393,6 @@ def check_ema_and_trade(symbol,row,df,allow_trade):
                 update_sheet_tp(row,tp)
 
             return
-
-
-    # =====================================================
-    # ENTRY
-    # =====================================================
 
     if allow_trade and ema_lower <= last_close <= ema_upper:
 
