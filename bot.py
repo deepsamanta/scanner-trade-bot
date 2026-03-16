@@ -15,21 +15,11 @@ getcontext().prec = 28
 BASE_URL = "https://api.coindcx.com"
 
 # ─── TUNEABLE CONSTANTS ────────────────────────────────────────────────────────
-EMA_PERIOD           = 200
-ATR_PERIOD           = 14        # candles for ATR
-TP_PCT               = 0.05      # TP = entry * (1 - 0.05) → fixed 5% below entry
-ATR_SL_MULT          = 1.2       # SL = sl_candle_high + ATR * mult
-MIN_RR               = 1.8       # skip trade if reward/risk < this
-EMA_ENTRY_PCT_HI     = 0.995     # entry zone upper bound  (0.5% below EMA)
-EMA_ENTRY_PCT_LO     = 0.970     # entry zone lower bound  (3%  below EMA)
-RSI_PERIOD           = 14
-RSI_MIN              = 35        # only short when RSI >= this
-RSI_MAX              = 65        # only short when RSI <= this
-EMA_SLOPE_BARS       = 5         # candles to measure EMA slope
-VOL_SPIKE_MULT       = 1.3       # current vol must be > avg_vol * this (Path A)
-GRADUAL_CONSEC       = 2         # 2 consecutive closed red candles (Path B)
-GRADUAL_VOL_LOOKBACK = 20        # candles to compute avg vol for gradual check
-TRAIL_TRIGGER_PCT    = 0.015     # move SL to break-even once price drops 1.5%
+EMA_FAST_PERIOD  = 50           # 50 EMA  — trailing SL reference
+EMA_SLOW_PERIOD  = 100          # 100 EMA — entry trigger level
+TP_PCT           = 0.05         # TP = entry * (1 - 0.05) → fixed 5% below entry
+SL_BUFFER        = 1.001        # SL = ema50 * 1.001 (0.1% buffer above 50 EMA)
+MIN_RR           = 1.5          # skip trade if reward/risk < this
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -140,12 +130,6 @@ def get_precision(raw_candle_close):
     """
     Derive decimal precision from the raw API string.
     Avoids float noise e.g. 0.004823 becoming 0.0048229999999999997.
-
-    Examples:
-        "0.004823"  -> 6
-        "1.25"      -> 2
-        "42381.5"   -> 1
-        "100"       -> 0
     """
     s = str(raw_candle_close)
     if "." in s:
@@ -166,111 +150,6 @@ def compute_ema(closes, period):
         ema = (price - ema) * multiplier + ema
         values.append(ema)
     return values
-
-
-def compute_atr(candles, period=ATR_PERIOD):
-    """Average True Range over the last `period` candles."""
-    trs = []
-    for i in range(1, len(candles)):
-        high       = float(candles[i]["high"])
-        low        = float(candles[i]["low"])
-        prev_close = float(candles[i - 1]["close"])
-        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-        trs.append(tr)
-    if len(trs) < period:
-        return None
-    return sum(trs[-period:]) / period
-
-
-def compute_rsi(closes, period=RSI_PERIOD):
-    """Wilder RSI."""
-    if len(closes) < period + 1:
-        return None
-    deltas   = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
-    gains    = [max(d, 0)      for d in deltas]
-    losses   = [abs(min(d, 0)) for d in deltas]
-    avg_gain = sum(gains[:period])  / period
-    avg_loss = sum(losses[:period]) / period
-    for g, l in zip(gains[period:], losses[period:]):
-        avg_gain = (avg_gain * (period - 1) + g) / period
-        avg_loss = (avg_loss * (period - 1) + l) / period
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return round(100 - (100 / (1 + rs)), 2)
-
-
-# =====================================================
-# VOLUME FILTERS  (dual-path)
-# =====================================================
-
-def volume_spike(candles, lookback=20, mult=VOL_SPIKE_MULT):
-    """
-    PATH A — single-candle spike.
-    Checks candles[-2] (last CLOSED candle) volume vs average.
-    candles[-1] is the live candle and is excluded.
-
-    True if candles[-2] volume > mult * average of prior `lookback` candles.
-    """
-    if len(candles) < lookback + 2:
-        return True
-    vols    = [float(c.get("volume", 0)) for c in candles]
-    avg_vol = sum(vols[-(lookback + 2):-2]) / lookback
-    cur_vol = vols[-2]   # last CLOSED candle
-    if avg_vol == 0:
-        return True
-    return cur_vol >= avg_vol * mult
-
-
-def gradual_decline(candles,
-                    lookback=GRADUAL_VOL_LOOKBACK,
-                    consec=GRADUAL_CONSEC):
-    """
-    PATH B — 2 consecutive CLOSED bearish lower-closes.
-
-    candles[-1] is the current live candle — completely ignored here.
-
-    Structure:
-        candles[-4]  prior candle       (comparison reference only)
-        candles[-3]  1st red candle  ← SL goes above THIS high
-        candles[-2]  2nd red candle  ← confirmed closed red
-        candles[-1]  current candle  ← live, entry price only
-
-    Returns True when ALL of:
-      1. candles[-3] and candles[-2] each close lower than the one before.
-      2. Both have bearish bodies (close < open).
-      3. Their combined volume >= one average candle volume.
-    """
-    if len(candles) < lookback + consec + 2:
-        return False
-
-    # window excludes candles[-1] (live candle)
-    # recent = [candles[-4], candles[-3], candles[-2]]
-    recent  = candles[-(consec + 2):-1]
-    vols    = [float(c.get("volume", 0)) for c in candles]
-    avg_vol = sum(vols[-(lookback + consec + 1):-(consec + 1)]) / lookback
-
-    for i in range(1, consec + 1):
-        c          = recent[i]
-        c_prev     = recent[i - 1]
-        close      = float(c["close"])
-        open_      = float(c["open"])
-        prev_close = float(c_prev["close"])
-
-        if close >= prev_close:   # not closing lower
-            return False
-        if close >= open_:        # not a bearish body
-            return False
-
-    # cumulative volume of the 2 closed red candles
-    cum_vol = sum(
-        float(candles[-(consec + i + 1)].get("volume", 0))
-        for i in range(consec)
-    )
-    if avg_vol > 0 and cum_vol < avg_vol:
-        return False              # too quiet — noise, not real selling
-
-    return True
 
 
 # =====================================================
@@ -332,9 +211,6 @@ def has_active_order(symbol):
     """
     Returns True if there is any open/pending order for this pair
     that has not yet been filled or cancelled.
-    Statuses considered active: initial, open, partially_filled.
-    Prevents placing a duplicate order when one is already sitting
-    on the book waiting to be filled.
     """
     try:
         body = {
@@ -358,7 +234,7 @@ def has_active_order(symbol):
 
     except Exception as e:
         print(f"has_active_order error ({symbol}):", e)
-        return False   # don't block trade on API error
+        return False
 
 
 # =====================================================
@@ -386,35 +262,19 @@ def get_recent_low(symbol):
 
 
 # =====================================================
-# TRAILING STOP UPDATE
+# TRAILING SL UPDATE  (50 EMA based)
 # =====================================================
 
-def maybe_update_trailing_sl(symbol, row, df, precision):
+def maybe_update_trailing_sl(symbol, row, df, precision, ema50):
     """
-    Once price drops TRAIL_TRIGGER_PCT below entry (trade is in profit),
-    move SL to break-even on both the exchange and the sheet.
+    Strategy: SL dynamically follows the 50 EMA.
+    SL = ema50 * SL_BUFFER (0.1% above 50 EMA).
+    Updates on every monitor cycle as long as position is open.
+    Only moves SL if new SL is LOWER than current SL
+    (for shorts, SL moves down as 50 EMA drops — locks in more profit).
     """
     try:
-        entry = get_position_entry(symbol)
-        if entry is None:
-            return
-
-        pair_api = fut_pair(symbol)
-        url  = "https://public.coindcx.com/market_data/candlesticks"
-        now  = int(time.time())
-        params = {
-            "pair":       pair_api,
-            "from":       now - 60,
-            "to":         now,
-            "resolution": "1",
-            "pcode":      "f",
-        }
-        resp       = requests.get(url, params=params)
-        last_price = float(resp.json()["data"][-1]["close"])
-
-        trail_target = entry * (1 - TRAIL_TRIGGER_PCT)
-        if last_price > trail_target:
-            return
+        new_sl = round(ema50 * SL_BUFFER, precision)
 
         sl_raw = df.iloc[row, 2] if df.shape[1] > 2 else ""
         try:
@@ -422,15 +282,15 @@ def maybe_update_trailing_sl(symbol, row, df, precision):
         except Exception:
             current_sl = None
 
-        breakeven_sl = round(entry * 1.0003, precision)
-
-        if current_sl is not None and current_sl <= breakeven_sl:
+        # For shorts: only update if new SL is lower (more favorable)
+        if current_sl is not None and new_sl >= current_sl:
             return
 
+        pair_api = fut_pair(symbol)
         body = {
             "timestamp":       int(time.time() * 1000),
             "pair":            pair_api,
-            "stop_loss_price": breakeven_sl,
+            "stop_loss_price": new_sl,
         }
         payload, headers = sign_request(body)
         requests.post(
@@ -438,8 +298,8 @@ def maybe_update_trailing_sl(symbol, row, df, precision):
             data=payload,
             headers=headers,
         )
-        update_sheet_sl(row, breakeven_sl)
-        print(f"[TRAIL] {symbol} SL moved to break-even {breakeven_sl}")
+        update_sheet_sl(row, new_sl)
+        print(f"[TRAIL] {symbol} SL updated to 50 EMA level {new_sl}")
 
     except Exception as e:
         print(f"[TRAIL] {symbol} error: {e}")
@@ -470,11 +330,6 @@ def compute_qty(entry_price, symbol):
     """
     Fixed sizing: always spend exactly CAPITAL_USDT * LEVERAGE.
     qty = (CAPITAL_USDT * LEVERAGE) / entry_price
-
-    Example — CAPITAL_USDT=5, LEVERAGE=6, entry=0.01793:
-        exposure = 5 * 6 = 30 USDT
-        qty      = 30 / 0.01793 = 1673 coins
-    This is consistent across all coins regardless of ATR or volatility.
     """
     step     = get_quantity_step(symbol)
     capital  = Decimal(str(CAPITAL_USDT))
@@ -494,39 +349,21 @@ def compute_qty(entry_price, symbol):
 # PLACE ORDER
 # =====================================================
 
-def place_order(side, symbol, entry_price, candles, atr, precision, entry_reason):
+def place_order(side, symbol, entry_price, ema50, precision):
     entry = round(entry_price, precision)
 
     # ── TP: fixed 5% below entry ─────────────────────────────────────────────
     tp = round(entry * (1 - TP_PCT), precision)
 
-    # ── SL candle selection ───────────────────────────────────────────────────
-    #
-    #   GRADUAL path:
-    #       candles[-3] = 1st closed red candle → SL above THIS high
-    #       candles[-2] = 2nd closed red candle
-    #       candles[-1] = current live candle   → entry only
-    #
-    #   SPIKE path:
-    #       candles[-2] = last closed candle    → SL above this high
-    #       candles[-1] = current live candle   → entry only
-    #
-    if entry_reason == "GRADUAL":
-        sl_candle_high = float(candles[-3]["high"])   # 1st closed red candle
-    else:
-        sl_candle_high = float(candles[-2]["high"])   # last closed candle
-
-    # ── SL: candle high + ATR buffer ─────────────────────────────────────────
-    if atr:
-        sl_base = round(sl_candle_high + atr * ATR_SL_MULT, precision)
-    else:
-        sl_base = round(sl_candle_high * 1.001, precision)
+    # ── SL: 50 EMA + 0.1% buffer ─────────────────────────────────────────────
+    #   Mirrors Pine Script: dynamicSL = ema50 * 1.001
+    sl_base = round(ema50 * SL_BUFFER, precision)
 
     # ── Reward / Risk gate ───────────────────────────────────────────────────
     reward = entry - tp
     risk   = sl_base - entry
     if risk <= 0 or (reward / risk) < MIN_RR:
-        rr = round(reward / risk, 2) if risk > 0 else 'inf'
+        rr = round(reward / risk, 2) if risk > 0 else "inf"
         print(f"[SKIP] {symbol} RR {rr} < {MIN_RR}")
         send_telegram(
             f"⚠️ <b>SIGNAL SKIPPED — {symbol}</b>\n"
@@ -534,17 +371,15 @@ def place_order(side, symbol, entry_price, candles, atr, precision, entry_reason
             f"❌ Reason : <code>RR {rr} below minimum {MIN_RR}</code>\n"
             f"📍 Entry  : <code>{entry}</code>\n"
             f"🎯 TP     : <code>{tp}</code>\n"
-            f"🛑 SL     : <code>{sl_base}</code>\n"
-            f"⚡ Signal : <code>{entry_reason}</code>"
+            f"🛑 SL     : <code>{sl_base}</code>"
         )
         return None, None
 
-    # ── Quantity: fixed capital * leverage / price ────────────────────────────
     qty = compute_qty(entry_price, symbol)
 
     print(
         f"[TRADE] {symbol} SELL | Entry {entry} | TP {tp} | SL {sl_base} "
-        f"| RR {round(reward / risk, 2)} | Qty {qty} | {entry_reason}"
+        f"| RR {round(reward / risk, 2)} | Qty {qty}"
     )
 
     # ── Order body — matches official CoinDCX API spec ────────────────────────
@@ -570,7 +405,6 @@ def place_order(side, symbol, entry_price, candles, atr, precision, entry_reason
     )
     result = response.json()
 
-    # ── Log full exchange response ────────────────────────────────────────────
     print(f"[API] {symbol} response: {result}")
 
     # ── Bail out if exchange rejected ─────────────────────────────────────────
@@ -582,7 +416,6 @@ def place_order(side, symbol, entry_price, candles, atr, precision, entry_reason
             f"📍 Entry  : <code>{entry}</code>\n"
             f"🎯 TP     : <code>{tp}</code>\n"
             f"🛑 SL     : <code>{sl_base}</code>\n"
-            f"⚡ Signal : <code>{entry_reason}</code>\n"
             f"⚠️ Response : <code>{str(result)[:200]}</code>"
         )
         return None, None
@@ -597,13 +430,12 @@ def place_order(side, symbol, entry_price, candles, atr, precision, entry_reason
     send_telegram(
         f"🔴 <b>NEW SHORT — {symbol}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"📍 Entry  : <code>{entry}</code>\n"
-        f"🎯 TP     : <code>{tp}</code>  (-{int(TP_PCT*100)}%)\n"
-        f"🛑 SL     : <code>{sl_base}</code>\n"
-        f"📊 RR     : <code>{round(reward / risk, 2)}</code>\n"
-        f"📦 Qty    : <code>{qty}</code>\n"
-        f"⚡ Signal : <code>{entry_reason}</code>\n"
-        f"💰 Margin : <code>{CAPITAL_USDT} USDT x {LEVERAGE}x</code>"
+        f"📍 Entry   : <code>{entry}</code>\n"
+        f"🎯 TP      : <code>{tp}</code>  (-{int(TP_PCT * 100)}%)\n"
+        f"🛑 SL      : <code>{sl_base}</code>  (50 EMA × 1.001)\n"
+        f"📊 RR      : <code>{round(reward / risk, 2)}</code>\n"
+        f"📦 Qty     : <code>{qty}</code>\n"
+        f"💰 Margin  : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
     )
 
     return tp_confirmed, sl_base
@@ -613,34 +445,10 @@ def place_order(side, symbol, entry_price, candles, atr, precision, entry_reason
 # MAIN LOGIC
 # =====================================================
 
-def check_ema_and_trade(symbol, row, df):
+def check_and_trade(symbol, row, df):
 
-    pair = fut_pair(symbol)
-
-    # ── Check active position FIRST — no need to run any filters ─────────────
-    positions = get_open_positions()
-    for pos in positions:
-        if pos.get("pair") == pair:
-            print(f"[ACTIVE TRADE] {symbol} — position already open, skipping filters")
-            precision = get_precision(
-                requests.get(
-                    "https://public.coindcx.com/market_data/candlesticks",
-                    params={"pair": pair, "from": int(time.time()) - 900,
-                            "to": int(time.time()), "resolution": "15", "pcode": "f"}
-                ).json()["data"][-1]["close"]
-            )
-            tp_live = get_position_tp(symbol)
-            if tp_live:
-                update_sheet_tp(row, tp_live)
-            maybe_update_trailing_sl(symbol, row, df, precision)
-            return
-
-    # ── Check active order — unfilled limit order already on the book ─────────
-    if has_active_order(symbol):
-        print(f"[ACTIVE ORDER] {symbol} — order already on the book, skipping filters")
-        return
-
-    pair_api = fut_pair(symbol)
+    pair     = fut_pair(symbol)
+    pair_api = pair
     url      = "https://public.coindcx.com/market_data/candlesticks"
     now      = int(time.time())
 
@@ -655,85 +463,42 @@ def check_ema_and_trade(symbol, row, df):
     response = requests.get(url, params=params)
     candles  = sorted(response.json()["data"], key=lambda x: x["time"])
 
-    if len(candles) < EMA_PERIOD + RSI_PERIOD + 5:
+    # Need at least 100 candles for slow EMA
+    if len(candles) < EMA_SLOW_PERIOD + 5:
         return
 
-    # ── Precision from raw API string (avoids float noise) ───────────────────
+    # ── Precision from raw API string ────────────────────────────────────────
     precision  = get_precision(candles[-1]["close"])
-
     closes     = [float(c["close"]) for c in candles]
     last_close = float(candles[-1]["close"])
     prev_close = float(candles[-2]["close"])
 
-    # ── Indicators ───────────────────────────────────────────────────────────
-    ema_values = compute_ema(closes, EMA_PERIOD)
-    atr        = compute_atr(candles)
-    rsi        = compute_rsi(closes)
+    # ── Compute both EMAs ────────────────────────────────────────────────────
+    ema50_values  = compute_ema(closes, EMA_FAST_PERIOD)
+    ema100_values = compute_ema(closes, EMA_SLOW_PERIOD)
 
-    ema        = round(ema_values[-1], precision)
+    ema50  = round(ema50_values[-1],  precision)
+    ema100 = round(ema100_values[-1], precision)
 
-    # ── Filter 1: EMA slope must be declining ────────────────────────────────
-    if len(ema_values) > EMA_SLOPE_BARS:
-        slope = ema_values[-1] - ema_values[-EMA_SLOPE_BARS]
-        if slope >= 0:
-            print(f"[SKIP] {symbol} EMA slope not down ({round(slope, precision)})")
+    # Also need previous values for crossunder detection
+    ema50_prev  = round(ema50_values[-2],  precision)
+    ema100_prev = round(ema100_values[-2], precision)
+
+    # ── Check active position FIRST ───────────────────────────────────────────
+    positions = get_open_positions()
+    for pos in positions:
+        if pos.get("pair") == pair:
+            print(f"[ACTIVE TRADE] {symbol} — updating trailing SL to 50 EMA {ema50}")
+            tp_live = get_position_tp(symbol)
+            if tp_live:
+                update_sheet_tp(row, tp_live)
+            maybe_update_trailing_sl(symbol, row, df, precision, ema50)
             return
 
-    # ── Filter 2: Previous closed candle below EMA ───────────────────────────
-    if prev_close >= ema:
-        print(f"[SKIP] {symbol} prev close {prev_close} >= EMA {ema}")
+    # ── Check active order ────────────────────────────────────────────────────
+    if has_active_order(symbol):
+        print(f"[ACTIVE ORDER] {symbol} — order already on the book, skipping")
         return
-
-    # ── Filter 3: Current price must be inside entry zone ────────────────────
-    ema_upper = round(ema * EMA_ENTRY_PCT_HI, precision)
-    ema_lower = round(ema * EMA_ENTRY_PCT_LO, precision)
-
-    if not (ema_lower <= last_close <= ema_upper):
-        print(
-            f"[SKIP] {symbol} price {last_close} outside entry zone "
-            f"[{ema_lower} – {ema_upper}]"
-        )
-        return
-
-    # ── Filter 4: RSI confirmation (35–65) ───────────────────────────────────
-    if rsi is not None:
-        if rsi < RSI_MIN or rsi > RSI_MAX:
-            print(f"[SKIP] {symbol} RSI {rsi} outside [{RSI_MIN}, {RSI_MAX}]")
-            return
-
-    # ── Filter 5: Last 2 CLOSED candles must both be red ─────────────────────
-    #   Mandatory for ALL entries regardless of spike or gradual path.
-    #   candles[-3] = 1st closed red candle  ← SL will go above this high
-    #   candles[-2] = 2nd closed red candle  ← confirms bearish structure
-    #   candles[-1] = current live candle    ← entry price only, not checked
-    c1_close = float(candles[-3]["close"])
-    c1_open  = float(candles[-3]["open"])
-    c2_close = float(candles[-2]["close"])
-    c2_open  = float(candles[-2]["open"])
-
-    if c1_close >= c1_open or c2_close >= c2_open:
-        print(f"[SKIP] {symbol} last 2 closed candles not both red")
-        return
-
-    # ── Filter 6: Dual-path volume check ──────────────────────────────────────
-    #   Path A — SPIKE:   candles[-2] volume > 1.3x average
-    #   Path B — GRADUAL: candles[-3] and candles[-2] each close lower
-    #                     than the one before, sufficient cumulative volume
-    #   candles[-1] = current LIVE candle, never checked for color
-    spike   = volume_spike(candles)
-    gradual = gradual_decline(candles)
-
-    if not spike and not gradual:
-        print(f"[SKIP] {symbol} no volume spike and no gradual decline pattern")
-        return
-
-    entry_reason = "SPIKE" if spike else "GRADUAL"
-
-    print(
-        f"[SIGNAL] {symbol} | Price {last_close} | EMA {ema} "
-        f"| ATR {round(atr, precision) if atr else 'N/A'} "
-        f"| RSI {rsi} | Volume {entry_reason}"
-    )
 
     # ── TP completed check ───────────────────────────────────────────────────
     tp_raw = df.iloc[row, 1]
@@ -753,9 +518,40 @@ def check_ema_and_trade(symbol, row, df):
     except Exception:
         pass
 
-    # ── New trade entry ───────────────────────────────────────────────────────
+    # ── STRATEGY CONDITIONS ───────────────────────────────────────────────────
+    #
+    #   Pine Script logic translated to Python:
+    #
+    #   1. aboveContext = ema50 > ema100
+    #      50 EMA must be above 100 EMA (still in bullish cycle)
+    #
+    #   2. priceBreak = ta.crossunder(close, ema100)
+    #      Price crosses UNDER the 100 EMA
+    #      = prev candle closed ABOVE 100 EMA
+    #      AND current candle closed BELOW 100 EMA
+    #
+    #   3. shortCondition = aboveContext AND priceBreak
+    #
+
+    above_context = ema50 > ema100
+    price_crossunder = (prev_close >= ema100_prev) and (last_close < ema100)
+
+    if not above_context:
+        print(f"[SKIP] {symbol} 50 EMA {ema50} not above 100 EMA {ema100}")
+        return
+
+    if not price_crossunder:
+        print(f"[SKIP] {symbol} no crossunder — price {last_close} prev {prev_close} EMA100 {ema100}")
+        return
+
+    print(
+        f"[SIGNAL] {symbol} | Price {last_close} crossed under 100 EMA {ema100} "
+        f"| 50 EMA {ema50} | SL will be {round(ema50 * SL_BUFFER, precision)}"
+    )
+
+    # ── Place trade ───────────────────────────────────────────────────────────
     tp_confirmed, sl_placed = place_order(
-        "sell", symbol, last_close, candles, atr, precision, entry_reason
+        "sell", symbol, last_close, ema50, precision
     )
     if tp_confirmed:
         update_sheet_tp(row, tp_confirmed)
@@ -770,12 +566,14 @@ def check_ema_and_trade(symbol, row, df):
 cycle = 0
 
 send_telegram(
-    "✅ <b>Bot Started</b>\n"
+    f"✅ <b>Bot Started</b>\n"
     f"━━━━━━━━━━━━━━━━━━\n"
-    f"💰 Capital  : <code>{CAPITAL_USDT} USDT</code>\n"
-    f"⚡ Leverage : <code>{LEVERAGE}x</code>\n"
+    f"📐 Strategy : <code>Price Cross 100 EMA</code>\n"
+    f"📉 Entry    : <code>Price crosses under 100 EMA</code>\n"
+    f"✅ Context  : <code>50 EMA above 100 EMA</code>\n"
     f"🎯 TP       : <code>{int(TP_PCT * 100)}%</code>\n"
-    f"📊 Min RR   : <code>{MIN_RR}</code>\n"
+    f"🛑 SL       : <code>50 EMA × 1.001 (trailing)</code>\n"
+    f"💰 Capital  : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>\n"
     f"🕐 Scanning every 30 seconds..."
 )
 
@@ -798,7 +596,7 @@ while True:
             if not pair:
                 continue
             symbol = normalize_symbol(pair)
-            check_ema_and_trade(symbol, row, df)
+            check_and_trade(symbol, row, df)
 
         time.sleep(30)
 
