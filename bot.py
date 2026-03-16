@@ -9,7 +9,7 @@ import gspread
 from decimal import Decimal, getcontext
 from google.oauth2.service_account import Credentials
 
-from config import COINDCX_KEY, COINDCX_SECRET, CAPITAL_USDT, LEVERAGE, SHEET_ID
+from config import COINDCX_KEY, COINDCX_SECRET, CAPITAL_USDT, LEVERAGE, SHEET_ID, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 getcontext().prec = 28
 BASE_URL = "https://api.coindcx.com"
@@ -113,6 +113,23 @@ def sign_request(body):
         "X-AUTH-SIGNATURE": signature,
     }
     return payload, headers
+
+
+# =====================================================
+# TELEGRAM NOTIFICATION
+# =====================================================
+
+def send_telegram(message):
+    try:
+        url  = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        data = {
+            "chat_id":    TELEGRAM_CHAT_ID,
+            "text":       message,
+            "parse_mode": "HTML",
+        }
+        requests.post(url, data=data, timeout=10)
+    except Exception as e:
+        print(f"[TELEGRAM] Failed to send message: {e}")
 
 
 # =====================================================
@@ -509,9 +526,16 @@ def place_order(side, symbol, entry_price, candles, atr, precision, entry_reason
     reward = entry - tp
     risk   = sl_base - entry
     if risk <= 0 or (reward / risk) < MIN_RR:
-        print(
-            f"[SKIP] {symbol} RR "
-            f"{round(reward / risk, 2) if risk > 0 else 'inf'} < {MIN_RR}"
+        rr = round(reward / risk, 2) if risk > 0 else 'inf'
+        print(f"[SKIP] {symbol} RR {rr} < {MIN_RR}")
+        send_telegram(
+            f"⚠️ <b>SIGNAL SKIPPED — {symbol}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"❌ Reason : <code>RR {rr} below minimum {MIN_RR}</code>\n"
+            f"📍 Entry  : <code>{entry}</code>\n"
+            f"🎯 TP     : <code>{tp}</code>\n"
+            f"🛑 SL     : <code>{sl_base}</code>\n"
+            f"⚡ Signal : <code>{entry_reason}</code>"
         )
         return None, None
 
@@ -552,6 +576,15 @@ def place_order(side, symbol, entry_price, candles, atr, precision, entry_reason
     # ── Bail out if exchange rejected ─────────────────────────────────────────
     if "order" not in result and not isinstance(result, list):
         print(f"[ERROR] {symbol} order not placed: {result}")
+        send_telegram(
+            f"❌ <b>ORDER REJECTED — {symbol}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📍 Entry  : <code>{entry}</code>\n"
+            f"🎯 TP     : <code>{tp}</code>\n"
+            f"🛑 SL     : <code>{sl_base}</code>\n"
+            f"⚡ Signal : <code>{entry_reason}</code>\n"
+            f"⚠️ Response : <code>{str(result)[:200]}</code>"
+        )
         return None, None
 
     try:
@@ -559,6 +592,19 @@ def place_order(side, symbol, entry_price, candles, atr, precision, entry_reason
         tp_confirmed = order.get("take_profit_price", tp)
     except Exception:
         tp_confirmed = tp
+
+    # ── Telegram notification ─────────────────────────────────────────────────
+    send_telegram(
+        f"🔴 <b>NEW SHORT — {symbol}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📍 Entry  : <code>{entry}</code>\n"
+        f"🎯 TP     : <code>{tp}</code>  (-{int(TP_PCT*100)}%)\n"
+        f"🛑 SL     : <code>{sl_base}</code>\n"
+        f"📊 RR     : <code>{round(reward / risk, 2)}</code>\n"
+        f"📦 Qty    : <code>{qty}</code>\n"
+        f"⚡ Signal : <code>{entry_reason}</code>\n"
+        f"💰 Margin : <code>{CAPITAL_USDT} USDT x {LEVERAGE}x</code>"
+    )
 
     return tp_confirmed, sl_base
 
@@ -722,6 +768,16 @@ def check_ema_and_trade(symbol, row, df):
 # =====================================================
 
 cycle = 0
+
+send_telegram(
+    "✅ <b>Bot Started</b>\n"
+    f"━━━━━━━━━━━━━━━━━━\n"
+    f"💰 Capital  : <code>{CAPITAL_USDT} USDT</code>\n"
+    f"⚡ Leverage : <code>{LEVERAGE}x</code>\n"
+    f"🎯 TP       : <code>{int(TP_PCT * 100)}%</code>\n"
+    f"📊 Min RR   : <code>{MIN_RR}</code>\n"
+    f"🕐 Scanning every 30 seconds..."
+)
 
 while True:
     try:
