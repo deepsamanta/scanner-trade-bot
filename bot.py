@@ -15,11 +15,11 @@ getcontext().prec = 28
 BASE_URL = "https://api.coindcx.com"
 
 # ─── TUNEABLE CONSTANTS ────────────────────────────────────────────────────────
-EMA_FAST_PERIOD  = 50           # 50 EMA  — trailing SL reference
-EMA_SLOW_PERIOD  = 100          # 100 EMA — entry trigger level
-TP_PCT           = 0.05         # TP = entry * (1 - 0.05) → fixed 5% below entry
-SL_BUFFER        = 1.001        # SL = ema50 * 1.001 (0.1% buffer above 50 EMA)
-MIN_RR           = 1.5          # skip trade if reward/risk < this
+EMA_FAST_PERIOD  = 50           # 50 EMA  — entry trigger level
+EMA_SLOW_PERIOD  = 100          # 100 EMA — macro context
+TP_PCT           = 0.06         # TP = entry * (1 - 0.06) → fixed 6% below entry
+SL_PCT           = 0.30         # SL = entry * 1.30 → fixed 30% above entry
+MIN_RR           = 0.1          # very wide SL so RR will always be low — keep permissive
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -349,15 +349,16 @@ def compute_qty(entry_price, symbol):
 # PLACE ORDER
 # =====================================================
 
-def place_order(side, symbol, entry_price, ema50, precision):
+def place_order(side, symbol, entry_price, precision):
     entry = round(entry_price, precision)
 
-    # ── TP: fixed 5% below entry ─────────────────────────────────────────────
+    # ── TP: fixed 6% below entry ─────────────────────────────────────────────
+    #   Mirrors Pine Script: fixedTP = position_avg_price * 0.94
     tp = round(entry * (1 - TP_PCT), precision)
 
-    # ── SL: 50 EMA + 0.1% buffer ─────────────────────────────────────────────
-    #   Mirrors Pine Script: dynamicSL = ema50 * 1.001
-    sl_base = round(ema50 * SL_BUFFER, precision)
+    # ── SL: fixed 30% above entry ─────────────────────────────────────────────
+    #   Mirrors Pine Script: fixedSL = position_avg_price * 1.30
+    sl_base = round(entry * (1 + SL_PCT), precision)
 
     # ── Reward / Risk gate ───────────────────────────────────────────────────
     reward = entry - tp
@@ -432,7 +433,7 @@ def place_order(side, symbol, entry_price, ema50, precision):
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📍 Entry   : <code>{entry}</code>\n"
         f"🎯 TP      : <code>{tp}</code>  (-{int(TP_PCT * 100)}%)\n"
-        f"🛑 SL      : <code>{sl_base}</code>  (50 EMA × 1.001)\n"
+        f"🛑 SL      : <code>{sl_base}</code>  (+{int(SL_PCT * 100)}% fixed)\n"
         f"📊 RR      : <code>{round(reward / risk, 2)}</code>\n"
         f"📦 Qty     : <code>{qty}</code>\n"
         f"💰 Margin  : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
@@ -488,11 +489,10 @@ def check_and_trade(symbol, row, df):
     positions = get_open_positions()
     for pos in positions:
         if pos.get("pair") == pair:
-            print(f"[ACTIVE TRADE] {symbol} — updating trailing SL to 50 EMA {ema50}")
+            print(f"[ACTIVE TRADE] {symbol} — position open, SL is fixed 30%")
             tp_live = get_position_tp(symbol)
             if tp_live:
                 update_sheet_tp(row, tp_live)
-            maybe_update_trailing_sl(symbol, row, df, precision, ema50)
             return
 
     # ── Check active order ────────────────────────────────────────────────────
@@ -522,36 +522,37 @@ def check_and_trade(symbol, row, df):
     #
     #   Pine Script logic translated to Python:
     #
-    #   1. aboveContext = ema50 > ema100
-    #      50 EMA must be above 100 EMA (still in bullish cycle)
+    #   1. macroBullish = ema50 > ema100
+    #      50 EMA must be above 100 EMA (macro bullish context)
     #
-    #   2. priceBreak = ta.crossunder(close, ema100)
-    #      Price crosses UNDER the 100 EMA
-    #      = prev candle closed ABOVE 100 EMA
-    #      AND current candle closed BELOW 100 EMA
+    #   2. cutBelow50 = ta.crossunder(close, ema50)
+    #      Price crosses UNDER the 50 EMA
+    #      = prev candle closed ABOVE 50 EMA
+    #      AND current candle closed BELOW 50 EMA
     #
-    #   3. shortCondition = aboveContext AND priceBreak
+    #   3. shortCondition = macroBullish AND cutBelow50
     #
 
-    above_context = ema50 > ema100
-    price_crossunder = (prev_close >= ema100_prev) and (last_close < ema100)
+    macro_bullish    = ema50 > ema100
+    price_crossunder = (prev_close >= ema50_prev) and (last_close < ema50)
 
-    if not above_context:
+    if not macro_bullish:
         print(f"[SKIP] {symbol} 50 EMA {ema50} not above 100 EMA {ema100}")
         return
 
     if not price_crossunder:
-        print(f"[SKIP] {symbol} no crossunder — price {last_close} prev {prev_close} EMA100 {ema100}")
+        print(f"[SKIP] {symbol} no crossunder — price {last_close} prev {prev_close} 50EMA {ema50}")
         return
 
     print(
-        f"[SIGNAL] {symbol} | Price {last_close} crossed under 100 EMA {ema100} "
-        f"| 50 EMA {ema50} | SL will be {round(ema50 * SL_BUFFER, precision)}"
+        f"[SIGNAL] {symbol} | Price {last_close} crossed under 50 EMA {ema50} "
+        f"| 100 EMA {ema100} | TP {round(last_close * (1 - TP_PCT), precision)} "
+        f"| SL {round(last_close * (1 + SL_PCT), precision)}"
     )
 
     # ── Place trade ───────────────────────────────────────────────────────────
     tp_confirmed, sl_placed = place_order(
-        "sell", symbol, last_close, ema50, precision
+        "sell", symbol, last_close, precision
     )
     if tp_confirmed:
         update_sheet_tp(row, tp_confirmed)
@@ -568,11 +569,11 @@ cycle = 0
 send_telegram(
     f"✅ <b>Bot Started</b>\n"
     f"━━━━━━━━━━━━━━━━━━\n"
-    f"📐 Strategy : <code>Price Cross 100 EMA</code>\n"
-    f"📉 Entry    : <code>Price crosses under 100 EMA</code>\n"
+    f"📐 Strategy : <code>50/100 Pullback Short</code>\n"
+    f"📉 Entry    : <code>Price crosses under 50 EMA</code>\n"
     f"✅ Context  : <code>50 EMA above 100 EMA</code>\n"
-    f"🎯 TP       : <code>{int(TP_PCT * 100)}%</code>\n"
-    f"🛑 SL       : <code>50 EMA × 1.001 (trailing)</code>\n"
+    f"🎯 TP       : <code>{int(TP_PCT * 100)}% fixed</code>\n"
+    f"🛑 SL       : <code>{int(SL_PCT * 100)}% fixed above entry</code>\n"
     f"💰 Capital  : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>\n"
     f"🕐 Scanning every 30 seconds..."
 )
