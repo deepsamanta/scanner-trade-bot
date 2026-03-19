@@ -265,50 +265,6 @@ def get_recent_low(symbol):
 
 
 # =====================================================
-# TRAILING SL UPDATE  (50 EMA based)
-# =====================================================
-
-def maybe_update_trailing_sl(symbol, row, df, precision, ema50):
-    """
-    Strategy: SL dynamically follows the 50 EMA.
-    SL = ema50 * SL_BUFFER (0.1% above 50 EMA).
-    Updates on every monitor cycle as long as position is open.
-    Only moves SL if new SL is LOWER than current SL
-    (for shorts, SL moves down as 50 EMA drops — locks in more profit).
-    """
-    try:
-        new_sl = round(ema50 * SL_BUFFER, precision)
-
-        sl_raw = df.iloc[row, 2] if df.shape[1] > 2 else ""
-        try:
-            current_sl = float(sl_raw)
-        except Exception:
-            current_sl = None
-
-        # For shorts: only update if new SL is lower (more favorable)
-        if current_sl is not None and new_sl >= current_sl:
-            return
-
-        pair_api = fut_pair(symbol)
-        body = {
-            "timestamp":       int(time.time() * 1000),
-            "pair":            pair_api,
-            "stop_loss_price": new_sl,
-        }
-        payload, headers = sign_request(body)
-        requests.post(
-            BASE_URL + "/exchange/v1/derivatives/futures/positions/update_sl",
-            data=payload,
-            headers=headers,
-        )
-        update_sheet_sl(row, new_sl)
-        print(f"[TRAIL] {symbol} SL updated to 50 EMA level {new_sl}")
-
-    except Exception as e:
-        print(f"[TRAIL] {symbol} error: {e}")
-
-
-# =====================================================
 # QUANTITY
 # =====================================================
 
@@ -359,8 +315,8 @@ def place_order(side, symbol, entry_price, precision):
     #   Mirrors Pine Script: fixedTP = position_avg_price * 0.94
     tp = round(entry * (1 - TP_PCT), precision)
 
-    # ── SL: fixed 30% above entry ─────────────────────────────────────────────
-    #   Mirrors Pine Script: fixedSL = position_avg_price * 1.30
+    # ── SL: fixed 10% above entry ─────────────────────────────────────────────
+    #   Mirrors Pine Script: fixedSL = position_avg_price * 1.10
     sl_base = round(entry * (1 + SL_PCT), precision)
 
     # ── Reward / Risk gate ───────────────────────────────────────────────────
@@ -492,7 +448,7 @@ def check_and_trade(symbol, row, df):
     positions = get_open_positions()
     for pos in positions:
         if pos.get("pair") == pair:
-            print(f"[ACTIVE TRADE] {symbol} — position open, SL is fixed 30%")
+            print(f"[ACTIVE TRADE] {symbol} — position open, SL is fixed 10%")
             tp_live = get_position_tp(symbol)
             if tp_live:
                 update_sheet_tp(row, tp_live)
