@@ -18,8 +18,11 @@ BASE_URL = "https://api.coindcx.com"
 EMA_FAST_PERIOD  = 50           # 50 EMA  — entry trigger level
 EMA_SLOW_PERIOD  = 100          # 100 EMA — macro context
 TP_PCT           = 0.06         # TP = entry * (1 - 0.06) → fixed 6% below entry
-SL_PCT           = 0.30         # SL = entry * 1.30 → fixed 30% above entry
+SL_PCT           = 0.10         # SL = entry * 1.10 → fixed 10% above entry
 MIN_RR           = 0.1          # very wide SL so RR will always be low — keep permissive
+EMA50_SLOPE_BARS = 5            # candles to measure 50 EMA slope (must be negative)
+EMA100_SLOPE_BARS = 5           # candles to measure 100 EMA slope (must be near flat)
+EMA100_FLAT_THRESHOLD = 0.0005  # 100 EMA slope as % of price — below this = flat
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -517,6 +520,27 @@ def check_and_trade(symbol, row, df):
             return
     except Exception:
         pass
+
+    # ── SLOPE FILTERS ─────────────────────────────────────────────────────────
+    #
+    #   Filter A — 50 EMA must be bending DOWN
+    #   Catches real pullback momentum, not a brief dip on a still-rising EMA.
+    #   slope = ema50[-1] - ema50[-5]  must be negative
+    #
+    ema50_slope = ema50_values[-1] - ema50_values[-EMA50_SLOPE_BARS]
+    if ema50_slope >= 0:
+        print(f"[SKIP] {symbol} 50 EMA slope not down ({round(ema50_slope, precision)})")
+        return
+
+    #   Filter B — 100 EMA must be going FLAT
+    #   If 100 EMA is still steeply rising, it's too early — not a real reversal.
+    #   slope as % of price must be below EMA100_FLAT_THRESHOLD (0.05%)
+    #
+    ema100_slope     = ema100_values[-1] - ema100_values[-EMA100_SLOPE_BARS]
+    ema100_slope_pct = abs(ema100_slope) / last_close
+    if ema100_slope_pct > EMA100_FLAT_THRESHOLD:
+        print(f"[SKIP] {symbol} 100 EMA not flat (slope {round(ema100_slope_pct * 100, 4)}%)")
+        return
 
     # ── STRATEGY CONDITIONS ───────────────────────────────────────────────────
     #
