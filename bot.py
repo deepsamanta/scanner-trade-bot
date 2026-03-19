@@ -488,14 +488,15 @@ def check_and_trade(symbol, row, df):
         print(f"[SKIP] {symbol} 50 EMA slope not down ({round(ema50_slope, precision)})")
         return
 
-    #   Filter B — 100 EMA must be going FLAT
-    #   If 100 EMA is still steeply rising, it's too early — not a real reversal.
-    #   slope as % of price must be below EMA100_FLAT_THRESHOLD (0.05%)
+    #   Filter B — 100 EMA must NOT be rising steeply
+    #   Flat OR declining 100 EMA = both fine for a short.
+    #   Only block if 100 EMA is still steeply going UP (too early, macro still bullish).
+    #   slope as % of price — only block if positive AND above threshold
     #
     ema100_slope     = ema100_values[-1] - ema100_values[-EMA100_SLOPE_BARS]
-    ema100_slope_pct = abs(ema100_slope) / last_close
+    ema100_slope_pct = ema100_slope / last_close   # no abs() — direction matters
     if ema100_slope_pct > EMA100_FLAT_THRESHOLD:
-        print(f"[SKIP] {symbol} 100 EMA not flat (slope {round(ema100_slope_pct * 100, 4)}%)")
+        print(f"[SKIP] {symbol} 100 EMA still rising (slope +{round(ema100_slope_pct * 100, 4)}%)")
         return
 
     # ── STRATEGY CONDITIONS ───────────────────────────────────────────────────
