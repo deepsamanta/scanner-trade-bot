@@ -431,7 +431,6 @@ def check_and_trade(symbol, row, df):
     precision  = get_precision(candles[-1]["close"])
     closes     = [float(c["close"]) for c in candles]
     last_close = float(candles[-1]["close"])
-    prev_close = float(candles[-2]["close"])
 
     # ── Compute both EMAs ────────────────────────────────────────────────────
     ema50_values  = compute_ema(closes, EMA_FAST_PERIOD)
@@ -439,10 +438,6 @@ def check_and_trade(symbol, row, df):
 
     ema50  = round(ema50_values[-1],  precision)
     ema100 = round(ema100_values[-1], precision)
-
-    # Also need previous values for crossunder detection
-    ema50_prev  = round(ema50_values[-2],  precision)
-    ema100_prev = round(ema100_values[-2], precision)
 
     # ── Check active position FIRST — from CoinDCX API ───────────────────────
     positions = get_open_positions()
@@ -525,19 +520,19 @@ def check_and_trade(symbol, row, df):
     #   3. shortCondition = macroBullish AND cutBelow50
     #
 
-    macro_bullish    = ema50 > ema100
-    price_crossunder = (prev_close >= ema50_prev) and (last_close < ema50)
+    macro_bullish  = ema50 > ema100
+    below_ema50    = last_close < ema50
 
     if not macro_bullish:
         print(f"[SKIP] {symbol} 50 EMA {ema50} not above 100 EMA {ema100}")
         return
 
-    if not price_crossunder:
-        print(f"[SKIP] {symbol} no crossunder — price {last_close} prev {prev_close} 50EMA {ema50}")
+    if not below_ema50:
+        print(f"[SKIP] {symbol} price {last_close} not below 50 EMA {ema50}")
         return
 
     print(
-        f"[SIGNAL] {symbol} | Price {last_close} crossed under 50 EMA {ema50} "
+        f"[SIGNAL] {symbol} | Price {last_close} below 50 EMA {ema50} "
         f"| 100 EMA {ema100} | TP {round(last_close * (1 - TP_PCT), precision)} "
         f"| SL {round(last_close * (1 + SL_PCT), precision)}"
     )
