@@ -444,38 +444,49 @@ def check_and_trade(symbol, row, df):
     ema50_prev  = round(ema50_values[-2],  precision)
     ema100_prev = round(ema100_values[-2], precision)
 
-    # ── Check active position FIRST ───────────────────────────────────────────
+    # ── Check active position FIRST — from CoinDCX API ───────────────────────
     positions = get_open_positions()
     for pos in positions:
         if pos.get("pair") == pair:
-            print(f"[ACTIVE TRADE] {symbol} — position open, SL is fixed 10%")
+            print(f"[ACTIVE TRADE] {symbol} — position open on CoinDCX, skipping")
             tp_live = get_position_tp(symbol)
             if tp_live:
                 update_sheet_tp(row, tp_live)
             return
 
-    # ── Check active order ────────────────────────────────────────────────────
+    # ── Check active order — from CoinDCX API ────────────────────────────────
     if has_active_order(symbol):
-        print(f"[ACTIVE ORDER] {symbol} — order already on the book, skipping")
+        print(f"[ACTIVE ORDER] {symbol} — order on book on CoinDCX, skipping")
         return
 
-    # ── TP completed check ───────────────────────────────────────────────────
+    # ── TP monitoring — check every 30s if stored TP has been hit ────────────
+    #   When an order is placed, TP price is written to column B.
+    #   Every cycle the bot checks if price has dropped to or below that TP.
+    #   If yes → write "TP COMPLETED" to sheet → stop trading this pair.
     tp_raw = df.iloc[row, 1]
 
-    if str(tp_raw).upper() == "TP COMPLETED":
+    if str(tp_raw).strip().upper() == "TP COMPLETED":
+        print(f"[SKIP] {symbol} TP COMPLETED")
         return
 
     try:
-        tp = float(tp_raw)
-        if last_close <= tp:
+        tp_stored = float(tp_raw)
+
+        # Check current price
+        if last_close <= tp_stored:
             update_sheet_tp(row, "TP COMPLETED")
+            print(f"[TP HIT] {symbol} price {last_close} <= TP {tp_stored}")
             return
+
+        # Check recent 1min candle lows — catches wicks that already hit TP
         recent_low = get_recent_low(symbol)
-        if recent_low and recent_low <= tp:
+        if recent_low and recent_low <= tp_stored:
             update_sheet_tp(row, "TP COMPLETED")
+            print(f"[TP HIT] {symbol} recent low {recent_low} <= TP {tp_stored}")
             return
+
     except Exception:
-        pass
+        pass  # column B is empty or not a number yet — no TP stored, continue
 
     # ── SLOPE FILTERS ─────────────────────────────────────────────────────────
     #
