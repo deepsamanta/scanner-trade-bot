@@ -20,9 +20,9 @@ EMA_SLOW_PERIOD  = 100          # 100 EMA — macro context
 TP_PCT           = 0.031         # TP = entry * (1 - 0.06) → fixed 6% below entry
 SL_PCT           = 0.10         # SL = entry * 1.10 → fixed 10% above entry
 MIN_RR           = 0.1          # very wide SL so RR will always be low — keep permissive
-EMA50_SLOPE_BARS = 5            # candles to measure 50 EMA slope (must be negative)
-EMA100_SLOPE_BARS = 5           # candles to measure 100 EMA slope (must be near flat)
-EMA100_FLAT_THRESHOLD = 0.0005  # 100 EMA slope as % of price — below this = flat
+EMA50_SLOPE_BARS = 10            # candles to measure 50 EMA slope (must be negative)
+EMA100_SLOPE_BARS = 10           # candles to measure 100 EMA slope (must be near flat)
+EMA100_FLAT_THRESHOLD = 0.0007  # 100 EMA slope as % of price — below this = flat
 # ──────────────────────────────────────────────────────────────────────────────
 
 
