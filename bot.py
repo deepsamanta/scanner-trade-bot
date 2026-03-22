@@ -15,13 +15,13 @@ getcontext().prec = 28
 BASE_URL = "https://api.coindcx.com"
 
 # ─── TUNEABLE CONSTANTS ────────────────────────────────────────────────────────
-EMA_FAST_PERIOD  = 50           # 50 EMA  — entry trigger level
-EMA_SLOW_PERIOD  = 100          # 100 EMA — macro context
-TP_PCT           = 0.031         # TP = entry * (1 - 0.06) → fixed 6% below entry
-SL_PCT           = 0.10         # SL = entry * 1.10 → fixed 10% above entry
-MIN_RR           = 0.1          # very wide SL so RR will always be low — keep permissive
-EMA50_SLOPE_BARS = 10            # candles to measure 50 EMA slope (must be negative)
-EMA100_SLOPE_BARS = 10           # candles to measure 100 EMA slope (must be near flat)
+EMA_FAST_PERIOD       = 50      # 50 EMA  — entry trigger level
+EMA_SLOW_PERIOD       = 100     # 100 EMA — macro context
+TP_PCT                = 0.031   # TP = entry * (1 - 0.031) → fixed 3.1% below entry
+SL_PCT                = 0.10    # SL = entry * 1.10 → fixed 10% above entry
+MIN_RR                = 0.1     # very wide SL so RR will always be low — keep permissive
+EMA50_SLOPE_BARS      = 10      # candles to measure 50 EMA slope (must be negative)
+EMA100_SLOPE_BARS     = 10      # candles to measure 100 EMA slope (must be near flat)
 EMA100_FLAT_THRESHOLD = 0.0007  # 100 EMA slope as % of price — below this = flat
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -311,12 +311,10 @@ def compute_qty(entry_price, symbol):
 def place_order(side, symbol, entry_price, precision):
     entry = round(entry_price, precision)
 
-    # ── TP: fixed 6% below entry ─────────────────────────────────────────────
-    #   Mirrors Pine Script: fixedTP = position_avg_price * 0.94
+    # ── TP: fixed 3.1% below entry ───────────────────────────────────────────
     tp = round(entry * (1 - TP_PCT), precision)
 
     # ── SL: fixed 10% above entry ─────────────────────────────────────────────
-    #   Mirrors Pine Script: fixedSL = position_avg_price * 1.10
     sl_base = round(entry * (1 + SL_PCT), precision)
 
     # ── Reward / Risk gate ───────────────────────────────────────────────────
@@ -391,7 +389,7 @@ def place_order(side, symbol, entry_price, precision):
         f"🔴 <b>NEW SHORT — {symbol}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📍 Entry   : <code>{entry}</code>\n"
-        f"🎯 TP      : <code>{tp}</code>  (-{int(TP_PCT * 100)}%)\n"
+        f"🎯 TP      : <code>{tp}</code>  (-{TP_PCT * 100:.1f}%)\n"
         f"🛑 SL      : <code>{sl_base}</code>  (+{int(SL_PCT * 100)}% fixed)\n"
         f"📊 RR      : <code>{round(reward / risk, 2)}</code>\n"
         f"📦 Qty     : <code>{qty}</code>\n"
@@ -416,7 +414,7 @@ def check_and_trade(symbol, row, df):
         "pair":       pair_api,
         "from":       now - 360000,
         "to":         now,
-        "resolution": "15",
+        "resolution": "30",         # ← 30 min candles (was 15)
         "pcode":      "f",
     }
 
@@ -455,9 +453,6 @@ def check_and_trade(symbol, row, df):
         return
 
     # ── TP monitoring — check every 30s if stored TP has been hit ────────────
-    #   When an order is placed, TP price is written to column B.
-    #   Every cycle the bot checks if price has dropped to or below that TP.
-    #   If yes → write "TP COMPLETED" to sheet → stop trading this pair.
     tp_raw = df.iloc[row, 1]
 
     if str(tp_raw).strip().upper() == "TP COMPLETED":
@@ -467,13 +462,11 @@ def check_and_trade(symbol, row, df):
     try:
         tp_stored = float(tp_raw)
 
-        # Check current price
         if last_close <= tp_stored:
             update_sheet_tp(row, "TP COMPLETED")
             print(f"[TP HIT] {symbol} price {last_close} <= TP {tp_stored}")
             return
 
-        # Check recent 1min candle lows — catches wicks that already hit TP
         recent_low = get_recent_low(symbol)
         if recent_low and recent_low <= tp_stored:
             update_sheet_tp(row, "TP COMPLETED")
@@ -481,59 +474,48 @@ def check_and_trade(symbol, row, df):
             return
 
     except Exception:
-        pass  # column B is empty or not a number yet — no TP stored, continue
+        pass
 
     # ── SLOPE FILTERS ─────────────────────────────────────────────────────────
     #
     #   Filter A — 50 EMA must be bending DOWN
-    #   Catches real pullback momentum, not a brief dip on a still-rising EMA.
-    #   slope = ema50[-1] - ema50[-5]  must be negative
+    #   slope = ema50[-1] - ema50[-10]  must be negative
     #
     ema50_slope = ema50_values[-1] - ema50_values[-EMA50_SLOPE_BARS]
     if ema50_slope >= 0:
-        print(f"[SKIP] {symbol} 50 EMA slope not down ({round(ema50_slope, precision)})")
+        print(f"[SKIP] {symbol} 50 EMA slope not down ({round(ema50_slope, precision)}) | 50 EMA {ema50} | 100 EMA {ema100} | Price {last_close}")
         return
 
     #   Filter B — 100 EMA must NOT be rising steeply
-    #   Flat OR declining 100 EMA = both fine for a short.
-    #   Only block if 100 EMA is still steeply going UP (too early, macro still bullish).
-    #   slope as % of price — only block if positive AND above threshold
+    #   Flat OR declining = fine. Only block if steeply rising.
     #
     ema100_slope     = ema100_values[-1] - ema100_values[-EMA100_SLOPE_BARS]
-    ema100_slope_pct = ema100_slope / last_close   # no abs() — direction matters
+    ema100_slope_pct = ema100_slope / last_close
     if ema100_slope_pct > EMA100_FLAT_THRESHOLD:
-        print(f"[SKIP] {symbol} 100 EMA still rising (slope +{round(ema100_slope_pct * 100, 4)}%)")
+        print(f"[SKIP] {symbol} 100 EMA still rising (slope +{round(ema100_slope_pct * 100, 4)}%) | 50 EMA {ema50} | 100 EMA {ema100} | Price {last_close}")
         return
 
     # ── STRATEGY CONDITIONS ───────────────────────────────────────────────────
     #
-    #   Pine Script logic translated to Python:
-    #
-    #   1. macroBullish = ema50 > ema100
-    #      50 EMA must be above 100 EMA (macro bullish context)
-    #
-    #   2. cutBelow50 = ta.crossunder(close, ema50)
-    #      Price crosses UNDER the 50 EMA
-    #      = prev candle closed ABOVE 50 EMA
-    #      AND current candle closed BELOW 50 EMA
-    #
-    #   3. shortCondition = macroBullish AND cutBelow50
+    #   1. macroBullish = ema50 > ema100  (50 EMA above 100 EMA)
+    #   2. below_ema50  = price < ema50   (price below 50 EMA)
     #
 
-    macro_bullish  = ema50 > ema100
-    below_ema50    = last_close < ema50
+    macro_bullish = ema50 > ema100
+    below_ema50   = last_close < ema50
 
     if not macro_bullish:
-        print(f"[SKIP] {symbol} 50 EMA {ema50} not above 100 EMA {ema100}")
+        print(f"[SKIP] {symbol} 50 EMA {ema50} not above 100 EMA {ema100} | Price {last_close}")
         return
 
     if not below_ema50:
-        print(f"[SKIP] {symbol} price {last_close} not below 50 EMA {ema50}")
+        print(f"[SKIP] {symbol} price {last_close} not below 50 EMA {ema50} | 100 EMA {ema100}")
         return
 
     print(
-        f"[SIGNAL] {symbol} | Price {last_close} below 50 EMA {ema50} "
-        f"| 100 EMA {ema100} | TP {round(last_close * (1 - TP_PCT), precision)} "
+        f"[SIGNAL] {symbol} | Price {last_close} | 50 EMA {ema50} | 100 EMA {ema100} "
+        f"| 50 slope {round(ema50_slope, precision)} | 100 slope {round(ema100_slope_pct * 100, 4)}% "
+        f"| TP {round(last_close * (1 - TP_PCT), precision)} "
         f"| SL {round(last_close * (1 + SL_PCT), precision)}"
     )
 
@@ -557,9 +539,10 @@ send_telegram(
     f"✅ <b>Bot Started</b>\n"
     f"━━━━━━━━━━━━━━━━━━\n"
     f"📐 Strategy : <code>50/100 Pullback Short</code>\n"
-    f"📉 Entry    : <code>Price crosses under 50 EMA</code>\n"
+    f"⏱ Timeframe : <code>30 Min</code>\n"
+    f"📉 Entry    : <code>Price below 50 EMA</code>\n"
     f"✅ Context  : <code>50 EMA above 100 EMA</code>\n"
-    f"🎯 TP       : <code>{int(TP_PCT * 100)}% fixed</code>\n"
+    f"🎯 TP       : <code>{TP_PCT * 100:.1f}% fixed</code>\n"
     f"🛑 SL       : <code>{int(SL_PCT * 100)}% fixed above entry</code>\n"
     f"💰 Capital  : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>\n"
     f"🕐 Scanning every 30 seconds..."
