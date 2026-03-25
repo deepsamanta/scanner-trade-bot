@@ -17,7 +17,7 @@ BASE_URL = "https://api.coindcx.com"
 # ─── TUNEABLE CONSTANTS ────────────────────────────────────────────────────────
 EMA_FAST_PERIOD       = 50      # 50 EMA  — entry trigger level
 EMA_SLOW_PERIOD       = 100     # 100 EMA — macro context
-TP_PCT                = 0.03   # TP = entry * (1 - 0.031) → fixed 3.1% below entry
+TP_PCT                = 0.01   # TP = entry * (1 - 0.031) → fixed 3.1% below entry
 SL_PCT                = 0.10    # SL = entry * 1.10 → fixed 10% above entry
 MIN_RR                = 0.1     # very wide SL so RR will always be low — keep permissive
 EMA50_SLOPE_BARS      = 5      # candles to measure 50 EMA slope (must be negative)
