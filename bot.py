@@ -22,7 +22,7 @@ SL_PCT                = 0.10    # SL = entry * 1.10 → fixed 10% above entry
 MIN_RR                = 0.05     # very wide SL so RR will always be low — keep permissive
 EMA50_SLOPE_BARS      = 5      # candles to measure 50 EMA slope (must be negative)
 EMA100_SLOPE_BARS     = 5      # candles to measure 100 EMA slope (must be near flat)
-EMA100_FLAT_THRESHOLD = 0.0009  # 100 EMA slope as % of price — below this = flat
+EMA100_FLAT_THRESHOLD = 0.001  # 100 EMA slope as % of price — below this = flat
 # ──────────────────────────────────────────────────────────────────────────────
 
 
