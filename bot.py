@@ -17,12 +17,12 @@ BASE_URL = "https://api.coindcx.com"
 # ─── TUNEABLE CONSTANTS ────────────────────────────────────────────────────────
 EMA_FAST_PERIOD       = 50      # 50 EMA  — entry trigger level
 EMA_SLOW_PERIOD       = 100     # 100 EMA — macro context
-TP_PCT                = 0.01   # TP = entry * (1 - 0.031) → fixed 3.1% below entry
+TP_PCT                = 0.01    # TP = entry * (1 - 0.01) → fixed 1% below entry
 SL_PCT                = 0.10    # SL = entry * 1.10 → fixed 10% above entry
-MIN_RR                = 0.05     # very wide SL so RR will always be low — keep permissive
-EMA50_SLOPE_BARS      = 5      # candles to measure 50 EMA slope (must be negative)
-EMA100_SLOPE_BARS     = 5      # candles to measure 100 EMA slope (must be near flat)
-EMA100_FLAT_THRESHOLD = 0.001  # 100 EMA slope as % of price — below this = flat
+MIN_RR                = 0.05    # very wide SL so RR will always be low — keep permissive
+EMA50_SLOPE_BARS      = 5       # candles to measure 50 EMA slope (must be negative)
+EMA100_SLOPE_BARS     = 5       # candles to measure 100 EMA slope (must be near flat)
+EMA100_FLAT_THRESHOLD = 0.001   # 100 EMA slope as % of price — below this = flat
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -156,7 +156,7 @@ def compute_ema(closes, period):
 
 
 # =====================================================
-# OPEN POSITIONS
+# OPEN POSITIONS  (order was filled → live position)
 # =====================================================
 
 def get_open_positions():
@@ -207,13 +207,14 @@ def get_position_entry(symbol):
 
 
 # =====================================================
-# ACTIVE ORDERS CHECK
+# OPEN ORDER CHECK  (order NOT yet filled, status="open")
 # =====================================================
 
-def has_active_order(symbol):
+def has_open_order(symbol):
     """
-    Returns True if there is any open/pending order for this pair
-    that has not yet been filled or cancelled.
+    Returns True if there is any unfilled order for this pair still on the book.
+    status="open"  →  order placed but NOT executed yet.
+    This is different from an open position (which means the order WAS filled).
     """
     try:
         body = {
@@ -236,7 +237,7 @@ def has_active_order(symbol):
         return False
 
     except Exception as e:
-        print(f"has_active_order error ({symbol}):", e)
+        print(f"has_open_order error ({symbol}):", e)
         return False
 
 
@@ -311,7 +312,7 @@ def compute_qty(entry_price, symbol):
 def place_order(side, symbol, entry_price, precision):
     entry = round(entry_price, precision)
 
-    # ── TP: fixed 3.1% below entry ───────────────────────────────────────────
+    # ── TP: fixed 1% below entry ─────────────────────────────────────────────
     tp = round(entry * (1 - TP_PCT), precision)
 
     # ── SL: fixed 10% above entry ─────────────────────────────────────────────
@@ -414,7 +415,7 @@ def check_and_trade(symbol, row, df):
         "pair":       pair_api,
         "from":       now - 360000,
         "to":         now,
-        "resolution": "30",         # ← 30 min candles (was 15)
+        "resolution": "30",         # 30 min candles
         "pcode":      "f",
     }
 
@@ -437,7 +438,9 @@ def check_and_trade(symbol, row, df):
     ema50  = round(ema50_values[-1],  precision)
     ema100 = round(ema100_values[-1], precision)
 
-    # ── Check active position FIRST — from CoinDCX API ───────────────────────
+    # =========================================================================
+    # GATE 1 — Open position check (order was filled → live position exists)
+    # =========================================================================
     positions = get_open_positions()
     for pos in positions:
         if pos.get("pair") == pair:
@@ -447,9 +450,11 @@ def check_and_trade(symbol, row, df):
                 update_sheet_tp(row, tp_live)
             return
 
-    # ── Check active order — from CoinDCX API ────────────────────────────────
-    if has_active_order(symbol):
-        print(f"[ACTIVE ORDER] {symbol} — order on book on CoinDCX, skipping")
+    # =========================================================================
+    # GATE 2 — Open order check (order placed but NOT yet filled, status="open")
+    # =========================================================================
+    if has_open_order(symbol):
+        print(f"[OPEN ORDER] {symbol} — unfilled order on book, skipping")
         return
 
     # ── TP monitoring — check every 30s if stored TP has been hit ────────────
@@ -479,7 +484,6 @@ def check_and_trade(symbol, row, df):
     # ── SLOPE FILTERS ─────────────────────────────────────────────────────────
     #
     #   Filter A — 50 EMA must be bending DOWN
-    #   slope = ema50[-1] - ema50[-10]  must be negative
     #
     ema50_slope = ema50_values[-1] - ema50_values[-EMA50_SLOPE_BARS]
     if ema50_slope >= 0:
@@ -487,7 +491,6 @@ def check_and_trade(symbol, row, df):
         return
 
     #   Filter B — 100 EMA must NOT be rising steeply
-    #   Flat OR declining = fine. Only block if steeply rising.
     #
     ema100_slope     = ema100_values[-1] - ema100_values[-EMA100_SLOPE_BARS]
     ema100_slope_pct = ema100_slope / last_close
@@ -497,10 +500,9 @@ def check_and_trade(symbol, row, df):
 
     # ── STRATEGY CONDITIONS ───────────────────────────────────────────────────
     #
-    #   1. macroBullish = ema50 > ema100  (50 EMA above 100 EMA)
-    #   2. below_ema50  = price < ema50   (price below 50 EMA)
+    #   1. macro_bullish = ema50 > ema100  (50 EMA above 100 EMA)
+    #   2. below_ema50   = price < ema50   (price below 50 EMA)
     #
-
     macro_bullish = ema50 > ema100
     below_ema50   = last_close < ema50
 
@@ -518,6 +520,23 @@ def check_and_trade(symbol, row, df):
         f"| TP {round(last_close * (1 - TP_PCT), precision)} "
         f"| SL {round(last_close * (1 + SL_PCT), precision)}"
     )
+
+    # =========================================================================
+    # FINAL GUARD — re-check both states right before placing
+    # Protects against race conditions where state changed mid-scan
+    # =========================================================================
+
+    # Guard 1: active order = order filled → open position now exists
+    live_positions = get_open_positions()
+    for pos in live_positions:
+        if pos.get("pair") == pair:
+            print(f"[SKIP] {symbol} — open position detected just before placement, aborting")
+            return
+
+    # Guard 2: open order = status 'open' → order NOT yet filled, still on book
+    if has_open_order(symbol):
+        print(f"[SKIP] {symbol} — unfilled open order detected just before placement, aborting")
+        return
 
     # ── Place trade ───────────────────────────────────────────────────────────
     tp_confirmed, sl_placed = place_order(
