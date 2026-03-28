@@ -15,29 +15,59 @@ getcontext().prec = 28
 BASE_URL = "https://api.coindcx.com"
 
 # ─── TUNEABLE CONSTANTS ────────────────────────────────────────────────────────
-EMA_FAST_PERIOD       = 50      # 50 EMA  — entry trigger level
-EMA_SLOW_PERIOD       = 100     # 100 EMA — macro context
-TP_PCT                = 0.01    # TP = entry * (1 - 0.01) → fixed 1% below entry
-SL_PCT                = 0.10    # SL = entry * 1.10 → fixed 10% above entry
-MIN_RR                = 0.05    # very wide SL so RR will always be low — keep permissive
-EMA50_SLOPE_BARS      = 5       # candles to measure 50 EMA slope (must be negative)
-EMA100_SLOPE_BARS     = 5       # candles to measure 100 EMA slope (must be near flat)
-EMA100_FLAT_THRESHOLD = 0.001   # 100 EMA slope as % of price — below this = flat
+EMA_FAST_PERIOD       = 50
+EMA_SLOW_PERIOD       = 100
+TP_PCT                = 0.01
+SL_PCT                = 0.10
+MIN_RR                = 0.05
+EMA50_SLOPE_BARS      = 5
+EMA100_SLOPE_BARS     = 5
+EMA100_FLAT_THRESHOLD = 0.001
+
+# ─── REQUEST TIMEOUTS (seconds) ───────────────────────────────────────────────
+REQUEST_TIMEOUT       = 15   # all CoinDCX / public API calls
+TELEGRAM_TIMEOUT      = 10   # telegram calls
+
+# ─── GSPREAD RE-AUTH INTERVAL ─────────────────────────────────────────────────
+# Re-initialise the gspread client every 45 minutes to avoid OAuth token expiry
+GSHEET_REAUTH_INTERVAL = 45 * 60   # 45 minutes in seconds
 # ──────────────────────────────────────────────────────────────────────────────
 
 
 # =====================================================
-# GOOGLE SHEETS CONNECTION
+# GOOGLE SHEETS — with periodic re-auth
 # =====================================================
 
-scope = [
+SCOPE = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
 
-creds  = Credentials.from_service_account_file("service_account.json", scopes=scope)
-client = gspread.authorize(creds)
-sheet  = client.open_by_key(SHEET_ID).sheet1
+# Module-level sheet handle and last-auth timestamp
+_sheet            = None
+_last_auth_time   = 0
+
+
+def get_sheet():
+    """
+    Return a valid gspread sheet object.
+    Re-authenticates every GSHEET_REAUTH_INTERVAL seconds so the OAuth
+    token never goes stale (tokens expire after ~1 hour).
+    """
+    global _sheet, _last_auth_time
+
+    now = time.time()
+    if _sheet is None or (now - _last_auth_time) > GSHEET_REAUTH_INTERVAL:
+        try:
+            creds         = Credentials.from_service_account_file("service_account.json", scopes=SCOPE)
+            client        = gspread.authorize(creds)
+            _sheet        = client.open_by_key(SHEET_ID).sheet1
+            _last_auth_time = now
+            print("[GSHEET] Re-authenticated successfully")
+        except Exception as e:
+            print(f"[GSHEET] Re-auth failed: {e}")
+            # Return old sheet if we have one, otherwise None
+    return _sheet
 
 
 # =====================================================
@@ -46,6 +76,9 @@ sheet  = client.open_by_key(SHEET_ID).sheet1
 
 def get_sheet_data():
     try:
+        sheet = get_sheet()
+        if sheet is None:
+            return pd.DataFrame()
         data = sheet.get_all_values()
         df   = pd.DataFrame(data)
         if df.shape[1] < 3:
@@ -59,6 +92,9 @@ def get_sheet_data():
 
 def update_sheet_tp(row, value):
     try:
+        sheet = get_sheet()
+        if sheet is None:
+            return
         sheet.update(f"B{row + 1}", [[str(value)]])
         print(f"[SHEET] Row {row + 1} col B -> {value}")
     except Exception as e:
@@ -68,6 +104,9 @@ def update_sheet_tp(row, value):
 def update_sheet_sl(row, value):
     """Column C stores live SL for trailing stop tracking."""
     try:
+        sheet = get_sheet()
+        if sheet is None:
+            return
         sheet.update(f"C{row + 1}", [[str(value)]])
         print(f"[SHEET] Row {row + 1} col C (SL) -> {value}")
     except Exception as e:
@@ -120,7 +159,7 @@ def send_telegram(message):
             "text":       message,
             "parse_mode": "HTML",
         }
-        requests.post(url, data=data, timeout=10)
+        requests.post(url, data=data, timeout=TELEGRAM_TIMEOUT)
     except Exception as e:
         print(f"[TELEGRAM] Failed to send message: {e}")
 
@@ -130,10 +169,6 @@ def send_telegram(message):
 # =====================================================
 
 def get_precision(raw_candle_close):
-    """
-    Derive decimal precision from the raw API string.
-    Avoids float noise e.g. 0.004823 becoming 0.0048229999999999997.
-    """
     s = str(raw_candle_close)
     if "." in s:
         return len(s.split(".")[1])
@@ -145,7 +180,6 @@ def get_precision(raw_candle_close):
 # =====================================================
 
 def compute_ema(closes, period):
-    """Returns list of EMA values, one per close starting from index period-1."""
     multiplier = 2 / (period + 1)
     ema        = sum(closes[:period]) / period
     values     = [ema]
@@ -169,7 +203,7 @@ def get_open_positions():
         }
         payload, headers = sign_request(body)
         url      = BASE_URL + "/exchange/v1/derivatives/futures/positions"
-        response = requests.post(url, data=payload, headers=headers)
+        response = requests.post(url, data=payload, headers=headers, timeout=REQUEST_TIMEOUT)
         positions = response.json()
         return [p for p in positions if float(p.get("active_pos", 0)) != 0]
     except Exception as e:
@@ -192,7 +226,6 @@ def get_position_tp(symbol):
 
 
 def get_position_entry(symbol):
-    """Return entry price of an open position, or None."""
     try:
         positions = get_open_positions()
         pair = fut_pair(symbol)
@@ -226,7 +259,7 @@ def has_open_order(symbol):
         }
         payload, headers = sign_request(body)
         url      = BASE_URL + "/exchange/v1/derivatives/futures/orders"
-        response = requests.post(url, data=payload, headers=headers)
+        response = requests.post(url, data=payload, headers=headers, timeout=REQUEST_TIMEOUT)
         orders   = response.json()
 
         pair = fut_pair(symbol)
@@ -257,7 +290,7 @@ def get_recent_low(symbol):
             "resolution": "1",
             "pcode":      "f",
         }
-        response = requests.get(url, params=params)
+        response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
         candles  = response.json()["data"]
         lows     = [float(c["low"]) for c in candles]
         return min(lows)
@@ -276,7 +309,7 @@ def get_quantity_step(symbol):
             "https://api.coindcx.com/exchange/v1/derivatives/futures/data/instrument"
             f"?pair={pair}&margin_currency_short_name=USDT"
         )
-        response   = requests.get(url)
+        response   = requests.get(url, timeout=REQUEST_TIMEOUT)
         data       = response.json()
         instrument = data["instrument"]
         quantity_increment = Decimal(str(instrument["quantity_increment"]))
@@ -287,17 +320,11 @@ def get_quantity_step(symbol):
 
 
 def compute_qty(entry_price, symbol):
-    """
-    Fixed sizing: always spend exactly CAPITAL_USDT * LEVERAGE.
-    qty = (CAPITAL_USDT * LEVERAGE) / entry_price
-    """
     step     = get_quantity_step(symbol)
     capital  = Decimal(str(CAPITAL_USDT))
     leverage = Decimal(str(LEVERAGE))
-
     exposure = capital * leverage
     raw_qty  = exposure / Decimal(str(entry_price))
-
     qty = (raw_qty / step).quantize(Decimal("1")) * step
     if qty <= 0:
         qty = step
@@ -310,15 +337,10 @@ def compute_qty(entry_price, symbol):
 # =====================================================
 
 def place_order(side, symbol, entry_price, precision):
-    entry = round(entry_price, precision)
-
-    # ── TP: fixed 1% below entry ─────────────────────────────────────────────
-    tp = round(entry * (1 - TP_PCT), precision)
-
-    # ── SL: fixed 10% above entry ─────────────────────────────────────────────
+    entry   = round(entry_price, precision)
+    tp      = round(entry * (1 - TP_PCT), precision)
     sl_base = round(entry * (1 + SL_PCT), precision)
 
-    # ── Reward / Risk gate ───────────────────────────────────────────────────
     reward = entry - tp
     risk   = sl_base - entry
     if risk <= 0 or (reward / risk) < MIN_RR:
@@ -341,7 +363,6 @@ def place_order(side, symbol, entry_price, precision):
         f"| RR {round(reward / risk, 2)} | Qty {qty}"
     )
 
-    # ── Order body — matches official CoinDCX API spec ────────────────────────
     body = {
         "timestamp": int(time.time() * 1000),
         "order": {
@@ -361,12 +382,12 @@ def place_order(side, symbol, entry_price, precision):
         BASE_URL + "/exchange/v1/derivatives/futures/orders/create",
         data=payload,
         headers=headers,
+        timeout=REQUEST_TIMEOUT,
     )
     result = response.json()
 
     print(f"[API] {symbol} response: {result}")
 
-    # ── Bail out if exchange rejected ─────────────────────────────────────────
     if "order" not in result and not isinstance(result, list):
         print(f"[ERROR] {symbol} order not placed: {result}")
         send_telegram(
@@ -385,7 +406,6 @@ def place_order(side, symbol, entry_price, precision):
     except Exception:
         tp_confirmed = tp
 
-    # ── Telegram notification ─────────────────────────────────────────────────
     send_telegram(
         f"🔴 <b>NEW SHORT — {symbol}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
@@ -415,25 +435,30 @@ def check_and_trade(symbol, row, df):
         "pair":       pair_api,
         "from":       now - 360000,
         "to":         now,
-        "resolution": "30",         # 30 min candles
+        "resolution": "30",
         "pcode":      "f",
     }
 
-    response = requests.get(url, params=params)
-    candles  = sorted(response.json()["data"], key=lambda x: x["time"])
+    try:
+        response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        candles  = sorted(response.json()["data"], key=lambda x: x["time"])
+    except Exception as e:
+        print(f"[ERROR] {symbol} candle fetch failed: {e}")
+        return
 
-    # Need at least 100 candles for slow EMA
     if len(candles) < EMA_SLOW_PERIOD + 5:
         return
 
-    # ── Precision from raw API string ────────────────────────────────────────
     precision  = get_precision(candles[-1]["close"])
     closes     = [float(c["close"]) for c in candles]
     last_close = float(candles[-1]["close"])
 
-    # ── Compute both EMAs ────────────────────────────────────────────────────
+    # Free memory immediately after extracting what we need
+    del candles
+
     ema50_values  = compute_ema(closes, EMA_FAST_PERIOD)
     ema100_values = compute_ema(closes, EMA_SLOW_PERIOD)
+    del closes
 
     ema50  = round(ema50_values[-1],  precision)
     ema100 = round(ema100_values[-1], precision)
@@ -451,13 +476,13 @@ def check_and_trade(symbol, row, df):
             return
 
     # =========================================================================
-    # GATE 2 — Open order check (order placed but NOT yet filled, status="open")
+    # GATE 2 — Open order check (order NOT yet filled, status="open")
     # =========================================================================
     if has_open_order(symbol):
         print(f"[OPEN ORDER] {symbol} — unfilled order on book, skipping")
         return
 
-    # ── TP monitoring — check every 30s if stored TP has been hit ────────────
+    # ── TP monitoring ─────────────────────────────────────────────────────────
     tp_raw = df.iloc[row, 1]
 
     if str(tp_raw).strip().upper() == "TP COMPLETED":
@@ -482,16 +507,11 @@ def check_and_trade(symbol, row, df):
         pass
 
     # ── SLOPE FILTERS ─────────────────────────────────────────────────────────
-    #
-    #   Filter A — 50 EMA must be bending DOWN
-    #
     ema50_slope = ema50_values[-1] - ema50_values[-EMA50_SLOPE_BARS]
     if ema50_slope >= 0:
         print(f"[SKIP] {symbol} 50 EMA slope not down ({round(ema50_slope, precision)}) | 50 EMA {ema50} | 100 EMA {ema100} | Price {last_close}")
         return
 
-    #   Filter B — 100 EMA must NOT be rising steeply
-    #
     ema100_slope     = ema100_values[-1] - ema100_values[-EMA100_SLOPE_BARS]
     ema100_slope_pct = ema100_slope / last_close
     if ema100_slope_pct > EMA100_FLAT_THRESHOLD:
@@ -499,10 +519,6 @@ def check_and_trade(symbol, row, df):
         return
 
     # ── STRATEGY CONDITIONS ───────────────────────────────────────────────────
-    #
-    #   1. macro_bullish = ema50 > ema100  (50 EMA above 100 EMA)
-    #   2. below_ema50   = price < ema50   (price below 50 EMA)
-    #
     macro_bullish = ema50 > ema100
     below_ema50   = last_close < ema50
 
@@ -552,7 +568,9 @@ def check_and_trade(symbol, row, df):
 # MAIN LOOP
 # =====================================================
 
-cycle = 0
+cycle           = 0
+consecutive_errors = 0
+MAX_CONSECUTIVE_ERRORS = 10  # crash intentionally after 10 back-to-back errors
 
 send_telegram(
     f"✅ <b>Bot Started</b>\n"
@@ -572,10 +590,13 @@ while True:
         df = get_sheet_data()
 
         if df.empty:
+            print("[WARN] Sheet returned empty — possible auth issue, retrying in 30s")
             time.sleep(30)
             continue
 
         cycle += 1
+        consecutive_errors = 0  # reset on successful cycle
+
         if cycle % 10 == 0:
             print("----- TRADE SCAN (5 MIN) -----")
         else:
@@ -591,5 +612,17 @@ while True:
         time.sleep(30)
 
     except Exception as e:
-        print("BOT ERROR:", e)
+        consecutive_errors += 1
+        print(f"BOT ERROR ({consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}): {e}")
+
+        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+            # Intentional crash — Docker restart policy will revive the container
+            send_telegram(
+                f"🚨 <b>Bot Crashed — Restarting</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"❌ Error : <code>{str(e)[:200]}</code>\n"
+                f"🔁 {consecutive_errors} consecutive errors — triggering restart"
+            )
+            raise SystemExit(1)
+
         time.sleep(60)
