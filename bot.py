@@ -21,7 +21,7 @@ TP_PCT                = 0.01
 SL_PCT                = 0.10
 MIN_RR                = 0.05
 EMA50_SLOPE_BARS      = 5
-EMA100_SLOPE_BARS     = 4
+EMA100_SLOPE_BARS     = 5
 EMA100_FLAT_THRESHOLD = 0.001
 
 # ─── REQUEST TIMEOUTS (seconds) ───────────────────────────────────────────────
@@ -446,7 +446,8 @@ def check_and_trade(symbol, row, df):
         print(f"[ERROR] {symbol} candle fetch failed: {e}")
         return
 
-    if len(candles) < EMA_SLOW_PERIOD + 5:
+    # Need enough bars to compute both current AND previous slope windows
+    if len(candles) < EMA_SLOW_PERIOD + EMA50_SLOPE_BARS + 1:
         return
 
     precision  = get_precision(candles[-1]["close"])
@@ -506,33 +507,77 @@ def check_and_trade(symbol, row, df):
     except Exception:
         pass
 
-    # ── SLOPE FILTERS ─────────────────────────────────────────────────────────
-    ema50_slope = ema50_values[-1] - ema50_values[-EMA50_SLOPE_BARS]
-    if ema50_slope >= 0:
-        print(f"[SKIP] {symbol} 50 EMA slope not down ({round(ema50_slope, precision)}) | 50 EMA {ema50} | 100 EMA {ema100} | Price {last_close}")
+    # ── SLOPE FLIP DETECTION — the confirmation trigger ───────────────────────
+    #
+    # Slope is measured as the change in EMA50 over EMA50_SLOPE_BARS bars.
+    #
+    #   ema50_slope_curr  = slope ending at the CURRENT bar   (bar -1)
+    #   ema50_slope_prev  = slope ending at the PREVIOUS bar  (bar -2)
+    #
+    # We enter only on the EXACT bar where the slope transitions from
+    # non-negative (flat or rising) to negative (pointing downward).
+    # If the slope was already negative last bar, we skip — the signal
+    # already fired and we don't want a re-entry on stale momentum.
+    #
+    ema50_slope_curr = ema50_values[-1] - ema50_values[-(EMA50_SLOPE_BARS + 1)]
+    ema50_slope_prev = ema50_values[-2] - ema50_values[-(EMA50_SLOPE_BARS + 2)]
+
+    slope_just_turned_negative = (ema50_slope_prev >= 0) and (ema50_slope_curr < 0)
+
+    if not slope_just_turned_negative:
+        if ema50_slope_curr >= 0:
+            print(
+                f"[SKIP] {symbol} 50 EMA slope still positive/flat "
+                f"({round(ema50_slope_curr, precision)}) "
+                f"| 50 EMA {ema50} | 100 EMA {ema100} | Price {last_close}"
+            )
+        else:
+            print(
+                f"[SKIP] {symbol} 50 EMA slope already negative previous bar too "
+                f"(curr {round(ema50_slope_curr, precision)}, "
+                f"prev {round(ema50_slope_prev, precision)}) — no fresh flip "
+                f"| Price {last_close}"
+            )
         return
 
+    # 100 EMA still rising check (unchanged)
     ema100_slope     = ema100_values[-1] - ema100_values[-EMA100_SLOPE_BARS]
     ema100_slope_pct = ema100_slope / last_close
     if ema100_slope_pct > EMA100_FLAT_THRESHOLD:
-        print(f"[SKIP] {symbol} 100 EMA still rising (slope +{round(ema100_slope_pct * 100, 4)}%) | 50 EMA {ema50} | 100 EMA {ema100} | Price {last_close}")
+        print(
+            f"[SKIP] {symbol} 100 EMA still rising (slope +{round(ema100_slope_pct * 100, 4)}%) "
+            f"| 50 EMA {ema50} | 100 EMA {ema100} | Price {last_close}"
+        )
         return
 
     # ── STRATEGY CONDITIONS ───────────────────────────────────────────────────
+    # Condition 1 — 50 EMA must be above 100 EMA (macro bullish context)
     macro_bullish = ema50 > ema100
-    below_ema50   = last_close < ema50
+
+    # Condition 2 — Price must be below the 50 EMA
+    below_ema50 = last_close < ema50
 
     if not macro_bullish:
-        print(f"[SKIP] {symbol} 50 EMA {ema50} not above 100 EMA {ema100} | Price {last_close}")
+        print(
+            f"[SKIP] {symbol} 50 EMA {ema50} not above 100 EMA {ema100} "
+            f"| Price {last_close}"
+        )
         return
 
     if not below_ema50:
-        print(f"[SKIP] {symbol} price {last_close} not below 50 EMA {ema50} | 100 EMA {ema100}")
+        print(
+            f"[SKIP] {symbol} price {last_close} not below 50 EMA {ema50} "
+            f"| 100 EMA {ema100}"
+        )
         return
 
     print(
-        f"[SIGNAL] {symbol} | Price {last_close} | 50 EMA {ema50} | 100 EMA {ema100} "
-        f"| 50 slope {round(ema50_slope, precision)} | 100 slope {round(ema100_slope_pct * 100, 4)}% "
+        f"[SIGNAL] {symbol} | 50 EMA slope JUST FLIPPED NEGATIVE ✓ "
+        f"| Price {last_close} below 50 EMA {ema50} ✓ "
+        f"| 50 EMA above 100 EMA {ema100} ✓ "
+        f"| slope curr {round(ema50_slope_curr, precision)} "
+        f"prev {round(ema50_slope_prev, precision)} "
+        f"| 100 slope {round(ema100_slope_pct * 100, 4)}% "
         f"| TP {round(last_close * (1 - TP_PCT), precision)} "
         f"| SL {round(last_close * (1 + SL_PCT), precision)}"
     )
@@ -568,7 +613,7 @@ def check_and_trade(symbol, row, df):
 # MAIN LOOP
 # =====================================================
 
-cycle           = 0
+cycle              = 0
 consecutive_errors = 0
 MAX_CONSECUTIVE_ERRORS = 10  # crash intentionally after 10 back-to-back errors
 
@@ -577,8 +622,8 @@ send_telegram(
     f"━━━━━━━━━━━━━━━━━━\n"
     f"📐 Strategy : <code>50/100 Pullback Short</code>\n"
     f"⏱ Timeframe : <code>30 Min</code>\n"
-    f"📉 Entry    : <code>Price below 50 EMA</code>\n"
-    f"✅ Context  : <code>50 EMA above 100 EMA</code>\n"
+    f"📉 Entry    : <code>50 EMA slope flips negative (confirmation bar)</code>\n"
+    f"✅ Context  : <code>50 EMA above 100 EMA + price below 50 EMA</code>\n"
     f"🎯 TP       : <code>{TP_PCT * 100:.1f}% fixed</code>\n"
     f"🛑 SL       : <code>{int(SL_PCT * 100)}% fixed above entry</code>\n"
     f"💰 Capital  : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>\n"
