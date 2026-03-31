@@ -21,7 +21,7 @@ TP_PCT                = 0.01
 SL_PCT                = 0.10
 MIN_RR                = 0.05
 EMA50_SLOPE_BARS      = 5
-EMA100_SLOPE_BARS     = 5
+EMA100_SLOPE_BARS     = 4
 EMA100_FLAT_THRESHOLD = 0.001
 
 # ─── REQUEST TIMEOUTS (seconds) ───────────────────────────────────────────────
