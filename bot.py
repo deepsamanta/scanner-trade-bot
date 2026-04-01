@@ -20,7 +20,7 @@ EMA_SLOW_PERIOD       = 100
 TP_PCT                = 0.01
 SL_PCT                = 0.10
 MIN_RR                = 0.05
-EMA50_SLOPE_BARS      = 10    # number of bars to measure the 50 EMA curve visually
+EMA50_SLOPE_BARS      = 5    # number of bars to measure the 50 EMA curve visually
 EMA100_SLOPE_BARS     = 5
 EMA100_FLAT_THRESHOLD = 0.001
 
