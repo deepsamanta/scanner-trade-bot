@@ -420,7 +420,7 @@ def check_and_trade(symbol, row, df):
         "pair":       pair_api,
         "from":       now - 1350000,  # ~750 candles of 30m — enough for EMA100 to fully converge
         "to":         now,
-        "resolution": "30",
+        "resolution": "30min",
         "pcode":      "f",
     }
 
