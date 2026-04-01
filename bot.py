@@ -20,17 +20,16 @@ EMA_SLOW_PERIOD       = 100
 TP_PCT                = 0.01
 SL_PCT                = 0.10
 MIN_RR                = 0.05
-EMA50_SLOPE_BARS      = 5
+EMA50_SLOPE_BARS      = 5    # number of bars to measure the 50 EMA curve visually
 EMA100_SLOPE_BARS     = 5
 EMA100_FLAT_THRESHOLD = 0.001
 
 # ─── REQUEST TIMEOUTS (seconds) ───────────────────────────────────────────────
-REQUEST_TIMEOUT       = 15   # all CoinDCX / public API calls
-TELEGRAM_TIMEOUT      = 10   # telegram calls
+REQUEST_TIMEOUT       = 15
+TELEGRAM_TIMEOUT      = 10
 
 # ─── GSPREAD RE-AUTH INTERVAL ─────────────────────────────────────────────────
-# Re-initialise the gspread client every 45 minutes to avoid OAuth token expiry
-GSHEET_REAUTH_INTERVAL = 45 * 60   # 45 minutes in seconds
+GSHEET_REAUTH_INTERVAL = 45 * 60
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -43,30 +42,22 @@ SCOPE = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-# Module-level sheet handle and last-auth timestamp
-_sheet            = None
-_last_auth_time   = 0
+_sheet          = None
+_last_auth_time = 0
 
 
 def get_sheet():
-    """
-    Return a valid gspread sheet object.
-    Re-authenticates every GSHEET_REAUTH_INTERVAL seconds so the OAuth
-    token never goes stale (tokens expire after ~1 hour).
-    """
     global _sheet, _last_auth_time
-
     now = time.time()
     if _sheet is None or (now - _last_auth_time) > GSHEET_REAUTH_INTERVAL:
         try:
-            creds         = Credentials.from_service_account_file("service_account.json", scopes=SCOPE)
-            client        = gspread.authorize(creds)
-            _sheet        = client.open_by_key(SHEET_ID).sheet1
+            creds           = Credentials.from_service_account_file("service_account.json", scopes=SCOPE)
+            client          = gspread.authorize(creds)
+            _sheet          = client.open_by_key(SHEET_ID).sheet1
             _last_auth_time = now
             print("[GSHEET] Re-authenticated successfully")
         except Exception as e:
             print(f"[GSHEET] Re-auth failed: {e}")
-            # Return old sheet if we have one, otherwise None
     return _sheet
 
 
@@ -102,7 +93,6 @@ def update_sheet_tp(row, value):
 
 
 def update_sheet_sl(row, value):
-    """Column C stores live SL for trailing stop tracking."""
     try:
         sheet = get_sheet()
         if sheet is None:
@@ -190,7 +180,7 @@ def compute_ema(closes, period):
 
 
 # =====================================================
-# OPEN POSITIONS  (order was filled → live position)
+# OPEN POSITIONS
 # =====================================================
 
 def get_open_positions():
@@ -240,15 +230,10 @@ def get_position_entry(symbol):
 
 
 # =====================================================
-# OPEN ORDER CHECK  (order NOT yet filled, status="open")
+# OPEN ORDER CHECK
 # =====================================================
 
 def has_open_order(symbol):
-    """
-    Returns True if there is any unfilled order for this pair still on the book.
-    status="open"  →  order placed but NOT executed yet.
-    This is different from an open position (which means the order WAS filled).
-    """
     try:
         body = {
             "timestamp":                  int(time.time() * 1000),
@@ -446,26 +431,26 @@ def check_and_trade(symbol, row, df):
         print(f"[ERROR] {symbol} candle fetch failed: {e}")
         return
 
-    # Need enough bars to compute both current AND previous slope windows
-    if len(candles) < EMA_SLOW_PERIOD + EMA50_SLOPE_BARS + 1:
+    # Need EMA_SLOW_PERIOD + EMA50_SLOPE_BARS + 2 bars to compute both
+    # the current and previous slope windows without index errors
+    if len(candles) < EMA_SLOW_PERIOD + EMA50_SLOPE_BARS + 2:
         return
 
     precision  = get_precision(candles[-1]["close"])
     closes     = [float(c["close"]) for c in candles]
     last_close = float(candles[-1]["close"])
 
-    # Free memory immediately after extracting what we need
     del candles
 
     ema50_values  = compute_ema(closes, EMA_FAST_PERIOD)
     ema100_values = compute_ema(closes, EMA_SLOW_PERIOD)
     del closes
 
-    ema50  = round(ema50_values[-1],  precision)
-    ema100 = round(ema100_values[-1], precision)
+    ema50  = ema50_values[-1]
+    ema100 = ema100_values[-1]
 
     # =========================================================================
-    # GATE 1 — Open position check (order was filled → live position exists)
+    # GATE 1 — Open position check
     # =========================================================================
     positions = get_open_positions()
     for pos in positions:
@@ -477,7 +462,7 @@ def check_and_trade(symbol, row, df):
             return
 
     # =========================================================================
-    # GATE 2 — Open order check (order NOT yet filled, status="open")
+    # GATE 2 — Open order check
     # =========================================================================
     if has_open_order(symbol):
         print(f"[OPEN ORDER] {symbol} — unfilled order on book, skipping")
@@ -507,17 +492,43 @@ def check_and_trade(symbol, row, df):
     except Exception:
         pass
 
-    # ── SLOPE FLIP DETECTION — the confirmation trigger ───────────────────────
+    # =========================================================================
+    # STRATEGY CONDITIONS
+    # =========================================================================
+
+    # ── Condition 1 — 50 EMA must be above 100 EMA ───────────────────────────
+    if ema50 <= ema100:
+        print(
+            f"[SKIP] {symbol} 50 EMA {round(ema50, precision)} not above "
+            f"100 EMA {round(ema100, precision)} | Price {last_close}"
+        )
+        return
+
+    # ── Condition 2 — Price must be below 50 EMA ─────────────────────────────
+    # Price may have dropped below 1 bar ago or many bars ago — doesn't matter.
+    # We just need it sitting below the EMA when the slope confirmation fires.
+    if last_close >= ema50:
+        print(
+            f"[SKIP] {symbol} price {last_close} not below "
+            f"50 EMA {round(ema50, precision)} | 100 EMA {round(ema100, precision)}"
+        )
+        return
+
+    # ── Condition 3 — 50 EMA slope JUST curved downward ──────────────────────
     #
-    # Slope is measured as the change in EMA50 over EMA50_SLOPE_BARS bars.
+    # Slope is measured over EMA50_SLOPE_BARS (default 5) bars — this matches
+    # what you visually see as the EMA "curving down" on the chart, not a
+    # single-bar flicker.
     #
-    #   ema50_slope_curr  = slope ending at the CURRENT bar   (bar -1)
-    #   ema50_slope_prev  = slope ending at the PREVIOUS bar  (bar -2)
+    #   ema50_slope_curr  =  EMA50[now]       - EMA50[5 bars ago]
+    #   ema50_slope_prev  =  EMA50[prev bar]  - EMA50[6 bars ago]
     #
-    # We enter only on the EXACT bar where the slope transitions from
-    # non-negative (flat or rising) to negative (pointing downward).
-    # If the slope was already negative last bar, we skip — the signal
-    # already fired and we don't want a re-entry on stale momentum.
+    # Flip = the 5-bar slope was flat/rising last bar (>= 0)
+    #        AND the 5-bar slope is now negative    (<  0)
+    #
+    # This fires on exactly ONE bar — the bar where the EMA visually peaks
+    # and begins curving downward. If slope was already negative last bar
+    # the signal already fired → skip to avoid re-entry.
     #
     ema50_slope_curr = ema50_values[-1] - ema50_values[-(EMA50_SLOPE_BARS + 1)]
     ema50_slope_prev = ema50_values[-2] - ema50_values[-(EMA50_SLOPE_BARS + 2)]
@@ -527,74 +538,50 @@ def check_and_trade(symbol, row, df):
     if not slope_just_turned_negative:
         if ema50_slope_curr >= 0:
             print(
-                f"[SKIP] {symbol} 50 EMA slope still positive/flat "
-                f"({round(ema50_slope_curr, precision)}) "
-                f"| 50 EMA {ema50} | 100 EMA {ema100} | Price {last_close}"
+                f"[SKIP] {symbol} 50 EMA still curving up/flat over last {EMA50_SLOPE_BARS} bars "
+                f"(slope {round(ema50_slope_curr, precision)}) "
+                f"| 50 EMA {round(ema50, precision)} | 100 EMA {round(ema100, precision)} "
+                f"| Price {last_close}"
             )
         else:
             print(
-                f"[SKIP] {symbol} 50 EMA slope already negative previous bar too "
-                f"(curr {round(ema50_slope_curr, precision)}, "
-                f"prev {round(ema50_slope_prev, precision)}) — no fresh flip "
+                f"[SKIP] {symbol} 50 EMA was already curving down last bar — signal already fired "
+                f"(curr {round(ema50_slope_curr, precision)}, prev {round(ema50_slope_prev, precision)}) "
                 f"| Price {last_close}"
             )
         return
 
-    # 100 EMA still rising check (unchanged)
+    # ── 100 EMA still rising guard ────────────────────────────────────────────
     ema100_slope     = ema100_values[-1] - ema100_values[-EMA100_SLOPE_BARS]
     ema100_slope_pct = ema100_slope / last_close
     if ema100_slope_pct > EMA100_FLAT_THRESHOLD:
         print(
-            f"[SKIP] {symbol} 100 EMA still rising (slope +{round(ema100_slope_pct * 100, 4)}%) "
-            f"| 50 EMA {ema50} | 100 EMA {ema100} | Price {last_close}"
-        )
-        return
-
-    # ── STRATEGY CONDITIONS ───────────────────────────────────────────────────
-    # Condition 1 — 50 EMA must be above 100 EMA (macro bullish context)
-    macro_bullish = ema50 > ema100
-
-    # Condition 2 — Price must be below the 50 EMA
-    below_ema50 = last_close < ema50
-
-    if not macro_bullish:
-        print(
-            f"[SKIP] {symbol} 50 EMA {ema50} not above 100 EMA {ema100} "
+            f"[SKIP] {symbol} 100 EMA still rising "
+            f"(slope +{round(ema100_slope_pct * 100, 4)}%) "
+            f"| 50 EMA {round(ema50, precision)} | 100 EMA {round(ema100, precision)} "
             f"| Price {last_close}"
         )
         return
 
-    if not below_ema50:
-        print(
-            f"[SKIP] {symbol} price {last_close} not below 50 EMA {ema50} "
-            f"| 100 EMA {ema100}"
-        )
-        return
-
     print(
-        f"[SIGNAL] {symbol} | 50 EMA slope JUST FLIPPED NEGATIVE ✓ "
-        f"| Price {last_close} below 50 EMA {ema50} ✓ "
-        f"| 50 EMA above 100 EMA {ema100} ✓ "
-        f"| slope curr {round(ema50_slope_curr, precision)} "
-        f"prev {round(ema50_slope_prev, precision)} "
-        f"| 100 slope {round(ema100_slope_pct * 100, 4)}% "
+        f"[SIGNAL] {symbol} "
+        f"| 50 EMA above 100 EMA ✓ "
+        f"| Price {last_close} below 50 EMA {round(ema50, precision)} ✓ "
+        f"| 50 EMA curved down over {EMA50_SLOPE_BARS} bars ✓ "
+        f"(curr slope {round(ema50_slope_curr, precision)}, prev slope {round(ema50_slope_prev, precision)}) "
         f"| TP {round(last_close * (1 - TP_PCT), precision)} "
         f"| SL {round(last_close * (1 + SL_PCT), precision)}"
     )
 
     # =========================================================================
-    # FINAL GUARD — re-check both states right before placing
-    # Protects against race conditions where state changed mid-scan
+    # FINAL GUARD — re-check right before placing
     # =========================================================================
-
-    # Guard 1: active order = order filled → open position now exists
     live_positions = get_open_positions()
     for pos in live_positions:
         if pos.get("pair") == pair:
             print(f"[SKIP] {symbol} — open position detected just before placement, aborting")
             return
 
-    # Guard 2: open order = status 'open' → order NOT yet filled, still on book
     if has_open_order(symbol):
         print(f"[SKIP] {symbol} — unfilled open order detected just before placement, aborting")
         return
@@ -615,15 +602,15 @@ def check_and_trade(symbol, row, df):
 
 cycle              = 0
 consecutive_errors = 0
-MAX_CONSECUTIVE_ERRORS = 10  # crash intentionally after 10 back-to-back errors
+MAX_CONSECUTIVE_ERRORS = 10
 
 send_telegram(
     f"✅ <b>Bot Started</b>\n"
     f"━━━━━━━━━━━━━━━━━━\n"
     f"📐 Strategy : <code>50/100 Pullback Short</code>\n"
     f"⏱ Timeframe : <code>30 Min</code>\n"
-    f"📉 Entry    : <code>50 EMA slope flips negative (confirmation bar)</code>\n"
-    f"✅ Context  : <code>50 EMA above 100 EMA + price below 50 EMA</code>\n"
+    f"📉 Entry    : <code>Price below 50 EMA + 50 EMA curves down ({EMA50_SLOPE_BARS}-bar slope flips negative)</code>\n"
+    f"✅ Context  : <code>50 EMA above 100 EMA</code>\n"
     f"🎯 TP       : <code>{TP_PCT * 100:.1f}% fixed</code>\n"
     f"🛑 SL       : <code>{int(SL_PCT * 100)}% fixed above entry</code>\n"
     f"💰 Capital  : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>\n"
@@ -640,7 +627,7 @@ while True:
             continue
 
         cycle += 1
-        consecutive_errors = 0  # reset on successful cycle
+        consecutive_errors = 0
 
         if cycle % 10 == 0:
             print("----- TRADE SCAN (5 MIN) -----")
@@ -661,7 +648,6 @@ while True:
         print(f"BOT ERROR ({consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}): {e}")
 
         if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-            # Intentional crash — Docker restart policy will revive the container
             send_telegram(
                 f"🚨 <b>Bot Crashed — Restarting</b>\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
