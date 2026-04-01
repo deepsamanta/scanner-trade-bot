@@ -20,9 +20,15 @@ EMA_SLOW_PERIOD       = 100
 TP_PCT                = 0.01
 SL_PCT                = 0.10
 MIN_RR                = 0.05
-EMA50_SLOPE_BARS      = 5    # number of bars to measure the 50 EMA curve visually
+EMA50_SLOPE_BARS      = 10   # number of 30m bars to measure 50 EMA slope visually
 EMA100_SLOPE_BARS     = 4
 EMA100_FLAT_THRESHOLD = 0.001
+
+# ─── CANDLE FETCH SETTINGS ────────────────────────────────────────────────────
+# Each chunk = 450000 seconds = 125 hours = ~250 candles of 30m
+# 4 chunks = ~1000 candles — enough for EMA100 to fully converge
+CANDLE_CHUNKS         = 4
+CANDLE_CHUNK_SECONDS  = 450000
 
 # ─── REQUEST TIMEOUTS (seconds) ───────────────────────────────────────────────
 REQUEST_TIMEOUT       = 15
@@ -177,6 +183,53 @@ def compute_ema(closes, period):
         ema = (price - ema) * multiplier + ema
         values.append(ema)
     return values
+
+
+# =====================================================
+# CANDLE FETCH — multi-chunk to get enough history
+# =====================================================
+
+def fetch_candles(pair_api):
+    """
+    Fetches candles in multiple chunks going back in time and stitches
+    them together. This bypasses the CoinDCX per-request candle cap and
+    ensures the EMA has enough history to converge to TradingView values.
+
+    CANDLE_CHUNKS x CANDLE_CHUNK_SECONDS:
+      4 chunks x 450000s = 1,800,000s = 500 hours = ~1000 candles of 30m
+    """
+    url         = "https://public.coindcx.com/market_data/candlesticks"
+    now         = int(time.time())
+    all_candles = []
+
+    for i in range(CANDLE_CHUNKS):
+        chunk_to   = now - i * CANDLE_CHUNK_SECONDS
+        chunk_from = chunk_to - CANDLE_CHUNK_SECONDS
+        params = {
+            "pair":       pair_api,
+            "from":       chunk_from,
+            "to":         chunk_to,
+            "resolution": "30",
+            "pcode":      "f",
+        }
+        try:
+            response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            data     = response.json().get("data", [])
+            all_candles.extend(data)
+        except Exception as e:
+            print(f"[CANDLE] Chunk {i} fetch error for {pair_api}: {e}")
+
+    # Deduplicate by timestamp and sort oldest → newest
+    seen   = set()
+    unique = []
+    for c in all_candles:
+        if c["time"] not in seen:
+            seen.add(c["time"])
+            unique.append(c)
+
+    candles = sorted(unique, key=lambda x: x["time"])
+    print(f"[CANDLE] {pair_api} total candles after merge: {len(candles)}")
+    return candles
 
 
 # =====================================================
@@ -413,27 +466,13 @@ def check_and_trade(symbol, row, df):
 
     pair     = fut_pair(symbol)
     pair_api = pair
-    url      = "https://public.coindcx.com/market_data/candlesticks"
-    now      = int(time.time())
 
-    params = {
-        "pair":       pair_api,
-        "from":       now - 1350000,  # ~750 candles of 30m — enough for EMA100 to fully converge
-        "to":         now,
-        "resolution": "30min",
-        "pcode":      "f",
-    }
+    # ── Fetch candles across multiple chunks for EMA accuracy ─────────────────
+    candles = fetch_candles(pair_api)
 
-    try:
-        response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-        candles  = sorted(response.json()["data"], key=lambda x: x["time"])
-    except Exception as e:
-        print(f"[ERROR] {symbol} candle fetch failed: {e}")
-        return
-
-    # Need EMA_SLOW_PERIOD + EMA50_SLOPE_BARS + 2 bars to compute both
-    # the current and previous slope windows without index errors
+    # Need at least EMA_SLOW_PERIOD + EMA50_SLOPE_BARS + 2 bars
     if len(candles) < EMA_SLOW_PERIOD + EMA50_SLOPE_BARS + 2:
+        print(f"[SKIP] {symbol} not enough candles ({len(candles)})")
         return
 
     precision  = get_precision(candles[-1]["close"])
@@ -505,8 +544,6 @@ def check_and_trade(symbol, row, df):
         return
 
     # ── Condition 2 — Price must be below 50 EMA ─────────────────────────────
-    # Price may have dropped below 1 bar ago or many bars ago — doesn't matter.
-    # We just need it sitting below the EMA when the slope confirmation fires.
     if last_close >= ema50:
         print(
             f"[SKIP] {symbol} price {last_close} not below "
@@ -516,12 +553,9 @@ def check_and_trade(symbol, row, df):
 
     # ── Condition 3 — 50 EMA slope must currently be negative ────────────────
     #
-    # Slope is measured over EMA50_SLOPE_BARS (default 5) bars:
-    #   ema50_slope_curr = EMA50[now] - EMA50[5 bars ago]
-    #
-    # If this value is negative, the EMA is visually curving downward
-    # on the 30m chart. No flip detection — just check current state.
-    # The open position/order gates above already prevent duplicate entries.
+    # Measured over EMA50_SLOPE_BARS (default 10) x 30m bars.
+    # Negative value = EMA is visually curving downward on the chart.
+    # No flip detection — just check current state.
     #
     ema50_slope_curr = ema50_values[-1] - ema50_values[-(EMA50_SLOPE_BARS + 1)]
 
