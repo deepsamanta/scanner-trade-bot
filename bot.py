@@ -21,7 +21,7 @@ TP_PCT                = 0.01
 SL_PCT                = 0.10
 MIN_RR                = 0.05
 EMA50_SLOPE_BARS      = 5    # number of bars to measure the 50 EMA curve visually
-EMA100_SLOPE_BARS     = 5
+EMA100_SLOPE_BARS     = 4
 EMA100_FLAT_THRESHOLD = 0.001
 
 # ─── REQUEST TIMEOUTS (seconds) ───────────────────────────────────────────────
@@ -514,41 +514,24 @@ def check_and_trade(symbol, row, df):
         )
         return
 
-    # ── Condition 3 — 50 EMA slope JUST curved downward ──────────────────────
+    # ── Condition 3 — 50 EMA slope must currently be negative ────────────────
     #
-    # Slope is measured over EMA50_SLOPE_BARS (default 5) bars — this matches
-    # what you visually see as the EMA "curving down" on the chart, not a
-    # single-bar flicker.
+    # Slope is measured over EMA50_SLOPE_BARS (default 5) bars:
+    #   ema50_slope_curr = EMA50[now] - EMA50[5 bars ago]
     #
-    #   ema50_slope_curr  =  EMA50[now]       - EMA50[5 bars ago]
-    #   ema50_slope_prev  =  EMA50[prev bar]  - EMA50[6 bars ago]
-    #
-    # Flip = the 5-bar slope was flat/rising last bar (>= 0)
-    #        AND the 5-bar slope is now negative    (<  0)
-    #
-    # This fires on exactly ONE bar — the bar where the EMA visually peaks
-    # and begins curving downward. If slope was already negative last bar
-    # the signal already fired → skip to avoid re-entry.
+    # If this value is negative, the EMA is visually curving downward
+    # on the 30m chart. No flip detection — just check current state.
+    # The open position/order gates above already prevent duplicate entries.
     #
     ema50_slope_curr = ema50_values[-1] - ema50_values[-(EMA50_SLOPE_BARS + 1)]
-    ema50_slope_prev = ema50_values[-2] - ema50_values[-(EMA50_SLOPE_BARS + 2)]
 
-    slope_just_turned_negative = (ema50_slope_prev >= 0) and (ema50_slope_curr < 0)
-
-    if not slope_just_turned_negative:
-        if ema50_slope_curr >= 0:
-            print(
-                f"[SKIP] {symbol} 50 EMA still curving up/flat over last {EMA50_SLOPE_BARS} bars "
-                f"(slope {round(ema50_slope_curr, precision)}) "
-                f"| 50 EMA {round(ema50, precision)} | 100 EMA {round(ema100, precision)} "
-                f"| Price {last_close}"
-            )
-        else:
-            print(
-                f"[SKIP] {symbol} 50 EMA was already curving down last bar — signal already fired "
-                f"(curr {round(ema50_slope_curr, precision)}, prev {round(ema50_slope_prev, precision)}) "
-                f"| Price {last_close}"
-            )
+    if ema50_slope_curr >= 0:
+        print(
+            f"[SKIP] {symbol} 50 EMA slope not negative "
+            f"(slope {round(ema50_slope_curr, precision)}) "
+            f"| 50 EMA {round(ema50, precision)} | 100 EMA {round(ema100, precision)} "
+            f"| Price {last_close}"
+        )
         return
 
     # ── 100 EMA still rising guard ────────────────────────────────────────────
@@ -567,8 +550,8 @@ def check_and_trade(symbol, row, df):
         f"[SIGNAL] {symbol} "
         f"| 50 EMA above 100 EMA ✓ "
         f"| Price {last_close} below 50 EMA {round(ema50, precision)} ✓ "
-        f"| 50 EMA curved down over {EMA50_SLOPE_BARS} bars ✓ "
-        f"(curr slope {round(ema50_slope_curr, precision)}, prev slope {round(ema50_slope_prev, precision)}) "
+        f"| 50 EMA slope negative ✓ "
+        f"(slope {round(ema50_slope_curr, precision)} over {EMA50_SLOPE_BARS} bars) "
         f"| TP {round(last_close * (1 - TP_PCT), precision)} "
         f"| SL {round(last_close * (1 + SL_PCT), precision)}"
     )
@@ -609,7 +592,7 @@ send_telegram(
     f"━━━━━━━━━━━━━━━━━━\n"
     f"📐 Strategy : <code>50/100 Pullback Short</code>\n"
     f"⏱ Timeframe : <code>30 Min</code>\n"
-    f"📉 Entry    : <code>Price below 50 EMA + 50 EMA curves down ({EMA50_SLOPE_BARS}-bar slope flips negative)</code>\n"
+    f"📉 Entry    : <code>Price below 50 EMA + 50 EMA slope negative ({EMA50_SLOPE_BARS}-bar)</code>\n"
     f"✅ Context  : <code>50 EMA above 100 EMA</code>\n"
     f"🎯 TP       : <code>{TP_PCT * 100:.1f}% fixed</code>\n"
     f"🛑 SL       : <code>{int(SL_PCT * 100)}% fixed above entry</code>\n"
