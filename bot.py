@@ -15,21 +15,30 @@ getcontext().prec = 28
 BASE_URL = "https://api.coindcx.com"
 
 # ─── TUNEABLE CONSTANTS ────────────────────────────────────────────────────────
-EMA_FAST_PERIOD       = 50
-EMA_SLOW_PERIOD       = 100
-TP_PCT                = 0.005
-SL_PCT                = 0.10
-MIN_RR                = 0.03
-EMA50_SLOPE_BARS      = 5    # number of bars to measure the 50 EMA curve visually
-EMA100_SLOPE_BARS     = 5
-EMA100_FLAT_THRESHOLD = 0.001
+EMA_PERIOD       = 21
+TP_PCT           = 0.01
+SL_PCT           = 0.10
+MIN_RR           = 0.05
 
 # ─── REQUEST TIMEOUTS (seconds) ───────────────────────────────────────────────
-REQUEST_TIMEOUT       = 15
-TELEGRAM_TIMEOUT      = 10
+REQUEST_TIMEOUT  = 15
+TELEGRAM_TIMEOUT = 10
 
 # ─── GSPREAD RE-AUTH INTERVAL ─────────────────────────────────────────────────
 GSHEET_REAUTH_INTERVAL = 45 * 60
+
+# ─── LATCHING FLAGS (per symbol) ──────────────────────────────────────────────
+_signal_flags = {}
+
+def _get_flags(symbol):
+    if symbol not in _signal_flags:
+        _signal_flags[symbol] = {"ema_slope_seen": False, "price_below_seen": False}
+    return _signal_flags[symbol]
+
+def _reset_flags(symbol, reason=""):
+    _signal_flags[symbol] = {"ema_slope_seen": False, "price_below_seen": False}
+    if reason:
+        print(f"[FLAGS] {symbol} reset — {reason}")
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -431,9 +440,8 @@ def check_and_trade(symbol, row, df):
         print(f"[ERROR] {symbol} candle fetch failed: {e}")
         return
 
-    # Need EMA_SLOW_PERIOD + EMA50_SLOPE_BARS + 2 bars to compute both
-    # the current and previous slope windows without index errors
-    if len(candles) < EMA_SLOW_PERIOD + EMA50_SLOPE_BARS + 2:
+    # ← CHANGED: EMA_PERIOD + 3 to safely access ema_values[-3] (2-bar slope)
+    if len(candles) < EMA_PERIOD + 3:
         return
 
     precision  = get_precision(candles[-1]["close"])
@@ -442,12 +450,11 @@ def check_and_trade(symbol, row, df):
 
     del candles
 
-    ema50_values  = compute_ema(closes, EMA_FAST_PERIOD)
-    ema100_values = compute_ema(closes, EMA_SLOW_PERIOD)
+    ema_values = compute_ema(closes, EMA_PERIOD)
     del closes
 
-    ema50  = ema50_values[-1]
-    ema100 = ema100_values[-1]
+    ema_now  = ema_values[-1]   # current candle's 21 EMA
+    ema_prev = ema_values[-3]   # ← CHANGED: 2 candles back for 2-bar slope
 
     # =========================================================================
     # GATE 1 — Open position check
@@ -493,65 +500,35 @@ def check_and_trade(symbol, row, df):
         pass
 
     # =========================================================================
-    # STRATEGY CONDITIONS
+    # STRATEGY CONDITIONS — 21 EMA only, matching Pine Script
     # =========================================================================
 
-    # ── Condition 1 — 50 EMA must be above 100 EMA ───────────────────────────
-    if ema50 <= ema100:
-        print(
-            f"[SKIP] {symbol} 50 EMA {round(ema50, precision)} not above "
-            f"100 EMA {round(ema100, precision)} | Price {last_close}"
-        )
-        return
+    flags = _get_flags(symbol)
 
-    # ── Condition 2 — Price must be below 50 EMA ─────────────────────────────
-    # Price may have dropped below 1 bar ago or many bars ago — doesn't matter.
-    # We just need it sitting below the EMA when the slope confirmation fires.
-    if last_close >= ema50:
-        print(
-            f"[SKIP] {symbol} price {last_close} not below "
-            f"50 EMA {round(ema50, precision)} | 100 EMA {round(ema100, precision)}"
-        )
-        return
+    # ── Condition 1 — 21 EMA slope negative over 2 bars (latch) ──────────────
+    # ema_now < ema_prev mirrors ema21 < ema21[1] but measured 2 bars back
+    if ema_now < ema_prev:
+        flags["ema_slope_seen"] = True
 
-    # ── Condition 3 — 50 EMA slope must currently be negative ────────────────
-    #
-    # Slope is measured over EMA50_SLOPE_BARS (default 5) bars:
-    #   ema50_slope_curr = EMA50[now] - EMA50[5 bars ago]
-    #
-    # If this value is negative, the EMA is visually curving downward
-    # on the 30m chart. No flip detection — just check current state.
-    # The open position/order gates above already prevent duplicate entries.
-    #
-    ema50_slope_curr = ema50_values[-1] - ema50_values[-(EMA50_SLOPE_BARS + 1)]
+    # ── Condition 2 — Price below 21 EMA (latch) ─────────────────────────────
+    # mirrors: close < ema21 in Pine Script
+    if last_close < ema_now:
+        flags["price_below_seen"] = True
 
-    if ema50_slope_curr >= 0:
+    # ── Both flags must be latched — order and timing don't matter ────────────
+    if not flags["ema_slope_seen"] or not flags["price_below_seen"]:
         print(
-            f"[SKIP] {symbol} 50 EMA slope not negative "
-            f"(slope {round(ema50_slope_curr, precision)}) "
-            f"| 50 EMA {round(ema50, precision)} | 100 EMA {round(ema100, precision)} "
-            f"| Price {last_close}"
-        )
-        return
-
-    # ── 100 EMA still rising guard ────────────────────────────────────────────
-    ema100_slope     = ema100_values[-1] - ema100_values[-EMA100_SLOPE_BARS]
-    ema100_slope_pct = ema100_slope / last_close
-    if ema100_slope_pct > EMA100_FLAT_THRESHOLD:
-        print(
-            f"[SKIP] {symbol} 100 EMA still rising "
-            f"(slope +{round(ema100_slope_pct * 100, 4)}%) "
-            f"| 50 EMA {round(ema50, precision)} | 100 EMA {round(ema100, precision)} "
-            f"| Price {last_close}"
+            f"[WAIT] {symbol} | "
+            f"ema_slope={flags['ema_slope_seen']} "
+            f"price_below={flags['price_below_seen']} "
+            f"| Price {last_close} | 21 EMA {round(ema_now, precision)}"
         )
         return
 
     print(
         f"[SIGNAL] {symbol} "
-        f"| 50 EMA above 100 EMA ✓ "
-        f"| Price {last_close} below 50 EMA {round(ema50, precision)} ✓ "
-        f"| 50 EMA slope negative ✓ "
-        f"(slope {round(ema50_slope_curr, precision)} over {EMA50_SLOPE_BARS} bars) "
+        f"| 21 EMA slope negative ✓ (latched, 2-bar) "
+        f"| Price {last_close} below 21 EMA {round(ema_now, precision)} ✓ (latched) "
         f"| TP {round(last_close * (1 - TP_PCT), precision)} "
         f"| SL {round(last_close * (1 + SL_PCT), precision)}"
     )
@@ -575,6 +552,7 @@ def check_and_trade(symbol, row, df):
     )
     if tp_confirmed:
         update_sheet_tp(row, tp_confirmed)
+        _reset_flags(symbol, "trade placed")
     if sl_placed:
         update_sheet_sl(row, sl_placed)
 
@@ -590,10 +568,10 @@ MAX_CONSECUTIVE_ERRORS = 10
 send_telegram(
     f"✅ <b>Bot Started</b>\n"
     f"━━━━━━━━━━━━━━━━━━\n"
-    f"📐 Strategy : <code>50/100 Pullback Short</code>\n"
+    f"📐 Strategy : <code>21 EMA Pullback Short</code>\n"
     f"⏱ Timeframe : <code>30 Min</code>\n"
-    f"📉 Entry    : <code>Price below 50 EMA + 50 EMA slope negative ({EMA50_SLOPE_BARS}-bar)</code>\n"
-    f"✅ Context  : <code>50 EMA above 100 EMA</code>\n"
+    f"📉 Entry    : <code>Price below 21 EMA + 21 EMA slope negative (2-bar)</code>\n"
+    f"✅ Filter   : <code>Pumped coins added manually to sheet</code>\n"
     f"🎯 TP       : <code>{TP_PCT * 100:.1f}% fixed</code>\n"
     f"🛑 SL       : <code>{int(SL_PCT * 100)}% fixed above entry</code>\n"
     f"💰 Capital  : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>\n"
