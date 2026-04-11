@@ -41,7 +41,7 @@ LINREG_4H_LOOKBACK = 5        # number of 4H candles to use for the slope check
 # (rallied / consolidated above it). This confirms a proper retest, not a
 # mid-air entry on an already extended move down.
 FILTER_LOOKBACK  = 50         # how many candles to check
-MIN_ABOVE_PERC   = 65         # min % of those candles that must be ABOVE EMA
+MIN_ABOVE_PERC   = 60         # min % of those candles that must be ABOVE EMA
 
 # ─── EMA PROXIMITY FILTER ─────────────────────────────────────────────────────
 # Even after the crossover down, don't sell if price has already run too far below EMA.
