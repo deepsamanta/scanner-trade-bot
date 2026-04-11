@@ -34,18 +34,18 @@ LINREG_LOOKBACK  = 4          # candles for slope curve
 # ─── 4H TREND FILTER ──────────────────────────────────────────────────────────
 # Before placing a short, verify that the 4H timeframe also shows bearish momentum.
 # The linreg slope on 4H EMA must be NEGATIVE (downward-bending curve on 4H).
-LINREG_4H_LOOKBACK = 4        # number of 4H candles to use for the slope check
+LINREG_4H_LOOKBACK = 5        # number of 4H candles to use for the slope check
 
 # ─── CONSOLIDATION FILTER ─────────────────────────────────────────────────────
 # Before a valid short, price must have spent enough time ABOVE the EMA
 # (rallied / consolidated above it). This confirms a proper retest, not a
 # mid-air entry on an already extended move down.
 FILTER_LOOKBACK  = 50         # how many candles to check
-MIN_ABOVE_PERC   = 45         # min % of those candles that must be ABOVE EMA
+MIN_ABOVE_PERC   = 65         # min % of those candles that must be ABOVE EMA
 
 # ─── EMA PROXIMITY FILTER ─────────────────────────────────────────────────────
 # Even after the crossover down, don't sell if price has already run too far below EMA.
-MAX_EMA_DISTANCE_PCT = 0.02   # 2% max distance below EMA
+MAX_EMA_DISTANCE_PCT = 0.03   # 2% max distance below EMA
 
 # ─── SCAN INTERVAL ────────────────────────────────────────────────────────────
 SCAN_INTERVAL    = 900        # 15 minutes in seconds
