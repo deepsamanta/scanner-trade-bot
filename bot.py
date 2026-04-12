@@ -16,14 +16,14 @@ BASE_URL = "https://api.coindcx.com"
 
 # ─── TUNEABLE CONSTANTS ────────────────────────────────────────────────────────
 EMA_PERIOD       = 21
-MIN_RR           = 0.05
+MIN_RR           = 0.04
 
 # ─── DYNAMIC TP SETTINGS (SHORT) ──────────────────────────────────────────────
 SWING_LOOKBACK     = 3        # candles each side to confirm a swing low
 SUPPORT_CANDLES    = 200      # how many candles to scan for swing body lows
-MIN_TP_PCT         = 0.012    # minimum TP: 1.2% below entry
-MAX_TP_PCT         = 0.05     # maximum TP: 5% below entry (cap)
-FALLBACK_TP_PCT    = 0.01     # fallback fixed TP if no support found: 1%
+MIN_TP_PCT         = 0.01    # minimum TP: 1.2% below entry
+MAX_TP_PCT         = 0.04     # maximum TP: 5% below entry (cap)
+FALLBACK_TP_PCT    = 0.008     # fallback fixed TP if no support found: 1%
 
 # ─── STOP LOSS ────────────────────────────────────────────────────────────────
 SL_PCT           = 0.055      # 5.5% fixed above entry
@@ -40,12 +40,12 @@ LINREG_4H_LOOKBACK = 5        # number of 4H candles to use for the slope check
 # Before a valid short, price must have spent enough time ABOVE the EMA
 # (rallied / consolidated above it). This confirms a proper retest, not a
 # mid-air entry on an already extended move down.
-FILTER_LOOKBACK  = 50         # how many candles to check
-MIN_ABOVE_PERC   = 50         # min % of those candles that must be ABOVE EMA
+FILTER_LOOKBACK  = 35         # how many candles to check
+MIN_ABOVE_PERC   = 58         # min % of those candles that must be ABOVE EMA
 
 # ─── EMA PROXIMITY FILTER ─────────────────────────────────────────────────────
 # Even after the crossover down, don't sell if price has already run too far below EMA.
-MAX_EMA_DISTANCE_PCT = 0.03   # 2% max distance below EMA
+MAX_EMA_DISTANCE_PCT = 0.02   # 2% max distance below EMA
 
 # ─── SCAN INTERVAL ────────────────────────────────────────────────────────────
 SCAN_INTERVAL    = 900        # 15 minutes in seconds
