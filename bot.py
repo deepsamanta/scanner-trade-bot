@@ -32,19 +32,13 @@ SL_PCT           = 0.055      # 5.5% fixed above entry
 LINREG_LOOKBACK  = 4          # candles for slope curve
 
 # ─── 4H TREND FILTER ──────────────────────────────────────────────────────────
-# Before placing a short, verify that the 4H timeframe also shows bearish momentum.
-# The linreg slope on 4H EMA must be NEGATIVE (downward-bending curve on 4H).
 LINREG_4H_LOOKBACK = 5        # number of 4H candles to use for the slope check
 
 # ─── CONSOLIDATION FILTER ─────────────────────────────────────────────────────
-# Before a valid short, price must have spent enough time ABOVE the EMA
-# (rallied / consolidated above it). This confirms a proper retest, not a
-# mid-air entry on an already extended move down.
 FILTER_LOOKBACK  = 35         # how many candles to check
 MIN_ABOVE_PERC   = 58         # min % of those candles that must be ABOVE EMA
 
 # ─── EMA PROXIMITY FILTER ─────────────────────────────────────────────────────
-# Even after the crossover down, don't sell if price has already run too far below EMA.
 MAX_EMA_DISTANCE_PCT = 0.02   # 2% max distance below EMA
 
 # ─── SCAN INTERVAL ────────────────────────────────────────────────────────────
@@ -207,16 +201,8 @@ def compute_ema(closes, period):
 
 def compute_linreg_slope(values):
     """
-    Exact Python port of the Pine Script f_true_slope() function:
-
-        for i = 0 to len - 1
-            x = len - i        # x counts DOWN: len, len-1, ..., 1
-            y = src[i]         # src[0] = most recent bar
-        slope = (n·ΣXY - ΣX·ΣY) / (n·ΣX2 - (ΣX)^2)
-
+    Exact Python port of the Pine Script f_true_slope() function.
     'values' must be ordered newest -> oldest (index 0 = most recent).
-    Call as: compute_linreg_slope(list(reversed(ema_values[-N:])))
-
     A NEGATIVE slope means the EMA curve is genuinely bending downward (bearish).
     """
     n      = len(values)
@@ -241,117 +227,24 @@ def compute_linreg_slope(values):
 
 
 # =====================================================
-# 4H TREND FILTER — bearish: slope negative + consolidation ABOVE EMA
+# SAFE API RESPONSE UNWRAPPER
 # =====================================================
 
-def get_4h_data(symbol):
+def unwrap_list_response(raw, list_keys, context=""):
     """
-    Fetches 4H candles, computes the 21 EMA on them, then returns:
-      - slope_ok        : bool  — linreg slope on last 4 EMA values is NEGATIVE (bearish)
-      - slope_4h        : float — raw slope value (for logging)
-      - is_consolidating: bool  — >= MIN_ABOVE_PERC% of last FILTER_LOOKBACK 4H
-                                  candles closed ABOVE the 4H EMA (bearish retest logic)
-      - perc_above_4h   : float — actual % above for logging
-
-    On error, returns fail-open defaults so the trade is not blocked.
+    CoinDCX sometimes returns a bare list, sometimes a dict wrapping the list.
+    This safely extracts the list either way and logs unexpected shapes.
     """
-    try:
-        pair_api = fut_pair(symbol)
-        url      = "https://public.coindcx.com/market_data/candlesticks"
-        now      = int(time.time())
-
-        fetch_candles = EMA_PERIOD + FILTER_LOOKBACK + LINREG_4H_LOOKBACK + 10
-        fetch_seconds = fetch_candles * 4 * 3600
-
-        params = {
-            "pair":       pair_api,
-            "from":       now - fetch_seconds,
-            "to":         now,
-            "resolution": "240",
-            "pcode":      "f",
-        }
-
-        response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-        candles  = sorted(response.json()["data"], key=lambda x: x["time"])
-
-        min_required = EMA_PERIOD + FILTER_LOOKBACK + LINREG_4H_LOOKBACK
-        if len(candles) < min_required:
-            print(f"[4H] {symbol} — not enough 4H candles ({len(candles)}, need {min_required}), skipping filters (allow trade)")
-            return True, None, True, 0.0
-
-        # ── 21 EMA on 4H closes ───────────────────────────────────────────────
-        closes_4h = [float(c["close"]) for c in candles]
-        ema_4h    = compute_ema(closes_4h, EMA_PERIOD)
-
-        # ── Linreg slope on last LINREG_4H_LOOKBACK 4H EMA values ────────────
-        # For shorts: slope must be NEGATIVE
-        ema_4h_window = list(reversed(ema_4h[-LINREG_4H_LOOKBACK:]))
-        slope_4h      = compute_linreg_slope(ema_4h_window)
-        slope_ok      = slope_4h < 0   # ← INVERTED: negative = bearish
-
-        # ── Consolidation: % of last FILTER_LOOKBACK 4H candles ABOVE 4H EMA ─
-        # For shorts: price must have spent time above EMA before breaking down
-        bars_above_4h = sum(
-            1 for i in range(1, FILTER_LOOKBACK + 1)
-            if float(candles[-(i + 1)]["close"]) > float(ema_4h[-(i + 1)])
-        ) if len(candles) > FILTER_LOOKBACK + 1 else 0
-        perc_above_4h    = (bars_above_4h / FILTER_LOOKBACK) * 100
-        is_consolidating = perc_above_4h >= MIN_ABOVE_PERC   # ← INVERTED: above EMA
-
-        return slope_ok, slope_4h, is_consolidating, perc_above_4h
-
-    except Exception as e:
-        print(f"[4H] {symbol} — fetch error: {e} — skipping filters (allow trade)")
-        return True, None, True, 0.0
-
-
-# =====================================================
-# DYNAMIC TP — NEAREST SUPPORT (SWING LOW BODY)
-# =====================================================
-
-def find_nearest_support(candles, entry_price, precision):
-    """
-    Scans the last SUPPORT_CANDLES candles for swing lows based on
-    candle BODY BOTTOMS — min(open, close) — ignoring wicks.
-
-    A swing body low = candle whose body bottom is lower than SWING_LOOKBACK
-    candles on both its left and right side.
-
-    Returns the nearest (highest) body-based swing low BELOW entry, capped
-    between MIN_TP_PCT and MAX_TP_PCT below entry.
-    Falls back to FALLBACK_TP_PCT (1%) below entry if none found.
-    """
-    recent_candles = candles[-SUPPORT_CANDLES:]
-    body_bottoms   = [min(float(c["open"]), float(c["close"])) for c in recent_candles]
-    n  = len(body_bottoms)
-    lb = SWING_LOOKBACK
-
-    swing_body_lows = []
-
-    for i in range(lb, n - lb):
-        current = body_bottoms[i]
-        left    = body_bottoms[i - lb : i]
-        right   = body_bottoms[i + 1 : i + lb + 1]
-
-        # Swing low: current body bottom is lower than all neighbours
-        if all(current < b for b in left) and all(current < b for b in right):
-            swing_body_lows.append(current)
-
-    min_tp_price = entry_price * (1 - MAX_TP_PCT)   # furthest allowed TP (lower)
-    max_tp_price = entry_price * (1 - MIN_TP_PCT)   # closest allowed TP (higher)
-
-    # Valid: body lows that sit between MIN_TP_PCT and MAX_TP_PCT below entry
-    valid = [b for b in swing_body_lows if min_tp_price <= b <= max_tp_price]
-
-    if valid:
-        nearest = max(valid)   # nearest = highest value = closest to entry from below
-        tp      = round(nearest, precision)
-        print(f"[BODY SUPPORT TP] Found swing body low at {tp} (from {len(valid)} candidates)")
-        return tp, "body_support"
-
-    fallback_tp = round(entry_price * (1 - FALLBACK_TP_PCT), precision)
-    print(f"[BODY SUPPORT TP] No valid swing body low found — using fallback {FALLBACK_TP_PCT*100:.1f}% TP = {fallback_tp}")
-    return fallback_tp, "fallback"
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, dict):
+        for key in list_keys:
+            if key in raw and isinstance(raw[key], list):
+                return raw[key]
+        print(f"[WARN]{' ' + context if context else ''}: unexpected dict keys: {list(raw.keys())} | raw: {str(raw)[:200]}")
+        return []
+    print(f"[WARN]{' ' + context if context else ''}: unexpected response type {type(raw)}")
+    return []
 
 
 # =====================================================
@@ -369,8 +262,15 @@ def get_open_positions():
         payload, headers = sign_request(body)
         url      = BASE_URL + "/exchange/v1/derivatives/futures/positions"
         response = requests.post(url, data=payload, headers=headers, timeout=REQUEST_TIMEOUT)
-        positions = response.json()
+        raw      = response.json()
+
+        positions = unwrap_list_response(
+            raw,
+            list_keys=["positions", "data", "result"],
+            context="get_open_positions"
+        )
         return [p for p in positions if float(p.get("active_pos", 0)) != 0]
+
     except Exception as e:
         print("get_open_positions error:", e)
         return []
@@ -420,13 +320,18 @@ def has_open_order(symbol):
         payload, headers = sign_request(body)
         url      = BASE_URL + "/exchange/v1/derivatives/futures/orders"
         response = requests.post(url, data=payload, headers=headers, timeout=REQUEST_TIMEOUT)
-        orders   = response.json()
+        raw      = response.json()
+
+        orders = unwrap_list_response(
+            raw,
+            list_keys=["orders", "data", "result"],
+            context=f"has_open_order({symbol})"
+        )
 
         pair = fut_pair(symbol)
-        if isinstance(orders, list):
-            for o in orders:
-                if o.get("pair") == pair:
-                    return True
+        for o in orders:
+            if o.get("pair") == pair:
+                return True
         return False
 
     except Exception as e:
@@ -439,10 +344,6 @@ def has_open_order(symbol):
 # =====================================================
 
 def get_recent_low(symbol):
-    """
-    Fetches 1-min candles over the last 15 minutes to check if price
-    touched TP via a wick downward since the last cycle.
-    """
     try:
         pair_api = fut_pair(symbol)
         url  = "https://public.coindcx.com/market_data/candlesticks"
@@ -457,7 +358,7 @@ def get_recent_low(symbol):
         response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
         candles  = response.json()["data"]
         lows     = [float(c["low"]) for c in candles]
-        return min(lows)   # ← INVERTED: check minimum low for short TP
+        return min(lows)
     except Exception:
         return None
 
@@ -497,17 +398,103 @@ def compute_qty(entry_price, symbol):
 
 
 # =====================================================
-# PLACE SHORT ORDER — with dynamic TP (INVERTED)
+# 4H TREND FILTER
+# =====================================================
+
+def get_4h_data(symbol):
+    try:
+        pair_api = fut_pair(symbol)
+        url      = "https://public.coindcx.com/market_data/candlesticks"
+        now      = int(time.time())
+
+        fetch_candles = EMA_PERIOD + FILTER_LOOKBACK + LINREG_4H_LOOKBACK + 10
+        fetch_seconds = fetch_candles * 4 * 3600
+
+        params = {
+            "pair":       pair_api,
+            "from":       now - fetch_seconds,
+            "to":         now,
+            "resolution": "240",
+            "pcode":      "f",
+        }
+
+        response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        candles  = sorted(response.json()["data"], key=lambda x: x["time"])
+
+        min_required = EMA_PERIOD + FILTER_LOOKBACK + LINREG_4H_LOOKBACK
+        if len(candles) < min_required:
+            print(f"[4H] {symbol} — not enough 4H candles ({len(candles)}, need {min_required}), skipping filters (allow trade)")
+            return True, None, True, 0.0
+
+        closes_4h = [float(c["close"]) for c in candles]
+        ema_4h    = compute_ema(closes_4h, EMA_PERIOD)
+
+        ema_4h_window = list(reversed(ema_4h[-LINREG_4H_LOOKBACK:]))
+        slope_4h      = compute_linreg_slope(ema_4h_window)
+        slope_ok      = slope_4h < 0
+
+        bars_above_4h = sum(
+            1 for i in range(1, FILTER_LOOKBACK + 1)
+            if float(candles[-(i + 1)]["close"]) > float(ema_4h[-(i + 1)])
+        ) if len(candles) > FILTER_LOOKBACK + 1 else 0
+        perc_above_4h    = (bars_above_4h / FILTER_LOOKBACK) * 100
+        is_consolidating = perc_above_4h >= MIN_ABOVE_PERC
+
+        return slope_ok, slope_4h, is_consolidating, perc_above_4h
+
+    except Exception as e:
+        print(f"[4H] {symbol} — fetch error: {e} — skipping filters (allow trade)")
+        return True, None, True, 0.0
+
+
+# =====================================================
+# DYNAMIC TP — NEAREST SUPPORT (SWING LOW BODY)
+# =====================================================
+
+def find_nearest_support(candles, entry_price, precision):
+    recent_candles = candles[-SUPPORT_CANDLES:]
+    body_bottoms   = [min(float(c["open"]), float(c["close"])) for c in recent_candles]
+    n  = len(body_bottoms)
+    lb = SWING_LOOKBACK
+
+    swing_body_lows = []
+
+    for i in range(lb, n - lb):
+        current = body_bottoms[i]
+        left    = body_bottoms[i - lb : i]
+        right   = body_bottoms[i + 1 : i + lb + 1]
+
+        if all(current < b for b in left) and all(current < b for b in right):
+            swing_body_lows.append(current)
+
+    min_tp_price = entry_price * (1 - MAX_TP_PCT)
+    max_tp_price = entry_price * (1 - MIN_TP_PCT)
+
+    valid = [b for b in swing_body_lows if min_tp_price <= b <= max_tp_price]
+
+    if valid:
+        nearest = max(valid)
+        tp      = round(nearest, precision)
+        print(f"[BODY SUPPORT TP] Found swing body low at {tp} (from {len(valid)} candidates)")
+        return tp, "body_support"
+
+    fallback_tp = round(entry_price * (1 - FALLBACK_TP_PCT), precision)
+    print(f"[BODY SUPPORT TP] No valid swing body low found — using fallback {FALLBACK_TP_PCT*100:.1f}% TP = {fallback_tp}")
+    return fallback_tp, "fallback"
+
+
+# =====================================================
+# PLACE SHORT ORDER
 # =====================================================
 
 def place_short_order(symbol, entry_price, precision, candles):
     entry   = round(entry_price, precision)
-    sl_base = round(entry * (1 + SL_PCT), precision)   # ← SL is ABOVE entry for shorts
+    sl_base = round(entry * (1 + SL_PCT), precision)
 
     tp, tp_type = find_nearest_support(candles, entry, precision)
 
-    reward = entry - tp    # ← For shorts: reward = entry - TP (TP is below)
-    risk   = sl_base - entry  # ← For shorts: risk = SL - entry (SL is above)
+    reward = entry - tp
+    risk   = sl_base - entry
 
     if risk <= 0 or (reward / risk) < MIN_RR:
         rr = round(reward / risk, 2) if risk > 0 else "inf"
@@ -524,7 +511,7 @@ def place_short_order(symbol, entry_price, precision, candles):
 
     qty = compute_qty(entry_price, symbol)
 
-    tp_pct = round(((entry - tp) / entry) * 100, 2)   # ← % drop to TP
+    tp_pct = round(((entry - tp) / entry) * 100, 2)
 
     print(
         f"[SHORT TRADE] {symbol} SELL | Entry {entry} | TP {tp} (-{tp_pct}% — {tp_type}) "
@@ -534,7 +521,7 @@ def place_short_order(symbol, entry_price, precision, candles):
     body = {
         "timestamp": int(time.time() * 1000),
         "order": {
-            "side":              "sell",              # ← INVERTED: sell for short
+            "side":              "sell",
             "pair":              fut_pair(symbol),
             "order_type":        "limit_order",
             "price":             entry,
@@ -592,7 +579,14 @@ def place_short_order(symbol, entry_price, precision, candles):
 # MAIN LOGIC
 # =====================================================
 
-def check_and_trade(symbol, row, df):
+def check_and_trade(symbol, row, df, placed_this_cycle):
+
+    # =========================================================================
+    # IN-CYCLE GUARD — prevents duplicate orders within the same scan cycle
+    # =========================================================================
+    if symbol in placed_this_cycle:
+        print(f"[SKIP] {symbol} — already traded this cycle (in-memory guard)")
+        return
 
     pair     = fut_pair(symbol)
     pair_api = pair
@@ -626,10 +620,9 @@ def check_and_trade(symbol, row, df):
 
     ema_now  = ema_values[-1]
 
-    # ── Linear regression slope — Pine Script formula (newest first) ──────────
     ema_window         = list(reversed(ema_values[-LINREG_LOOKBACK:]))
     ema_slope          = compute_linreg_slope(ema_window)
-    ema_slope_negative = ema_slope < 0   # ← INVERTED: need negative slope for short
+    ema_slope_negative = ema_slope < 0
     slope_dir          = "negative" if ema_slope_negative else "positive"
 
     # =========================================================================
@@ -642,6 +635,8 @@ def check_and_trade(symbol, row, df):
             tp_live = get_position_tp(symbol)
             if tp_live:
                 update_sheet_tp(row, tp_live)
+            # Mark in-cycle so subsequent sheet rows for same symbol are also skipped
+            placed_this_cycle.add(symbol)
             return
 
     # =========================================================================
@@ -649,6 +644,7 @@ def check_and_trade(symbol, row, df):
     # =========================================================================
     if has_open_order(symbol):
         print(f"[OPEN ORDER] {symbol} — unfilled order on book, skipping")
+        placed_this_cycle.add(symbol)
         return
 
     # ── TP monitoring ─────────────────────────────────────────────────────────
@@ -661,7 +657,6 @@ def check_and_trade(symbol, row, df):
     try:
         tp_stored = float(tp_raw)
 
-        # ← INVERTED: TP hit when price drops TO or BELOW stored TP
         if last_close <= tp_stored:
             update_sheet_tp(row, "TP COMPLETED")
             print(f"[TP HIT] {symbol} price {last_close} <= TP {tp_stored}")
@@ -677,15 +672,13 @@ def check_and_trade(symbol, row, df):
         pass
 
     # =========================================================================
-    # STRATEGY CONDITIONS (ALL INVERTED FOR SHORT)
+    # STRATEGY CONDITIONS
     # =========================================================================
 
-    # ← INVERTED: for shorts, measure how far price is BELOW EMA
     ema_distance_pct = (ema_now - last_close) / ema_now if ema_now > 0 else 0
-    price_near_ema   = ema_distance_pct <= MAX_EMA_DISTANCE_PCT   # not too far below
-    price_below_ema  = last_close < ema_now   # ← INVERTED: price must be BELOW EMA
+    price_near_ema   = ema_distance_pct <= MAX_EMA_DISTANCE_PCT
+    price_below_ema  = last_close < ema_now
 
-    # ── Fetch 4H data (slope + consolidation) — single API call ─────────────
     slope_4h_ok, slope_4h_val, is_consolidating, perc_above_4h = get_4h_data(symbol)
     slope_4h_str = (
         f"{round(slope_4h_val, 6)} ({'✅' if slope_4h_ok else '❌'})"
@@ -701,22 +694,19 @@ def check_and_trade(symbol, row, df):
         f"below_ema={price_below_ema} slope30m_neg={ema_slope_negative} consol4H={is_consolidating} near={price_near_ema}"
     )
 
-    # ← INVERTED: price must be BELOW EMA
     if not price_below_ema:
         return
 
-    # ← INVERTED: 30m slope must be negative
     if not ema_slope_negative:
         print(f"[SKIP] {symbol} — 30m slope is positive/flat (need negative for short)")
         return
 
-    # ← INVERTED: price must not have dropped too far below EMA already
     if not price_near_ema:
         print(f"[SKIP] {symbol} — price {round(ema_distance_pct*100,2)}% below EMA, exceeds {MAX_EMA_DISTANCE_PCT*100}% max — waiting for retest")
         return
 
     # =========================================================================
-    # GATE 3 — 4H SLOPE + 4H CONSOLIDATION FILTER (INVERTED)
+    # GATE 3 — 4H SLOPE + 4H CONSOLIDATION FILTER
     # =========================================================================
     if not slope_4h_ok:
         print(
@@ -749,13 +739,14 @@ def check_and_trade(symbol, row, df):
     for pos in live_positions:
         if pos.get("pair") == pair:
             print(f"[SKIP] {symbol} — open position detected just before placement, aborting")
+            placed_this_cycle.add(symbol)
             return
 
     if has_open_order(symbol):
         print(f"[SKIP] {symbol} — unfilled open order detected just before placement, aborting")
+        placed_this_cycle.add(symbol)
         return
 
-    # ← INVERTED: re-confirm price is still below EMA at placement time
     if last_close >= ema_now:
         print(
             f"[SKIP] {symbol} — last close {last_close} not below "
@@ -767,6 +758,8 @@ def check_and_trade(symbol, row, df):
         symbol, last_close, precision, candles
     )
     if tp_confirmed:
+        # Mark symbol as traded this cycle immediately after placement
+        placed_this_cycle.add(symbol)
         update_sheet_tp(row, tp_confirmed)
     if sl_placed:
         update_sheet_sl(row, sl_placed)
@@ -806,6 +799,9 @@ while True:
         cycle += 1
         consecutive_errors = 0
 
+        # Tracks symbols traded THIS cycle — reset every cycle
+        placed_this_cycle = set()
+
         print(f"----- SHORT SCAN — CYCLE {cycle} -----")
 
         for row in range(len(df)):
@@ -813,7 +809,7 @@ while True:
             if not pair:
                 continue
             symbol = normalize_symbol(pair)
-            check_and_trade(symbol, row, df)
+            check_and_trade(symbol, row, df, placed_this_cycle)
 
         time.sleep(SCAN_INTERVAL)
 
