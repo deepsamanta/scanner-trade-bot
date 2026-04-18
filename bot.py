@@ -19,7 +19,7 @@ EMA_PERIOD         = 200          # 200 EMA
 LOOKBACK_CANDLES   = 200          # Candles to check for exhaustion
 MIN_ABOVE_PCT      = 60.0         # ≥60% of last 200 candles must have closed ABOVE EMA
 SLOPE_BARS         = 20           # Bars used to measure EMA slope
-FLAT_BAND_PCT      = 0.3          # EMA slope must be within ±0.3% over SLOPE_BARS = "flat"
+FLAT_BAND_PCT      = 0.1          # EMA slope must be within ±0.1% over SLOPE_BARS = "flat"
 
 # ─── TP / SL ──────────────────────────────────────────────────────────────────
 TP_PCT             = 0.025        # 2.5% below entry (fixed)
