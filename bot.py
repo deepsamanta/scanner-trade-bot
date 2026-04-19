@@ -16,12 +16,12 @@ BASE_URL = "https://api.coindcx.com"
 
 # ─── STRATEGY CONSTANTS (200 EMA FALLING — TREND-FOLLOWING SHORT) ─────────────
 EMA_PERIOD         = 200          # 200 EMA
-LOOKBACK_CANDLES   = 150          # Candles to check for exhaustion
-MIN_ABOVE_PCT      = 70.0         # ≥70% of last 150 candles must have closed ABOVE EMA
-MIN_PUMP_PCT       = 10.0         # Price must have risen ≥10% from lowest low in last 150 candles
+LOOKBACK_CANDLES   = 250          # Candles to check for exhaustion
+MIN_ABOVE_PCT      = 55.0         # ≥55% of last 250 candles must have closed ABOVE EMA
+MIN_PUMP_PCT       = 5.0         # Price must have risen ≥10% from lowest low in last 250 candles
 SLOPE_BARS         = 20           # Bars used to measure EMA slope
 MAX_SLOPE_PCT      = -0.05        # EMA must be mildly falling: slope < -0.05% over SLOPE_BARS
-MAX_EMA_DIST_PCT   = 2.0          # Price must be within 2% BELOW EMA at entry (don't chase late)
+MAX_EMA_DIST_PCT   = 3.0          # Price must be within 2% BELOW EMA at entry (don't chase late)
 
 # ─── TP / SL ──────────────────────────────────────────────────────────────────
 TP_PCT             = 0.025        # 2.5% below entry (fixed)
