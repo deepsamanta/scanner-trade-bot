@@ -17,9 +17,9 @@ BASE_URL = "https://api.coindcx.com"
 # ─── STRATEGY CONSTANTS (200 EMA FALLING — TREND-FOLLOWING SHORT) ─────────────
 EMA_PERIOD         = 200          # 200 EMA
 LOOKBACK_CANDLES   = 250          # Candles to check for exhaustion
-MIN_ABOVE_PCT      = 60.0         # ≥60% of last 200 candles must have closed ABOVE EMA
+MIN_ABOVE_PCT      = 55.0         # ≥55% of last 250 candles must have closed ABOVE EMA
 SLOPE_BARS         = 20           # Bars used to measure EMA slope
-MAX_SLOPE_PCT      = -0.09        # EMA must be mildly falling: slope < -0.09% over SLOPE_BARS
+MAX_SLOPE_PCT      = -0.09        # EMA must be mildly falling: slope < -0.05% over SLOPE_BARS
 MAX_EMA_DIST_PCT   = 3.0          # Price must be within 3% BELOW EMA at entry (don't chase late)
 
 # ─── TP / SL ──────────────────────────────────────────────────────────────────
@@ -232,7 +232,12 @@ def get_open_positions():
         payload, headers = sign_request(body)
         url      = BASE_URL + "/exchange/v1/derivatives/futures/positions"
         response = requests.post(url, data=payload, headers=headers, timeout=REQUEST_TIMEOUT)
-        raw      = response.json()
+
+        if response.status_code != 200:
+            print(f"[ERROR] get_open_positions HTTP {response.status_code} | body: {response.text[:200]}")
+            return []
+
+        raw = response.json()
 
         positions = unwrap_list_response(
             raw,
@@ -268,15 +273,21 @@ def has_open_order(symbol):
     try:
         body = {
             "timestamp":                  int(time.time() * 1000),
-            "page":                       1,
-            "size":                       50,
-            "margin_currency_short_name": "USDT",
-            "status":                     ["initial", "open", "partially_filled"],
+            "page":                       "1",
+            "size":                       "50",
+            "margin_currency_short_name": ["USDT"],
+            "status":                     "open,partially_filled,untriggered",
+            "side":                       "sell",
         }
         payload, headers = sign_request(body)
         url      = BASE_URL + "/exchange/v1/derivatives/futures/orders"
         response = requests.post(url, data=payload, headers=headers, timeout=REQUEST_TIMEOUT)
-        raw      = response.json()
+
+        if response.status_code != 200:
+            print(f"[ERROR] has_open_order({symbol}) HTTP {response.status_code} | body: {response.text[:200]}")
+            return False
+
+        raw = response.json()
 
         orders = unwrap_list_response(
             raw,
