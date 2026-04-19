@@ -14,16 +14,17 @@ from config import COINDCX_KEY, COINDCX_SECRET, CAPITAL_USDT, LEVERAGE, SHEET_ID
 getcontext().prec = 28
 BASE_URL = "https://api.coindcx.com"
 
-# ─── STRATEGY CONSTANTS (200 EMA EXHAUSTION SHORT) ────────────────────────────
+# ─── STRATEGY CONSTANTS (200 EMA FALLING — TREND-FOLLOWING SHORT) ─────────────
 EMA_PERIOD         = 200          # 200 EMA
-LOOKBACK_CANDLES   = 200          # Candles to check for exhaustion
+LOOKBACK_CANDLES   = 300          # Candles to check for exhaustion
 MIN_ABOVE_PCT      = 60.0         # ≥60% of last 200 candles must have closed ABOVE EMA
 SLOPE_BARS         = 20           # Bars used to measure EMA slope
-FLAT_BAND_PCT      = 0.1          # EMA slope must be within ±0.1% over SLOPE_BARS = "flat"
+MAX_SLOPE_PCT      = -0.09        # EMA must be mildly falling: slope < -0.09% over SLOPE_BARS
+MAX_EMA_DIST_PCT   = 3.0          # Price must be within 3% BELOW EMA at entry (don't chase late)
 
 # ─── TP / SL ──────────────────────────────────────────────────────────────────
 TP_PCT             = 0.025        # 2.5% below entry (fixed)
-SL_ABOVE_EMA_PCT   = 0.01         # 1% ABOVE the EMA (not above entry — per strategy)
+SL_ABOVE_EMA_PCT   = 0.01         # 1% ABOVE the EMA
 
 # ─── SAFETY (reward/risk floor) ───────────────────────────────────────────────
 MIN_RR             = 1.5          # Skip trade if TP/SL reward:risk falls below this
@@ -552,7 +553,7 @@ def check_and_trade(symbol, row, df, placed_this_cycle):
         pass
 
     # =========================================================================
-    # STRATEGY CONDITIONS — 200 EMA EXHAUSTION SHORT
+    # STRATEGY CONDITIONS — 200 EMA FALLING SHORT
     # =========================================================================
 
     # ── Condition 1: % of last LOOKBACK_CANDLES candles closed ABOVE 200 EMA ──
@@ -562,31 +563,39 @@ def check_and_trade(symbol, row, df, placed_this_cycle):
     above_pct     = (above_count / LOOKBACK_CANDLES) * 100.0
     trend_qualifies = above_pct >= MIN_ABOVE_PCT
 
-    # ── Condition 2: EMA is close to flat (slope within ±FLAT_BAND_PCT) ───────
+    # ── Condition 2: EMA is mildly falling (slope < MAX_SLOPE_PCT) ────────────
     ema_slope_ref = ema_values[-(SLOPE_BARS + 1)]   # EMA value SLOPE_BARS bars ago
     if ema_slope_ref == 0:
         ema_slope_pct = 0.0
     else:
         ema_slope_pct = ((ema_now - ema_slope_ref) / ema_slope_ref) * 100.0
-    ema_flat = abs(ema_slope_pct) <= FLAT_BAND_PCT
+    ema_falling = ema_slope_pct < MAX_SLOPE_PCT
 
     # ── Condition 3: Price CROSSES DOWN through the 200 EMA this bar ──────────
     prev_close = closes[-2]
     cross_down = (prev_close >= ema_prev) and (last_close < ema_now)
 
+    # ── Condition 4: Price within MAX_EMA_DIST_PCT below EMA (fresh entry) ────
+    if ema_now > 0:
+        ema_dist_pct = ((ema_now - last_close) / ema_now) * 100.0
+    else:
+        ema_dist_pct = 0.0
+    price_near_ema = 0 <= ema_dist_pct <= MAX_EMA_DIST_PCT
+
     print(
         f"[SCAN] {symbol} | Price {last_close} | EMA200 {round(ema_now, precision)} | "
         f"Above% {round(above_pct, 1)}/{MIN_ABOVE_PCT} | "
-        f"Slope {round(ema_slope_pct, 3)}% (flat±{FLAT_BAND_PCT}%) | "
-        f"trend_ok={trend_qualifies} flat={ema_flat} crossdown={cross_down}"
+        f"Slope {round(ema_slope_pct, 3)}% (need <{MAX_SLOPE_PCT}%) | "
+        f"Dist {round(ema_dist_pct, 2)}% below EMA (max {MAX_EMA_DIST_PCT}%) | "
+        f"trend_ok={trend_qualifies} falling={ema_falling} crossdown={cross_down} near={price_near_ema}"
     )
 
     if not trend_qualifies:
         print(f"[SKIP] {symbol} — only {round(above_pct, 1)}% of last {LOOKBACK_CANDLES} candles above EMA (need ≥{MIN_ABOVE_PCT}%)")
         return
 
-    if not ema_flat:
-        print(f"[SKIP] {symbol} — EMA not flat (slope {round(ema_slope_pct, 3)}% exceeds ±{FLAT_BAND_PCT}%)")
+    if not ema_falling:
+        print(f"[SKIP] {symbol} — EMA not falling enough (slope {round(ema_slope_pct, 3)}%, need < {MAX_SLOPE_PCT}%)")
         return
 
     if not cross_down:
@@ -594,11 +603,16 @@ def check_and_trade(symbol, row, df, placed_this_cycle):
               f"curr {last_close} vs curr_ema {round(ema_now, precision)})")
         return
 
+    if not price_near_ema:
+        print(f"[SKIP] {symbol} — price too far below EMA ({round(ema_dist_pct, 2)}%, max {MAX_EMA_DIST_PCT}%) — chasing, skipping")
+        return
+
     print(
         f"[SIGNAL] {symbol} | all SHORT conditions met ✓ "
         f"| Above% {round(above_pct, 1)} ✓ "
-        f"| Slope {round(ema_slope_pct, 3)}% ✓ (flat) "
+        f"| Slope {round(ema_slope_pct, 3)}% ✓ (falling) "
         f"| crossunder ✓ "
+        f"| Dist {round(ema_dist_pct, 2)}% ✓ "
         f"| Price {last_close} | EMA {round(ema_now, precision)}"
     )
 
@@ -641,13 +655,14 @@ consecutive_errors = 0
 MAX_CONSECUTIVE_ERRORS = 10
 
 send_telegram(
-    f"✅ <b>SHORT Bot Started — 200 EMA Exhaustion</b>\n"
+    f"✅ <b>SHORT Bot Started — 200 EMA Falling</b>\n"
     f"━━━━━━━━━━━━━━━━━━\n"
-    f"📐 Strategy  : <code>200 EMA Exhaustion Short</code>\n"
+    f"📐 Strategy  : <code>200 EMA Falling Short</code>\n"
     f"⏱ Timeframe : <code>15 Min</code>\n"
     f"📉 Entry     : <code>Price crosses DOWN through EMA200</code>\n"
     f"🔎 Filter 1  : <code>≥{MIN_ABOVE_PCT:.0f}% of last {LOOKBACK_CANDLES} candles closed ABOVE EMA</code>\n"
-    f"🔎 Filter 2  : <code>EMA flat — |slope| ≤ {FLAT_BAND_PCT}% over {SLOPE_BARS} bars</code>\n"
+    f"🔎 Filter 2  : <code>EMA falling — slope &lt; {MAX_SLOPE_PCT}% over {SLOPE_BARS} bars</code>\n"
+    f"🔎 Filter 3  : <code>Price within {MAX_EMA_DIST_PCT}% below EMA (fresh entry)</code>\n"
     f"🎯 TP        : <code>{TP_PCT*100:.2f}% below entry (fixed)</code>\n"
     f"🛑 SL        : <code>{SL_ABOVE_EMA_PCT*100:.2f}% above EMA200</code>\n"
     f"📊 Min RR    : <code>{MIN_RR}</code>\n"
