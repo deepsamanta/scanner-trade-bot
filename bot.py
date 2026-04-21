@@ -17,8 +17,8 @@ BASE_URL = "https://api.coindcx.com"
 # ─── STRATEGY CONSTANTS (200 EMA FALLING — TREND-FOLLOWING SHORT) ─────────────
 EMA_PERIOD         = 200          # 200 EMA
 LOOKBACK_CANDLES   = 250          # Candles to check for exhaustion
-MIN_ABOVE_PCT      = 55.0         # ≥55% of last 250 candles must have closed ABOVE EMA
-MIN_PUMP_PCT       = 6.0         # Window high-to-low range ≥6% in last 250 candles
+MIN_ABOVE_PCT      = 70.0         # ≥70% of last 250 candles must have closed ABOVE EMA
+MIN_PUMP_PCT       = 10.0         # Window high-to-low range ≥10% in last 250 candles
 SLOPE_BARS         = 20           # Bars used to measure EMA slope
 MAX_SLOPE_PCT      = -0.05        # EMA must be mildly falling: slope < -0.05% over SLOPE_BARS
 MAX_EMA_DIST_PCT   = 2.0          # Price must be within 2% BELOW EMA at entry (don't chase late)
@@ -820,22 +820,45 @@ def check_and_trade(symbol, row, df, placed_this_cycle):
     res_tfs   = ",".join(sorted(resistance["tfs"]))
     res_count = resistance["count"]
 
-    # ── Rejection trigger: prev close ABOVE resistance, curr close BELOW it ───
-    rejection = (prev_close > res_price) and (last_close < res_price)
+    # ── Rejection trigger: requires 3 CLOSED bars ─────────────────────────────
+    # Layout (current in-progress bar = closes[-1], ignored for closed-bar logic):
+    #   closes[-4]  → bar above resistance (pre-rejection)
+    #   closes[-3]  → rejection bar: first closed BELOW resistance
+    #   closes[-2]  → confirmation bar: still closed BELOW resistance
+    #
+    # Both closed bars must close below. This kills wick fakeouts.
+    if len(closes) < 4:
+        print(f"[SCAN-RES] {symbol} — not enough closed candles for rejection check, skipping")
+        return
+
+    rejection_bar      = closes[-3]
+    confirmation_bar   = closes[-2]
+    pre_rejection_bar  = closes[-4]
+
+    above_before      = pre_rejection_bar  > res_price
+    rejected          = rejection_bar      < res_price
+    confirmed         = confirmation_bar   < res_price
+    rejection_trigger = above_before and rejected and confirmed
 
     print(
         f"[SCAN-RES] {symbol} | Price {last_close} | "
         f"NearestRes {round(res_price, precision)} (TFs: {res_tfs}, count={res_count}) | "
         f"PostCrossGain {round(post_cross_gain, 2)}% (need ≥{POST_CROSS_PUMP_PCT}%) | "
-        f"prev_close {prev_close} | rejection={rejection} post_cross_ok={post_cross_ok}"
+        f"pre_rej {pre_rejection_bar} (above? {above_before}) | "
+        f"rej_bar {rejection_bar} (below? {rejected}) | "
+        f"conf_bar {confirmation_bar} (below? {confirmed}) | "
+        f"trigger={rejection_trigger} post_cross_ok={post_cross_ok}"
     )
 
     if not post_cross_ok:
         print(f"[SKIP-RES] {symbol} — post-EMA-cross gain only {round(post_cross_gain, 2)}% (need ≥{POST_CROSS_PUMP_PCT}%)")
         return
 
-    if not rejection:
-        print(f"[SKIP-RES] {symbol} — no rejection (prev_close {prev_close} must be > {res_price} AND last_close {last_close} must be < {res_price})")
+    if not rejection_trigger:
+        print(
+            f"[SKIP-RES] {symbol} — rejection pattern not complete "
+            f"(need: pre-rej {pre_rejection_bar} > {res_price}, rej {rejection_bar} < {res_price}, conf {confirmation_bar} < {res_price})"
+        )
         return
 
     # ── All conditions met ────────────────────────────────────────────────────
@@ -860,7 +883,7 @@ def check_and_trade(symbol, row, df, placed_this_cycle):
         return
 
     if last_close >= res_price:
-        print(f"[SKIP-RES] {symbol} — last close {last_close} not below resistance {res_price} at placement, aborting")
+        print(f"[SKIP-RES] {symbol} — current price {last_close} popped back above resistance {res_price} during processing, aborting")
         return
 
     res_sl = res_price * (1 + SL_ABOVE_RES_PCT)
@@ -898,7 +921,7 @@ send_telegram(
     f"🛑 SL        : <code>{SL_ABOVE_EMA_PCT*100:.2f}% above EMA200</code>\n"
     f"\n"
     f"<b>STRATEGY 2 — Resistance Rejection</b>\n"
-    f"📉 Entry     : <code>Prev close ABOVE res, curr close BELOW res</code>\n"
+    f"📉 Entry     : <code>3 closed bars: above → closed below → closed below (confirmation)</code>\n"
     f"🔎 TFs       : <code>{', '.join(RES_TIMEFRAMES)} min (pivot L={RES_PIVOT_LEFT}, R={RES_PIVOT_RIGHT})</code>\n"
     f"🔎 Merge     : <code>levels within {RES_MERGE_PCT}% collapse into one zone</code>\n"
     f"🔎 Filter    : <code>Post-EMA-cross high ≥{POST_CROSS_PUMP_PCT:.0f}% from cross close</code>\n"
