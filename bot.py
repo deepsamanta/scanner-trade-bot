@@ -18,14 +18,23 @@ BASE_URL = "https://api.coindcx.com"
 EMA_PERIOD         = 200          # 200 EMA
 LOOKBACK_CANDLES   = 250          # Candles to check for exhaustion
 MIN_ABOVE_PCT      = 55.0         # ≥55% of last 250 candles must have closed ABOVE EMA
-MIN_PUMP_PCT       = 5.0         # Price must have risen ≥10% from lowest low in last 250 candles
+MIN_PUMP_PCT       = 6.0         # Window high-to-low range ≥6% in last 250 candles
 SLOPE_BARS         = 20           # Bars used to measure EMA slope
 MAX_SLOPE_PCT      = -0.05        # EMA must be mildly falling: slope < -0.05% over SLOPE_BARS
-MAX_EMA_DIST_PCT   = 3.0          # Price must be within 2% BELOW EMA at entry (don't chase late)
+MAX_EMA_DIST_PCT   = 2.0          # Price must be within 2% BELOW EMA at entry (don't chase late)
+
+# ─── RESISTANCE STRATEGY CONSTANTS ────────────────────────────────────────────
+RES_TIMEFRAMES       = ["15", "30", "60", "240"]   # 15m, 30m, 1h, 4h
+RES_FETCH_BARS       = 600                          # Candles per TF for pivot detection
+RES_PIVOT_LEFT       = 3                            # Bars to left of pivot high
+RES_PIVOT_RIGHT      = 3                            # Bars to right of pivot high
+RES_MERGE_PCT        = 0.3                          # Merge levels within 0.3% across TFs
+SL_ABOVE_RES_PCT     = 0.01                         # 1% ABOVE resistance for SL
+POST_CROSS_PUMP_PCT  = 5.0                          # From last upward EMA cross → high must be ≥5% (resistance strategy only)
 
 # ─── TP / SL ──────────────────────────────────────────────────────────────────
-TP_PCT             = 0.025        # 2.5% below entry (fixed)
-SL_ABOVE_EMA_PCT   = 0.01         # 1% ABOVE the EMA
+TP_PCT             = 0.025        # 2.5% below entry (fixed, BOTH strategies)
+SL_ABOVE_EMA_PCT   = 0.01         # 1% ABOVE the EMA (EMA strategy)
 
 # ─── SAFETY (reward/risk floor) ───────────────────────────────────────────────
 MIN_RR             = 1.5          # Skip trade if TP/SL reward:risk falls below this
@@ -202,6 +211,120 @@ def compute_ema(closes, period):
 
 
 # =====================================================
+# RESISTANCE HELPERS (pivot highs, multi-TF merge)
+# =====================================================
+
+def fetch_candles(symbol, resolution, bars):
+    """Fetch `bars` number of candles for the given resolution (minutes as string)."""
+    pair_api = fut_pair(symbol)
+    url      = "https://public.coindcx.com/market_data/candlesticks"
+    now      = int(time.time())
+
+    # Convert resolution to seconds per bar
+    res_seconds = int(resolution) * 60
+    from_ts     = now - (bars * res_seconds)
+
+    params = {
+        "pair":       pair_api,
+        "from":       from_ts,
+        "to":         now,
+        "resolution": resolution,
+        "pcode":      "f",
+    }
+    try:
+        response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        if response.status_code != 200:
+            print(f"[ERROR] fetch_candles({symbol}, {resolution}) HTTP {response.status_code}")
+            return []
+        data = response.json().get("data", [])
+        return sorted(data, key=lambda x: x["time"])
+    except Exception as e:
+        print(f"fetch_candles error ({symbol}, {resolution}): {e}")
+        return []
+
+
+def find_pivot_highs(candles, left, right):
+    """
+    Return list of (index, price) tuples for each swing high.
+    A swing high at index i has a high greater than `left` bars before and `right` bars after.
+    """
+    highs = [float(c["high"]) for c in candles]
+    pivots = []
+    for i in range(left, len(highs) - right):
+        val = highs[i]
+        left_window  = highs[i - left : i]
+        right_window = highs[i + 1 : i + right + 1]
+        if all(val > h for h in left_window) and all(val > h for h in right_window):
+            pivots.append((i, val))
+    return pivots
+
+
+def collect_resistances_above(symbol, current_price):
+    """
+    Fetch candles on each RES_TIMEFRAMES, find pivot highs above current price,
+    merge levels within RES_MERGE_PCT across TFs. Returns sorted list (ascending by price).
+    """
+    raw_levels = []  # list of (price, tf) tuples
+
+    for tf in RES_TIMEFRAMES:
+        candles = fetch_candles(symbol, tf, RES_FETCH_BARS)
+        if len(candles) < RES_PIVOT_LEFT + RES_PIVOT_RIGHT + 5:
+            continue
+        pivots = find_pivot_highs(candles, RES_PIVOT_LEFT, RES_PIVOT_RIGHT)
+        for _, price in pivots:
+            if price > current_price:
+                raw_levels.append((price, tf))
+
+    if not raw_levels:
+        return []
+
+    # Sort ascending, then merge levels that are within RES_MERGE_PCT
+    raw_levels.sort(key=lambda x: x[0])
+    merged = []
+    for price, tf in raw_levels:
+        if merged and abs(price - merged[-1]["price"]) / merged[-1]["price"] * 100 <= RES_MERGE_PCT:
+            # Merge into existing zone
+            merged[-1]["tfs"].add(tf)
+            merged[-1]["count"] += 1
+            # Keep the lower price as the zone anchor (more conservative for shorts)
+            merged[-1]["price"] = min(merged[-1]["price"], price)
+        else:
+            merged.append({"price": price, "tfs": {tf}, "count": 1})
+
+    return merged
+
+
+def find_nearest_resistance_above(symbol, current_price):
+    """Return dict {price, tfs, count} of nearest resistance above current_price, or None."""
+    zones = collect_resistances_above(symbol, current_price)
+    if not zones:
+        return None
+    return zones[0]  # already sorted ascending, lowest price above = nearest
+
+
+def find_last_upward_ema_cross(closes, ema_values):
+    """
+    Scan from most recent bar backwards; return (index, close_at_cross) of the most recent
+    bar where price crossed ABOVE the EMA (prev_close <= prev_ema AND curr_close > curr_ema).
+    Returns (None, None) if no upward cross found in the window.
+    """
+    # We need at least 2 bars and they must align (ema_values align with closes at the tail)
+    n = min(len(closes), len(ema_values))
+    if n < 2:
+        return None, None
+    # Walk from second-to-last back to beginning
+    offset = len(closes) - n   # closes index where ema_values[0] starts
+    for i in range(n - 1, 0, -1):
+        prev_close = closes[offset + i - 1]
+        curr_close = closes[offset + i]
+        prev_ema   = ema_values[i - 1]
+        curr_ema   = ema_values[i]
+        if prev_close <= prev_ema and curr_close > curr_ema:
+            return offset + i, curr_close
+    return None, None
+
+
+# =====================================================
 # SAFE API RESPONSE UNWRAPPER
 # =====================================================
 
@@ -369,19 +492,28 @@ def compute_qty(entry_price, symbol):
 # PLACE SHORT ORDER
 # =====================================================
 
-def place_short_order(symbol, entry_price, ema_now, precision):
+def place_short_order(symbol, entry_price, sl_price, precision, strategy_label, context_info=""):
+    """
+    Place a short order with a pre-computed SL.
+      symbol         - normalized symbol like 'XLMUSDT'
+      entry_price    - raw entry price
+      sl_price       - raw SL price (already computed by caller per strategy)
+      precision      - decimal precision of instrument
+      strategy_label - short string for logs/telegram, e.g. 'EMA' or 'RESISTANCE'
+      context_info   - extra one-line detail for telegram (e.g. 'EMA 0.1697' or 'Res 0.1810')
+    """
     entry = round(entry_price, precision)
-    tp    = round(entry   * (1 - TP_PCT),           precision)
-    sl    = round(ema_now * (1 + SL_ABOVE_EMA_PCT), precision)
+    tp    = round(entry    * (1 - TP_PCT), precision)
+    sl    = round(sl_price, precision)
 
     # Sanity: SL must be above entry (for a short)
     if sl <= entry:
-        print(f"[SKIP] {symbol} computed SL {sl} not above entry {entry} — aborting")
+        print(f"[SKIP] {symbol} [{strategy_label}] SL {sl} not above entry {entry} — aborting")
         send_telegram(
-            f"⚠️ <b>SHORT SKIPPED — {symbol}</b>\n"
+            f"⚠️ <b>SHORT SKIPPED — {symbol} [{strategy_label}]</b>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"❌ Reason : <code>SL {sl} not above entry {entry}</code>\n"
-            f"📍 EMA    : <code>{round(ema_now, precision)}</code>"
+            f"📍 Info   : <code>{context_info}</code>"
         )
         return None, None
 
@@ -390,14 +522,15 @@ def place_short_order(symbol, entry_price, ema_now, precision):
 
     if risk <= 0 or (reward / risk) < MIN_RR:
         rr = round(reward / risk, 2) if risk > 0 else "inf"
-        print(f"[SKIP] {symbol} RR {rr} < {MIN_RR}")
+        print(f"[SKIP] {symbol} [{strategy_label}] RR {rr} < {MIN_RR}")
         send_telegram(
-            f"⚠️ <b>SHORT SIGNAL SKIPPED — {symbol}</b>\n"
+            f"⚠️ <b>SHORT SIGNAL SKIPPED — {symbol} [{strategy_label}]</b>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"❌ Reason : <code>RR {rr} below minimum {MIN_RR}</code>\n"
             f"📍 Entry  : <code>{entry}</code>\n"
-            f"🎯 TP     : <code>{tp}</code>  (-{TP_PCT*100:.2f}%)\n"
-            f"🛑 SL     : <code>{sl}</code>  ({SL_ABOVE_EMA_PCT*100:.2f}% above EMA {round(ema_now, precision)})"
+            f"🎯 TP     : <code>{tp}</code>\n"
+            f"🛑 SL     : <code>{sl}</code>\n"
+            f"📋 Info   : <code>{context_info}</code>"
         )
         return None, None
 
@@ -406,9 +539,8 @@ def place_short_order(symbol, entry_price, ema_now, precision):
     sl_pct_from_entry = round(((sl - entry) / entry) * 100, 2)
 
     print(
-        f"[SHORT TRADE] {symbol} SELL | Entry {entry} | TP {tp} (-{TP_PCT*100:.2f}%) "
-        f"| SL {sl} (+{sl_pct_from_entry}% from entry | {SL_ABOVE_EMA_PCT*100:.2f}% above EMA) "
-        f"| RR {round(reward / risk, 2)} | Qty {qty}"
+        f"[SHORT TRADE] {symbol} [{strategy_label}] SELL | Entry {entry} | TP {tp} (-{TP_PCT*100:.2f}%) "
+        f"| SL {sl} (+{sl_pct_from_entry}% from entry) | RR {round(reward / risk, 2)} | Qty {qty}"
     )
 
     body = {
@@ -437,9 +569,9 @@ def place_short_order(symbol, entry_price, ema_now, precision):
     print(f"[API] {symbol} response: {result}")
 
     if "order" not in result and not isinstance(result, list):
-        print(f"[ERROR] {symbol} short order not placed: {result}")
+        print(f"[ERROR] {symbol} [{strategy_label}] short order not placed: {result}")
         send_telegram(
-            f"❌ <b>SHORT ORDER REJECTED — {symbol}</b>\n"
+            f"❌ <b>SHORT ORDER REJECTED — {symbol} [{strategy_label}]</b>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"📍 Entry    : <code>{entry}</code>\n"
             f"🎯 TP       : <code>{tp}</code>\n"
@@ -455,12 +587,12 @@ def place_short_order(symbol, entry_price, ema_now, precision):
         tp_confirmed = tp
 
     send_telegram(
-        f"🔴 <b>NEW SHORT (SELL) — {symbol}</b>\n"
+        f"🔴 <b>NEW SHORT — {symbol} [{strategy_label}]</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📍 Entry  : <code>{entry}</code>\n"
-        f"📈 EMA200 : <code>{round(ema_now, precision)}</code>\n"
+        f"📋 Info   : <code>{context_info}</code>\n"
         f"🎯 TP     : <code>{tp}</code>  (-{TP_PCT*100:.2f}% from entry)\n"
-        f"🛑 SL     : <code>{sl}</code>  ({SL_ABOVE_EMA_PCT*100:.2f}% above EMA | +{sl_pct_from_entry}% from entry)\n"
+        f"🛑 SL     : <code>{sl}</code>  (+{sl_pct_from_entry}% from entry)\n"
         f"📊 RR     : <code>{round(reward / risk, 2)}</code>\n"
         f"📦 Qty    : <code>{qty}</code>\n"
         f"💰 Margin : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
@@ -470,7 +602,7 @@ def place_short_order(symbol, entry_price, ema_now, precision):
 
 
 # =====================================================
-# MAIN LOGIC — 200 EMA EXHAUSTION SHORT (15m)
+# MAIN LOGIC — TWO STRATEGIES: EMA FALLING + RESISTANCE REJECTION (15m)
 # =====================================================
 
 def check_and_trade(symbol, row, df, placed_this_cycle):
@@ -565,7 +697,7 @@ def check_and_trade(symbol, row, df, placed_this_cycle):
         pass
 
     # =========================================================================
-    # STRATEGY CONDITIONS — 200 EMA FALLING SHORT
+    # STRATEGY 1 — 200 EMA FALLING SHORT
     # =========================================================================
 
     # ── Condition 1: % of last LOOKBACK_CANDLES candles closed ABOVE 200 EMA ──
@@ -606,48 +738,115 @@ def check_and_trade(symbol, row, df, placed_this_cycle):
         ema_dist_pct = 0.0
     price_near_ema = 0 <= ema_dist_pct <= MAX_EMA_DIST_PCT
 
+    ema_signal = (
+        trend_qualifies and has_pumped and ema_falling and cross_down and price_near_ema
+    )
+
     print(
-        f"[SCAN] {symbol} | Price {last_close} | EMA200 {round(ema_now, precision)} | "
+        f"[SCAN-EMA] {symbol} | Price {last_close} | EMA200 {round(ema_now, precision)} | "
         f"Above% {round(above_pct, 1)}/{MIN_ABOVE_PCT} | "
         f"Range {round(pump_pct, 2)}% (H {window_high} / L {window_low}, need ≥{MIN_PUMP_PCT}%) | "
         f"Slope {round(ema_slope_pct, 3)}% (need <{MAX_SLOPE_PCT}%) | "
         f"Dist {round(ema_dist_pct, 2)}% below EMA (max {MAX_EMA_DIST_PCT}%) | "
-        f"trend_ok={trend_qualifies} pumped={has_pumped} falling={ema_falling} crossdown={cross_down} near={price_near_ema}"
+        f"trend_ok={trend_qualifies} pumped={has_pumped} falling={ema_falling} crossdown={cross_down} near={price_near_ema} → EMA_FIRED={ema_signal}"
     )
 
-    if not trend_qualifies:
-        print(f"[SKIP] {symbol} — only {round(above_pct, 1)}% of last {LOOKBACK_CANDLES} candles above EMA (need ≥{MIN_ABOVE_PCT}%)")
+    # ─────────────── EMA STRATEGY PATH ────────────────────────────────────────
+    if ema_signal:
+        print(
+            f"[SIGNAL-EMA] {symbol} | all conditions met ✓ "
+            f"| Price {last_close} | EMA {round(ema_now, precision)}"
+        )
+
+        # FINAL GUARD — re-check right before placing
+        live_positions = get_open_positions()
+        for pos in live_positions:
+            if pos.get("pair") == pair:
+                print(f"[SKIP] {symbol} — open position detected just before placement, aborting")
+                placed_this_cycle.add(symbol)
+                return
+
+        if has_open_order(symbol):
+            print(f"[SKIP] {symbol} — unfilled open order detected just before placement, aborting")
+            placed_this_cycle.add(symbol)
+            return
+
+        if last_close >= ema_now:
+            print(f"[SKIP] {symbol} — last close {last_close} not below EMA200 at placement, aborting")
+            return
+
+        ema_sl = ema_now * (1 + SL_ABOVE_EMA_PCT)
+        tp_confirmed, sl_placed = place_short_order(
+            symbol, last_close, ema_sl, precision,
+            strategy_label="EMA",
+            context_info=f"EMA200 {round(ema_now, precision)} | SL {SL_ABOVE_EMA_PCT*100:.2f}% above EMA",
+        )
+        if tp_confirmed:
+            placed_this_cycle.add(symbol)
+            update_sheet_tp(row, tp_confirmed)
+        if sl_placed:
+            update_sheet_sl(row, sl_placed)
+        return  # EMA fired — do not also try resistance strategy this cycle
+
+    # =========================================================================
+    # STRATEGY 2 — RESISTANCE REJECTION SHORT
+    # (Only runs if EMA strategy didn't fire)
+    # =========================================================================
+
+    # ── NEW FILTER: from latest UPWARD EMA cross → highest high since must be ≥ POST_CROSS_PUMP_PCT
+    cross_idx, cross_close = find_last_upward_ema_cross(closes, ema_values)
+    if cross_idx is None:
+        print(f"[SCAN-RES] {symbol} — no recent upward EMA cross found, skipping resistance strategy")
         return
 
-    if not has_pumped:
-        print(f"[SKIP] {symbol} — window range only {round(pump_pct, 2)}% (H {window_high} / L {window_low}, need ≥{MIN_PUMP_PCT}%)")
+    # Highest high from cross bar to now
+    highs_since_cross = [float(c["high"]) for c in candles[cross_idx:]]
+    if not highs_since_cross or cross_close <= 0:
+        print(f"[SCAN-RES] {symbol} — empty post-cross window, skipping")
         return
 
-    if not ema_falling:
-        print(f"[SKIP] {symbol} — EMA not falling enough (slope {round(ema_slope_pct, 3)}%, need < {MAX_SLOPE_PCT}%)")
+    post_cross_high = max(highs_since_cross)
+    post_cross_gain = ((post_cross_high - cross_close) / cross_close) * 100.0
+    post_cross_ok   = post_cross_gain >= POST_CROSS_PUMP_PCT
+
+    # ── Fetch nearest resistance above current price (multi-TF) ───────────────
+    resistance = find_nearest_resistance_above(symbol, last_close)
+
+    if resistance is None:
+        print(f"[SCAN-RES] {symbol} — no resistance levels found above current price, skipping")
         return
 
-    if not cross_down:
-        print(f"[SKIP] {symbol} — no crossunder this bar (prev {prev_close} vs prev_ema {round(ema_prev, precision)}, "
-              f"curr {last_close} vs curr_ema {round(ema_now, precision)})")
-        return
+    res_price = resistance["price"]
+    res_tfs   = ",".join(sorted(resistance["tfs"]))
+    res_count = resistance["count"]
 
-    if not price_near_ema:
-        print(f"[SKIP] {symbol} — price too far below EMA ({round(ema_dist_pct, 2)}%, max {MAX_EMA_DIST_PCT}%) — chasing, skipping")
-        return
+    # ── Rejection trigger: prev close ABOVE resistance, curr close BELOW it ───
+    rejection = (prev_close > res_price) and (last_close < res_price)
 
     print(
-        f"[SIGNAL] {symbol} | all SHORT conditions met ✓ "
-        f"| Above% {round(above_pct, 1)} ✓ "
-        f"| Slope {round(ema_slope_pct, 3)}% ✓ (falling) "
-        f"| crossunder ✓ "
-        f"| Dist {round(ema_dist_pct, 2)}% ✓ "
-        f"| Price {last_close} | EMA {round(ema_now, precision)}"
+        f"[SCAN-RES] {symbol} | Price {last_close} | "
+        f"NearestRes {round(res_price, precision)} (TFs: {res_tfs}, count={res_count}) | "
+        f"PostCrossGain {round(post_cross_gain, 2)}% (need ≥{POST_CROSS_PUMP_PCT}%) | "
+        f"prev_close {prev_close} | rejection={rejection} post_cross_ok={post_cross_ok}"
     )
 
-    # =========================================================================
-    # FINAL GUARD — re-check everything right before placing
-    # =========================================================================
+    if not post_cross_ok:
+        print(f"[SKIP-RES] {symbol} — post-EMA-cross gain only {round(post_cross_gain, 2)}% (need ≥{POST_CROSS_PUMP_PCT}%)")
+        return
+
+    if not rejection:
+        print(f"[SKIP-RES] {symbol} — no rejection (prev_close {prev_close} must be > {res_price} AND last_close {last_close} must be < {res_price})")
+        return
+
+    # ── All conditions met ────────────────────────────────────────────────────
+    print(
+        f"[SIGNAL-RES] {symbol} | resistance rejection ✓ "
+        f"| Res {round(res_price, precision)} (TFs: {res_tfs}) "
+        f"| PostCrossGain {round(post_cross_gain, 2)}% ✓ "
+        f"| Price {last_close}"
+    )
+
+    # FINAL GUARD — re-check right before placing
     live_positions = get_open_positions()
     for pos in live_positions:
         if pos.get("pair") == pair:
@@ -660,14 +859,16 @@ def check_and_trade(symbol, row, df, placed_this_cycle):
         placed_this_cycle.add(symbol)
         return
 
-    if last_close >= ema_now:
-        print(
-            f"[SKIP] {symbol} — last close {last_close} not below "
-            f"EMA200 {round(ema_now, precision)} at placement, aborting"
-        )
+    if last_close >= res_price:
+        print(f"[SKIP-RES] {symbol} — last close {last_close} not below resistance {res_price} at placement, aborting")
         return
 
-    tp_confirmed, sl_placed = place_short_order(symbol, last_close, ema_now, precision)
+    res_sl = res_price * (1 + SL_ABOVE_RES_PCT)
+    tp_confirmed, sl_placed = place_short_order(
+        symbol, last_close, res_sl, precision,
+        strategy_label="RESISTANCE",
+        context_info=f"Res {round(res_price, precision)} [{res_tfs}] | SL {SL_ABOVE_RES_PCT*100:.2f}% above resistance",
+    )
     if tp_confirmed:
         placed_this_cycle.add(symbol)
         update_sheet_tp(row, tp_confirmed)
@@ -684,17 +885,27 @@ consecutive_errors = 0
 MAX_CONSECUTIVE_ERRORS = 10
 
 send_telegram(
-    f"✅ <b>SHORT Bot Started — 200 EMA Falling</b>\n"
+    f"✅ <b>SHORT Bot Started — Dual Strategy</b>\n"
     f"━━━━━━━━━━━━━━━━━━\n"
-    f"📐 Strategy  : <code>200 EMA Falling Short</code>\n"
-    f"⏱ Timeframe : <code>15 Min</code>\n"
+    f"⏱ Timeframe : <code>15 Min (primary trigger)</code>\n"
+    f"\n"
+    f"<b>STRATEGY 1 — 200 EMA Falling</b>\n"
     f"📉 Entry     : <code>Price crosses DOWN through EMA200</code>\n"
     f"🔎 Filter 1  : <code>≥{MIN_ABOVE_PCT:.0f}% of last {LOOKBACK_CANDLES} candles closed ABOVE EMA</code>\n"
-    f"🔎 Filter 2  : <code>Window range (high vs low) ≥{MIN_PUMP_PCT:.0f}% in last {LOOKBACK_CANDLES} candles</code>\n"
+    f"🔎 Filter 2  : <code>Window range ≥{MIN_PUMP_PCT:.0f}% in last {LOOKBACK_CANDLES} candles</code>\n"
     f"🔎 Filter 3  : <code>EMA falling — slope &lt; {MAX_SLOPE_PCT}% over {SLOPE_BARS} bars</code>\n"
-    f"🔎 Filter 4  : <code>Price within {MAX_EMA_DIST_PCT}% below EMA (fresh entry)</code>\n"
-    f"🎯 TP        : <code>{TP_PCT*100:.2f}% below entry (fixed)</code>\n"
+    f"🔎 Filter 4  : <code>Price within {MAX_EMA_DIST_PCT}% below EMA</code>\n"
     f"🛑 SL        : <code>{SL_ABOVE_EMA_PCT*100:.2f}% above EMA200</code>\n"
+    f"\n"
+    f"<b>STRATEGY 2 — Resistance Rejection</b>\n"
+    f"📉 Entry     : <code>Prev close ABOVE res, curr close BELOW res</code>\n"
+    f"🔎 TFs       : <code>{', '.join(RES_TIMEFRAMES)} min (pivot L={RES_PIVOT_LEFT}, R={RES_PIVOT_RIGHT})</code>\n"
+    f"🔎 Merge     : <code>levels within {RES_MERGE_PCT}% collapse into one zone</code>\n"
+    f"🔎 Filter    : <code>Post-EMA-cross high ≥{POST_CROSS_PUMP_PCT:.0f}% from cross close</code>\n"
+    f"🛑 SL        : <code>{SL_ABOVE_RES_PCT*100:.2f}% above resistance</code>\n"
+    f"\n"
+    f"<b>SHARED</b>\n"
+    f"🎯 TP        : <code>{TP_PCT*100:.2f}% below entry</code>\n"
     f"📊 Min RR    : <code>{MIN_RR}</code>\n"
     f"💰 Capital   : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>\n"
     f"🕐 Scanning every 15 minutes..."
