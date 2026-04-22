@@ -16,9 +16,9 @@ BASE_URL = "https://api.coindcx.com"
 
 # ─── STRATEGY CONSTANTS (200 EMA FALLING — TREND-FOLLOWING SHORT) ─────────────
 EMA_PERIOD         = 200          # 200 EMA
-LOOKBACK_CANDLES   = 250          # Candles to check for exhaustion
-MIN_ABOVE_PCT      = 70.0         # ≥70% of last 250 candles must have closed ABOVE EMA
-MIN_PUMP_PCT       = 10.0         # Window high-to-low range ≥10% in last 250 candles
+LOOKBACK_CANDLES   = 150          # Candles to check for exhaustion
+MIN_ABOVE_PCT      = 70.0         # ≥70% of last 150 candles must have closed ABOVE EMA
+MIN_PUMP_PCT       = 10.0         # Window high-to-low range ≥10% in last 150 candles
 SLOPE_BARS         = 20           # Bars used to measure EMA slope
 MAX_SLOPE_PCT      = -0.05        # EMA must be mildly falling: slope < -0.05% over SLOPE_BARS
 MAX_EMA_DIST_PCT   = 2.0          # Price must be within 2% BELOW EMA at entry (don't chase late)
@@ -793,6 +793,12 @@ def check_and_trade(symbol, row, df, placed_this_cycle):
     # (Only runs if EMA strategy didn't fire)
     # =========================================================================
 
+    # ── SHARED FILTER: ≥MIN_ABOVE_PCT of last LOOKBACK_CANDLES closed ABOVE EMA
+    # (reuses trend_qualifies already computed in Strategy 1 — no recalc needed)
+    if not trend_qualifies:
+        print(f"[SKIP-RES] {symbol} — only {round(above_pct, 1)}% of last {LOOKBACK_CANDLES} candles above EMA (need ≥{MIN_ABOVE_PCT}%)")
+        return
+
     # ── NEW FILTER: from latest UPWARD EMA cross → highest high since must be ≥ POST_CROSS_PUMP_PCT
     cross_idx, cross_close = find_last_upward_ema_cross(closes, ema_values)
     if cross_idx is None:
@@ -922,9 +928,10 @@ send_telegram(
     f"\n"
     f"<b>STRATEGY 2 — Resistance Rejection</b>\n"
     f"📉 Entry     : <code>3 closed bars: above → closed below → closed below (confirmation)</code>\n"
+    f"🔎 Filter 1  : <code>≥{MIN_ABOVE_PCT:.0f}% of last {LOOKBACK_CANDLES} candles closed ABOVE EMA</code>\n"
+    f"🔎 Filter 2  : <code>Post-EMA-cross high ≥{POST_CROSS_PUMP_PCT:.0f}% from cross close</code>\n"
     f"🔎 TFs       : <code>{', '.join(RES_TIMEFRAMES)} min (pivot L={RES_PIVOT_LEFT}, R={RES_PIVOT_RIGHT})</code>\n"
     f"🔎 Merge     : <code>levels within {RES_MERGE_PCT}% collapse into one zone</code>\n"
-    f"🔎 Filter    : <code>Post-EMA-cross high ≥{POST_CROSS_PUMP_PCT:.0f}% from cross close</code>\n"
     f"🛑 SL        : <code>{SL_ABOVE_RES_PCT*100:.2f}% above resistance</code>\n"
     f"\n"
     f"<b>SHARED</b>\n"
