@@ -667,18 +667,6 @@ def get_recent_low(symbol):
 # POSITIONS & ORDERS
 # =====================================================
 
-def unwrap_list_response(raw, list_keys, context=""):
-    if isinstance(raw, list):
-        return raw
-    if isinstance(raw, dict):
-        for key in list_keys:
-            if key in raw and isinstance(raw[key], list):
-                return raw[key]
-        print(f"[WARN]{' ' + context if context else ''}: unexpected dict keys: {list(raw.keys())}")
-        return []
-    return []
-
-
 def get_open_positions():
     try:
         body = {
@@ -690,12 +678,16 @@ def get_open_positions():
         payload, headers = sign_request(body)
         url      = BASE_URL + "/exchange/v1/derivatives/futures/positions"
         response = requests.post(url, data=payload, headers=headers, timeout=REQUEST_TIMEOUT)
-        raw = response.json()
-        positions = unwrap_list_response(raw, list_keys=["positions", "data", "result"], context="get_open_positions")
+        positions = response.json()
+        if not isinstance(positions, list):
+            return []
         return [p for p in positions if float(p.get("active_pos", 0)) != 0]
     except Exception as e:
         print("get_open_positions error:", e)
         return []
+
+
+
 
 
 def get_position_by_pair(symbol):
@@ -708,7 +700,7 @@ def get_position_by_pair(symbol):
 
 
 def has_open_order(symbol):
-    """Entry-type unfilled sell order still on book."""
+    """Entry-type unfilled order still on book."""
     try:
         body = {
             "timestamp":                  int(time.time() * 1000),
@@ -720,13 +712,13 @@ def has_open_order(symbol):
         payload, headers = sign_request(body)
         url      = BASE_URL + "/exchange/v1/derivatives/futures/orders"
         response = requests.post(url, data=payload, headers=headers, timeout=REQUEST_TIMEOUT)
-        raw = response.json()
-        orders = unwrap_list_response(raw, list_keys=["orders", "data", "result"], context=f"has_open_order({symbol})")
+        orders   = response.json()
 
         pair = fut_pair(symbol)
-        for o in orders:
-            if o.get("pair") == pair:
-                return True
+        if isinstance(orders, list):
+            for o in orders:
+                if o.get("pair") == pair:
+                    return True
         return False
 
     except Exception as e:
