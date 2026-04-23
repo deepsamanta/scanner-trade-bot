@@ -29,7 +29,7 @@ BASE_URL = "https://api.coindcx.com"
 EMA_PERIOD           = 200
 LOOKBACK             = 200      # candles to count ABOVE EMA (mirror: was "below" for long)
 ABOVE_PCT_MIN        = 70.0     # min % of last LOOKBACK candles ABOVE EMA
-TP_PCT               = 7.5      # Take Profit % (fixed BELOW entry for shorts)
+TP_PCT               = 5        # Take Profit % (fixed BELOW entry for shorts)
 SL_ABOVE_EMA_PCT     = 5.0      # Paths A/B SL: EMA × (1 + this/100)
 
 # ─── PATH A: REJECTION RETEST (mirror of long reversal retest) ───────────────
