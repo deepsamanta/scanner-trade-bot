@@ -81,7 +81,7 @@ PIVOT_ZONE_PCT            = 1.0           # ±% band for clustering pivots
 MIN_TF_CONFLUENCE         = 2             # min TFs defending a zone (2 of 3)
 PATH_C_MAX_WAIT_BARS      = 30            # max 30m bars to wait for rejection
 PATH_C_TOUCH_TOLERANCE_PCT = 0.5          # price must come within this % of zone to count as "tested"
-PATH_C_SL_ABOVE_ZONE_PCT  = 2.0           # Path C SL: zone_high × (1 + this/100)
+PATH_C_SL_ABOVE_ZONE_PCT  = 1.5           # Path C SL: zone_high × (1 + this/100)
 
 # ─── SAFETY (reward/risk floor) ──────────────────────────────────────────────
 MIN_RR               = 1.5          # Skip trade if TP/SL reward:risk falls below this
