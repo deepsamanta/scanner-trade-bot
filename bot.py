@@ -700,31 +700,46 @@ def get_position_by_pair(symbol):
 
 
 def has_open_order(symbol):
-    """Entry-type unfilled order still on book."""
+    """
+    Returns True if there is an unfilled SELL entry order on the book for this
+    pair (status: open or partially_filled).
+
+    Per CoinDCX List Orders API:
+      - timestamp: int (epoch ms)
+      - status:    string, comma-separated  (NOT array)
+      - side:      string, mandatory
+      - page:      string  (NOT int)
+      - size:      string  (NOT int)
+      - margin_currency_short_name: array  (NOT string)
+    """
     try:
         body = {
             "timestamp":                  int(time.time() * 1000),
-            "page":                       1,
-            "size":                       50,
-            "margin_currency_short_name": "USDT",
-            "status":                     ["initial", "open", "partially_filled"],
+            "status":                     "open,partially_filled",
+            "side":                       "sell",
+            "page":                       "1",
+            "size":                       "50",
+            "margin_currency_short_name": ["USDT"],
         }
         payload, headers = sign_request(body)
         url      = BASE_URL + "/exchange/v1/derivatives/futures/orders"
         response = requests.post(url, data=payload, headers=headers, timeout=REQUEST_TIMEOUT)
         orders   = response.json()
 
+        if not isinstance(orders, list):
+            print(f"[has_open_order] {symbol} unexpected response (request rejected?): {orders}")
+            return False
+
         pair = fut_pair(symbol)
-        if isinstance(orders, list):
-            for o in orders:
-                if o.get("pair") == pair:
-                    return True
+        for o in orders:
+            if o.get("pair") == pair:
+                return True
         return False
 
     except Exception as e:
         print(f"has_open_order error ({symbol}):", e)
         return False
-
+    
 
 # =====================================================
 # QUANTITY
