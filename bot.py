@@ -83,6 +83,11 @@ PATH_C_MAX_WAIT_BARS      = 30            # max 30m bars to wait for rejection
 PATH_C_TOUCH_TOLERANCE_PCT = 0.5          # price must come within this % of zone to count as "tested"
 PATH_C_SL_ABOVE_ZONE_PCT  = 1.5           # Path C SL: zone_high × (1 + this/100)
 
+# ─── PATH C: ADDITIONAL EMA-POSITION ARM TRIGGERS ───────────────────────
+# Path C also arms when price sits in one of these two zones vs. 200 EMA (4h):
+PATH_C_BELOW_EMA_PROXIMITY_PCT = 4.0    # arm if  -4%  <= (close-EMA)/EMA < 0
+PATH_C_ABOVE_EMA_EXTENDED_PCT  = 10.0   # arm if  (close-EMA)/EMA >= +10%
+
 # ─── SAFETY (reward/risk floor) ──────────────────────────────────────────────
 MIN_RR               = 1.5          # Skip trade if TP/SL reward:risk falls below this
 
@@ -1350,9 +1355,10 @@ def check_and_trade(symbol, row, df, all_state):
     #         • price has risen more than 2% above zone_high (zone broken)
     #
     #   Stage 2 (ARM): Otherwise, if conditions hold, arm a new zone:
-    #     - Pump from lowest-EMA crossup ≥ PATH_C_MIN_PUMP_PCT
-    #     - Find nearest confluence resistance zone ABOVE current price
-    #     - Store it and wait for the rejection in a future scan
+    #     - Pump from lowest-EMA crossup ≥ PATH_C_MIN_PUMP_PCT, OR
+    #     - Price below EMA within PATH_C_BELOW_EMA_PROXIMITY_PCT, OR
+    #     - Price above EMA by ≥ PATH_C_ABOVE_EMA_EXTENDED_PCT
+    #     Then find nearest confluence resistance zone ABOVE current price.
     # =========================================================================
     if USE_PATH_C:
         # ── STAGE 1: already armed — watch for rejection ───────────────────
@@ -1462,7 +1468,21 @@ def check_and_trade(symbol, row, df, all_state):
         # ── STAGE 2: not armed — evaluate whether to arm a new zone ────────
         path_c_pump_ok = pump_pct_path_c >= PATH_C_MIN_PUMP_PCT
 
-        if path_c_pump_ok:
+        # NEW: EMA-position-based arm triggers
+        ema_diff_pct        = ((last_close - ema_now) / ema_now * 100.0) if ema_now else 0
+        below_ema_proximity = (-PATH_C_BELOW_EMA_PROXIMITY_PCT) <= ema_diff_pct < 0
+        above_ema_extended  = ema_diff_pct >= PATH_C_ABOVE_EMA_EXTENDED_PCT
+
+        path_c_arm_ok = path_c_pump_ok or below_ema_proximity or above_ema_extended
+
+        if path_c_arm_ok:
+            # Build trigger label for logs / telegram
+            triggers = []
+            if path_c_pump_ok:      triggers.append(f"pump≥{PATH_C_MIN_PUMP_PCT}%")
+            if below_ema_proximity: triggers.append(f"below EMA within {PATH_C_BELOW_EMA_PROXIMITY_PCT}%")
+            if above_ema_extended:  triggers.append(f"above EMA ≥{PATH_C_ABOVE_EMA_EXTENDED_PCT}%")
+            trigger_str = " + ".join(triggers)
+
             zone = find_nearest_resistance_zone_above(symbol, last_close)
 
             if zone is not None:
@@ -1476,7 +1496,8 @@ def check_and_trade(symbol, row, df, all_state):
 
                     print(f"[PATH-C] {symbol} — ARMING zone {round(zone_low, precision)}–{round(zone_high, precision)} "
                           f"(center {round(zone_cent, precision)}, {tf_count} TFs: {tfs_str}, "
-                          f"{round(dist_pct, 2)}% above close, pump_c {round(pump_pct_path_c, 2)}% from {path_c_pump_anchor})")
+                          f"{round(dist_pct, 2)}% above close, pump_c {round(pump_pct_path_c, 2)}% from {path_c_pump_anchor}, "
+                          f"trigger: {trigger_str})")
 
                     st["path_c_armed"]        = True
                     st["path_c_zone_low"]     = zone_low
@@ -1495,6 +1516,8 @@ def check_and_trade(symbol, row, df, all_state):
                         f"📊 Zone cent  : <code>{round(zone_cent, precision)}</code>\n"
                         f"⏫ Dist above : <code>{round(dist_pct, 2)}%</code>\n"
                         f"📈 Pump (C)   : <code>{round(pump_pct_path_c, 2)}% ({path_c_pump_anchor})</code>\n"
+                        f"⚙️ Trigger    : <code>{trigger_str}</code>\n"
+                        f"📏 EMA diff   : <code>{round(ema_diff_pct, 2)}%</code>\n"
                         f"🪢 Confluence : <code>{tf_count} TFs ({tfs_str})</code>\n"
                         f"⌛ Waiting up to {PATH_C_MAX_WAIT_BARS} × 30m bars for rejection"
                     )
@@ -1522,7 +1545,7 @@ send_telegram(
     f"🔁 Scan       : <code>Every 30 minutes</code>\n"
     f"🅰️ Path A    : <code>{ABOVE_PCT_MIN}% above EMA + crossdown + slope≤{MAX_EMA_SLOPE_PCT}% + vol×{VOL_MULTIPLIER} + pump≥{MIN_PUMP_PCT}% → wait retest (≤{MAX_RETEST_BARS} × 4h bars)</code>\n"
     f"🅱️ Path B    : <code>crossdown + close&lt;close[{MOMENTUM_LOOKBACK}] + vol×{BREAKDOWN_VOL_MULT} + pump≥{MIN_PUMP_PCT}% when trend NOT qualifying</code>\n"
-    f"🆎 Path C    : <code>pump≥{PATH_C_MIN_PUMP_PCT}% (from recent crossup, current leg only) + nearest multi-TF pivot zone above price ({MIN_TF_CONFLUENCE}/{len(PATH_C_ENABLED_TIMEFRAMES)} TFs) → 30m break-below (≤{PATH_C_MAX_WAIT_BARS} bars)</code>\n"
+    f"🆎 Path C    : <code>(pump≥{PATH_C_MIN_PUMP_PCT}% OR below EMA within {PATH_C_BELOW_EMA_PROXIMITY_PCT}% OR above EMA ≥{PATH_C_ABOVE_EMA_EXTENDED_PCT}%) + nearest multi-TF pivot zone above price ({MIN_TF_CONFLUENCE}/{len(PATH_C_ENABLED_TIMEFRAMES)} TFs) → 30m break-below (≤{PATH_C_MAX_WAIT_BARS} bars)</code>\n"
     f"🔀 Cross      : <code>strict OR within last {CROSS_LOOKBACK} bars (if price still below EMA and ≤{MAX_EMA_DISTANCE_PCT}% away)</code>\n"
     f"📈 Pump A/B   : <code>min-EMA across all crossups (or lowest-low if never crossed) → highest-high across last {PUMP_LOOKBACK} × 4h bars must be ≥{MIN_PUMP_PCT}%</code>\n"
     f"🧱 Pivots     : <code>N={PIVOT_STRENGTH} each side, ±{PIVOT_ZONE_PCT}% zone band, TFs: 4h + 12h synth + 1D</code>\n"
