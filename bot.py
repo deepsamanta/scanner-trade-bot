@@ -29,8 +29,8 @@ BASE_URL = "https://api.coindcx.com"
 EMA_PERIOD           = 200
 LOOKBACK             = 200      # candles to count ABOVE EMA (mirror: was "below" for long)
 ABOVE_PCT_MIN        = 70.0     # min % of last LOOKBACK candles ABOVE EMA
-TP_PCT               = 5        # Take Profit % (fixed BELOW entry for shorts)
-SL_ABOVE_EMA_PCT     = 5.0      # Paths A/B SL: EMA × (1 + this/100)
+TP_PCT               = 2        # Take Profit % (fixed BELOW entry for shorts)
+SL_ABOVE_EMA_PCT     = 1.0      # Paths A/B SL: EMA × (1 + this/100)
 
 # ─── PATH A: REJECTION RETEST (mirror of long reversal retest) ───────────────
 MAX_RETEST_BARS      = 20       # max 4h bars to wait for retest after arming
@@ -81,11 +81,11 @@ PIVOT_ZONE_PCT            = 1.0           # ±% band for clustering pivots
 MIN_TF_CONFLUENCE         = 2             # min TFs defending a zone (2 of 3)
 PATH_C_MAX_WAIT_BARS      = 30            # max 30m bars to wait for rejection
 PATH_C_TOUCH_TOLERANCE_PCT = 0.5          # price must come within this % of zone to count as "tested"
-PATH_C_SL_ABOVE_ZONE_PCT  = 1.5           # Path C SL: zone_high × (1 + this/100)
+PATH_C_SL_ABOVE_ZONE_PCT  = 1.0           # Path C SL: zone_high × (1 + this/100)
 
 # ─── PATH C: ADDITIONAL EMA-POSITION ARM TRIGGERS ───────────────────────
 # Path C also arms when price sits in one of these two zones vs. 200 EMA (4h):
-PATH_C_BELOW_EMA_PROXIMITY_PCT = 4.0    # arm if  -4%  <= (close-EMA)/EMA < 0
+PATH_C_BELOW_EMA_PROXIMITY_PCT = 5.0    # arm if  -4%  <= (close-EMA)/EMA < 0
 PATH_C_ABOVE_EMA_EXTENDED_PCT  = 10.0   # arm if  (close-EMA)/EMA >= +10%
 
 # ─── PATH C: FAKEOUT FILTER FOR BELOW-EMA ARMS ───────────────────────────
