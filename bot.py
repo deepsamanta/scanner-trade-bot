@@ -30,7 +30,7 @@ EMA_PERIOD           = 200
 LOOKBACK             = 200      # candles to count ABOVE EMA (mirror: was "below" for long)
 ABOVE_PCT_MIN        = 70.0     # min % of last LOOKBACK candles ABOVE EMA
 TP_PCT               = 2        # Take Profit % (fixed BELOW entry for shorts)
-SL_ABOVE_EMA_PCT     = 1.0      # Paths A/B SL: EMA × (1 + this/100)
+SL_ABOVE_EMA_PCT     = 0.8      # Paths A/B SL: EMA × (1 + this/100)
 
 # ─── PATH A: REJECTION RETEST (mirror of long reversal retest) ───────────────
 MAX_RETEST_BARS      = 20       # max 4h bars to wait for retest after arming
@@ -77,15 +77,15 @@ PATH_C_ENABLED_TIMEFRAMES = ["240", "12H_synth", "1D"]   # 4h + synthetic 12h + 
 PATH_C_CANDLES            = 600           # target bars per TF
 PATH_C_MIN_PUMP_PCT       = 5.0           # min pump from MOST RECENT crossup (4h-based)
 PIVOT_STRENGTH            = 3             # N bars on each side for pivot detection
-PIVOT_ZONE_PCT            = 1.0           # ±% band for clustering pivots
+PIVOT_ZONE_PCT            = 0.8           # ±% band for clustering pivots
 MIN_TF_CONFLUENCE         = 2             # min TFs defending a zone (2 of 3)
 PATH_C_MAX_WAIT_BARS      = 30            # max 30m bars to wait for rejection
 PATH_C_TOUCH_TOLERANCE_PCT = 0.5          # price must come within this % of zone to count as "tested"
-PATH_C_SL_ABOVE_ZONE_PCT  = 1.0           # Path C SL: zone_high × (1 + this/100)
+PATH_C_SL_ABOVE_ZONE_PCT  = 0.8           # Path C SL: zone_high × (1 + this/100)
 
 # ─── PATH C: ADDITIONAL EMA-POSITION ARM TRIGGERS ───────────────────────
 # Path C also arms when price sits in one of these two zones vs. 200 EMA (4h):
-PATH_C_BELOW_EMA_PROXIMITY_PCT = 5.0    # arm if  -4%  <= (close-EMA)/EMA < 0
+PATH_C_BELOW_EMA_PROXIMITY_PCT = 4.0    # arm if  -4%  <= (close-EMA)/EMA < 0
 PATH_C_ABOVE_EMA_EXTENDED_PCT  = 10.0   # arm if  (close-EMA)/EMA >= +10%
 
 # ─── PATH C: FAKEOUT FILTER FOR BELOW-EMA ARMS ───────────────────────────
@@ -93,10 +93,10 @@ PATH_C_ABOVE_EMA_EXTENDED_PCT  = 10.0   # arm if  (close-EMA)/EMA >= +10%
 # sit cleanly below the EMA — at least this % below — so price has to clear
 # both the zone AND the EMA to invalidate. Without this gap, zones that
 # straddle the EMA produce frequent fakeouts.
-PATH_C_BELOW_EMA_RESISTANCE_GAP_PCT = 1.0   # require zone_high <= EMA × (1 - this/100)
+PATH_C_BELOW_EMA_RESISTANCE_GAP_PCT = 0.8   # require zone_high <= EMA × (1 - this/100)
 
 # ─── SAFETY (reward/risk floor) ──────────────────────────────────────────────
-MIN_RR               = 1.5          # Skip trade if TP/SL reward:risk falls below this
+MIN_RR               = 1         # Skip trade if TP/SL reward:risk falls below this
 
 # ─── TIMEFRAME / SCAN ────────────────────────────────────────────────────────
 RESOLUTION_PRIMARY   = "240"    # CoinDCX 4-hour candles
