@@ -74,7 +74,7 @@ MIN_PUMP_PCT         = 10.0      # min pump % from lower hinge to highest high
 # construct 12h candles synthetically from 4h data (every 3 × 4h = 12h).
 USE_PATH_C                = True
 PATH_C_ENABLED_TIMEFRAMES = ["240", "12H_synth", "1D"]   # 4h + synthetic 12h + 1D
-PATH_C_CANDLES            = 600           # target bars per TF
+PATH_C_CANDLES            = 800           # target bars per TF
 PATH_C_MIN_PUMP_PCT       = 5.0           # min pump from MOST RECENT crossup (4h-based)
 PIVOT_STRENGTH            = 3             # N bars on each side for pivot detection
 PIVOT_ZONE_PCT            = 0.8           # ±% band for clustering pivots
@@ -96,7 +96,7 @@ PATH_C_ABOVE_EMA_EXTENDED_PCT  = 10.0   # arm if  (close-EMA)/EMA >= +10%
 PATH_C_BELOW_EMA_RESISTANCE_GAP_PCT = 0.8   # require zone_high <= EMA × (1 - this/100)
 
 # ─── SAFETY (reward/risk floor) ──────────────────────────────────────────────
-MIN_RR               = 1         # Skip trade if TP/SL reward:risk falls below this
+MIN_RR               = 0.5         # Skip trade if TP/SL reward:risk falls below this
 
 # ─── TIMEFRAME / SCAN ────────────────────────────────────────────────────────
 RESOLUTION_PRIMARY   = "240"    # CoinDCX 4-hour candles
