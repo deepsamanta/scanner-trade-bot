@@ -31,11 +31,13 @@ BASE_URL = "https://api.coindcx.com"
 
 # ─── CORE ─────────────────────────────────────────────────────────────────────
 EMA_PERIOD           = 200
+EMA_FAST_PERIOD      = 21        # short-term EMA (4h) used as bounce-risk filter
+EMA21_BUFFER_PCT     = 1.3       # if 21 EMA is within this % BELOW zone_low → skip (likely bounce)
 TP_PCT               = 5         # Take Profit % below entry (fixed)
 
 # ─── PATH C ARM TRIGGERS ─────────────────────────────────────────────────────
 PATH_C_BELOW_EMA_PROXIMITY_PCT = 5.0     # -5% ≤ (close-EMA)/EMA < 0  →  resistance must lie BETWEEN price & EMA
-PATH_C_ABOVE_EMA_EXTENDED_PCT  = 10.0    # (close-EMA)/EMA ≥ +10%     →  any resistance above price
+PATH_C_ABOVE_EMA_EXTENDED_PCT  = 11.0    # (close-EMA)/EMA ≥ +10%     →  any resistance above price
 
 # ─── PATH C ZONE / CONFLUENCE ────────────────────────────────────────────────
 PATH_C_ENABLED_TIMEFRAMES   = ["240", "12H_synth", "1D", "3D_synth"]   # 4h + 12h synth + 1D + 3D synth
@@ -725,6 +727,9 @@ def check_and_trade(symbol, row, df, all_state):
         return
     ema_now = ema_values[-1]
 
+    ema21_values = compute_ema(closes, EMA_FAST_PERIOD)
+    ema21_now    = ema21_values[-1] if ema21_values[-1] is not None else None
+
     st = all_state.get(symbol)
     if st is None:
         st = init_symbol_state()
@@ -806,8 +811,9 @@ def check_and_trade(symbol, row, df, all_state):
     # PATH C — RESISTANCE REJECTION
     # =========================================================================
     ema_diff_pct = ((last_close - ema_now) / ema_now * 100.0) if ema_now else 0
+    ema21_str    = round(ema21_now, precision) if ema21_now is not None else "N/A"
     print(
-        f"[SCAN] {symbol} | close={last_close} ema200={round(ema_now, precision)} | "
+        f"[SCAN] {symbol} | close={last_close} ema200={round(ema_now, precision)} ema21={ema21_str} | "
         f"emaDiff={round(ema_diff_pct, 2)}% | armed={st.get('path_c_armed', False)}"
     )
 
@@ -919,6 +925,25 @@ def check_and_trade(symbol, row, df, all_state):
         save_state(all_state)
         return
 
+    # ── 21 EMA bounce-risk gate ──────────────────────────────────────────
+    # If 21 EMA (4h) sits within EMA21_BUFFER_PCT% BELOW zone_low and price
+    # is still above 21 EMA, the EMA may act as support and price could
+    # bounce before reaching the zone. Skip arming until price closes below
+    # 21 EMA on the 4h.
+    if ema21_now is not None and ema21_now > 0:
+        ema21_to_zone_pct = (zone["low"] - ema21_now) / ema21_now * 100.0
+        ema21_below_zone  = ema21_now < zone["low"]
+        price_above_ema21 = last_close > ema21_now
+
+        if ema21_below_zone and ema21_to_zone_pct <= EMA21_BUFFER_PCT and price_above_ema21:
+            print(
+                f"[PATH-C] {symbol} — SKIP arming: 21 EMA {round(ema21_now, precision)} is "
+                f"{round(ema21_to_zone_pct, 2)}% below zone_low {round(zone['low'], precision)} "
+                f"(≤{EMA21_BUFFER_PCT}%) and price {last_close} > 21 EMA — waiting for 4h close below 21 EMA"
+            )
+            save_state(all_state)
+            return
+
     tf_count   = len(zone["tfs"])
     tfs_str    = ",".join(sorted(zone["tfs"]))
     zone_low   = zone["low"]
@@ -945,6 +970,7 @@ def check_and_trade(symbol, row, df, all_state):
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📍 Close      : <code>{last_close}</code>\n"
         f"📊 EMA200     : <code>{round(ema_now, precision)}</code>\n"
+        f"📊 EMA21      : <code>{round(ema21_now, precision) if ema21_now else 'N/A'}</code>\n"
         f"📏 EMA diff   : <code>{round(ema_diff_pct, 2)}%</code>\n"
         f"🧱 Zone low   : <code>{round(zone_low, precision)}</code>\n"
         f"🧱 Zone high  : <code>{round(zone_high, precision)}</code>\n"
@@ -976,6 +1002,7 @@ send_telegram(
     f"🅱️ Trigger B : <code>close within -{PATH_C_BELOW_EMA_PROXIMITY_PCT}% of EMA → resistance between price &amp; EMA</code>\n"
     f"🧱 Pivots     : <code>N={PIVOT_STRENGTH} each side, ±{PIVOT_ZONE_PCT}% zone band</code>\n"
     f"🪢 TFs        : <code>4h + 12h synth + 1D + 3D synth (≥{MIN_TF_CONFLUENCE}/4 confluence)</code>\n"
+    f"🚧 Bounce gate: <code>skip if 21 EMA (4h) is within {EMA21_BUFFER_PCT}% below zone_low &amp; price still above 21 EMA</code>\n"
     f"🎯 TP         : <code>{TP_PCT}% fixed below entry</code>\n"
     f"🛑 SL         : <code>zone_high × (1 + {PATH_C_SL_ABOVE_ZONE_PCT}%)</code>\n"
     f"⏳ Max wait   : <code>{PATH_C_MAX_WAIT_BARS} × 4h bars</code>\n"
