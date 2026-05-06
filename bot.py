@@ -557,7 +557,7 @@ def compute_qty(entry_price, symbol):
 # PLACE SHORT ORDER
 # =====================================================
 
-def place_short_order(symbol, entry_price, tp_price, sl_price, precision, entry_path, signal_info=None):
+def place_short_order(symbol, entry_price, tp_price, sl_price, precision, entry_path, trigger_details=None):
     entry = round(entry_price, precision)
     tp    = round(tp_price,    precision)
     sl    = round(sl_price,    precision)
@@ -631,25 +631,10 @@ def place_short_order(symbol, entry_price, tp_price, sl_price, precision, entry_
         f"📦 Qty    : <code>{qty}</code>\n"
         f"💰 Margin : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
     )
-    if signal_info:
-        msg += (
-            f"\n━━━━━━━━━━━━━━━━━━\n"
-            f"🧠 <b>Trigger conditions</b>\n"
-            f"📉 redB         : <code>True</code>\n"
-            f"🧱 lowerLvl     : <code>{signal_info.get('lower_lvl')}</code>\n"
-            f"🔺 lastPH       : <code>{signal_info.get('last_ph')}</code>\n"
-            f"🪵 Body break   : <code>{signal_info.get('f_body')}</code>  "
-            f"(max(o,c)={signal_info.get('max_oc')} &lt; lowerLvl)\n"
-            f"💪 Strong bar   : <code>{signal_info.get('f_strong')}</code>  "
-            f"(body {signal_info.get('body_pct')}% ≥ {TL_MIN_BODY_PCT}%)\n"
-            f"📊 Volume       : <code>{signal_info.get('f_vol')}</code>  "
-            f"(vol {signal_info.get('vol')} vs SMA20×{TL_VOL_MULT}={signal_info.get('vol_thresh')})\n"
-            f"📐 ATR distance : <code>{signal_info.get('f_atr')}</code>  "
-            f"(close &lt; lowerLvl − ATR14×{TL_ATR_MULT} = {signal_info.get('atr_thresh')})\n"
-            f"⏳ Cooldown     : <code>{signal_info.get('f_cooldown')}</code>  "
-            f"({signal_info.get('bars_since')} bars since last entry, need ≥{TL_COOLDOWN_BARS})\n"
-            f"⚖️ Risk         : <code>{signal_info.get('risk')}</code>  → RR {TL_RR_RATIO}× = TP"
-        )
+    if trigger_details:
+        msg += f"\n━━━━━━━━━━━━━━━━━━\n🧠 <b>Trigger conditions ({entry_path})</b>"
+        for label, value in trigger_details:
+            msg += f"\n{label} : <code>{value}</code>"
     send_telegram(msg)
     return True
 
@@ -760,7 +745,7 @@ def check_and_trade(symbol, row, df, all_state):
         return
 
     # =========================================================================
-    # TRENDLINE-BREAK SHORT LOGIC
+    # COMPUTE TRENDLINE STATE
     # =========================================================================
     state = compute_trendline_state(candles)
     if state is None:
@@ -772,17 +757,29 @@ def check_and_trade(symbol, row, df, all_state):
     lower_lvl = state["lower_lvl"][i]
     last_ph   = state["last_ph"]
 
-    if not red_b:
-        print(
-            f"[SCAN] {symbol} | close={last_close} | redB=False | "
-            f"lowerLvl={round(lower_lvl, precision) if lower_lvl else None} | "
-            f"lastPH={round(last_ph, precision) if last_ph else None}"
-        )
-        save_state(all_state)
-        return
-
+    # =========================================================================
+    # ENTRY EVALUATION — three independent paths
+    #
+    #   Path 0  ("tl_break")  — redB this bar  AND  ALL filters pass
+    #                           (body break, strong bar, volume, ATR distance)
+    #   Path A  ("tl_retest") — armed by an earlier redB whose filters failed;
+    #                           fires when a later bar's high retests lowerLvl
+    #                           from below and closes back beneath it.
+    #                           Filters are NOT required.
+    #   Path B  ("tl_accept") — independent of Path 0 / A. Tracks consecutive
+    #                           closes below lowerLvl; once the count reaches
+    #                           PATH_B_ACCEPTANCE_BARS, fires on the first
+    #                           bearish bar (close < open) below the line.
+    #                           Filters are NOT required.
+    #
+    # Cooldown applies globally. SL / TP geometry is identical across paths
+    # (entry = close, SL = lastPH × (1+TL_SL_BUFFER_PCT%), TP = entry − risk×RR).
+    # =========================================================================
     if lower_lvl is None or last_ph is None:
-        print(f"[SKIP] {symbol} — incomplete trendline state at signal bar")
+        print(
+            f"[SCAN] {symbol} | close={last_close} | trendline state incomplete "
+            f"(lowerLvl={lower_lvl}, lastPH={last_ph})"
+        )
         save_state(all_state)
         return
 
@@ -791,96 +788,184 @@ def check_and_trade(symbol, row, df, all_state):
     last_low    = state["lows"][i]
     last_volume = state["volumes"][i]
 
-    # Body break (wick-only break disqualifies)
+    # ── Cooldown gate (shared across all paths) ──────────────────────────────
+    last_sig_ts = st.get("tl_last_signal_ts")
+    if not TL_USE_COOLDOWN or last_sig_ts is None:
+        f_cooldown      = True
+        bars_since_disp = "∞"
+    else:
+        bars_since      = max(0, (last_ts - last_sig_ts) // (CANDLE_SECONDS * 1000))
+        f_cooldown      = bars_since >= TL_COOLDOWN_BARS
+        bars_since_disp = int(bars_since)
+
+    # ── Filters — ONLY used by Path 0 (core break) ──────────────────────────
     body_break_dn = max(last_open, last_close) < lower_lvl
     f_body = (not TL_USE_BODY_BREAK) or body_break_dn
 
-    # Strong bar
     bar_range = last_high - last_low
     bar_body  = abs(last_close - last_open)
     body_pct  = (bar_body / bar_range * 100) if bar_range > 0 else 0
     f_strong  = (not TL_USE_STRONG_BAR) or body_pct >= TL_MIN_BODY_PCT
 
-    # Volume confirmation
     vol_sma = calc_sma(state["volumes"], 20)
     f_vol   = (not TL_USE_VOLUME) or (vol_sma[i] is not None and last_volume > vol_sma[i] * TL_VOL_MULT)
 
-    # ATR distance beyond TL
     tr     = calc_true_range(state["highs"], state["lows"], state["closes"])
     atr14  = calc_rma(tr, 14)
     f_atr  = (not TL_USE_ATR_DIST) or (atr14[i] is not None and last_close < lower_lvl - atr14[i] * TL_ATR_MULT)
 
-    # Cooldown — N closed bars between entries
-    last_sig_ts = st.get("tl_last_signal_ts")
-    if not TL_USE_COOLDOWN or last_sig_ts is None:
-        f_cooldown = True
-        bars_since_disp = "∞"
-    else:
-        bars_since = max(0, (last_ts - last_sig_ts) // (CANDLE_SECONDS * 1000))
-        f_cooldown = bars_since >= TL_COOLDOWN_BARS
-        bars_since_disp = int(bars_since)
+    filters_pass = f_body and f_strong and f_vol and f_atr
 
-    short_sig = f_body and f_strong and f_vol and f_atr and f_cooldown
+    # ── Path 0 candidate ─────────────────────────────────────────────────────
+    core_sig = red_b and filters_pass
+
+    # ── Path A candidate (retest) — NO filters ───────────────────────────────
+    path_a_armed     = st.get("path_a_armed", False)
+    path_a_bars      = st.get("path_a_bars_armed", 0)
+    retest_floor     = lower_lvl * (1 - PATH_A_RETEST_TOLERANCE_PCT / 100.0)
+    retested         = last_high >= retest_floor                # high climbed back near/over line
+    closed_below_tl  = last_close < lower_lvl                   # rejected back beneath it
+    retest_sig       = PATH_A_ENABLED and path_a_armed and retested and closed_below_tl
+
+    # ── Path B candidate (acceptance) — NO filters ───────────────────────────
+    prev_consec_b = st.get("path_b_consecutive_below", 0)
+    new_consec_b  = prev_consec_b + 1 if closed_below_tl else 0
+    accept_sig    = (PATH_B_ENABLED
+                     and new_consec_b >= PATH_B_ACCEPTANCE_BARS
+                     and last_close < last_open)                # bearish continuation bar
+
+    # ── Pick the first path that fires ───────────────────────────────────────
+    chosen, trigger_details = None, None
+    if f_cooldown:
+        if core_sig:
+            chosen = "tl_break"
+        elif retest_sig:
+            chosen = "tl_retest"
+        elif accept_sig:
+            chosen = "tl_accept"
 
     print(
-        f"[TL-BREAK] {symbol} | redB=True | body={f_body} strong={f_strong}({round(body_pct,1)}%) "
-        f"vol={f_vol} atr={f_atr} cool={f_cooldown} → SHORT={short_sig} | "
+        f"[TL-EVAL] {symbol} | redB={red_b} filters={filters_pass} "
+        f"(body={f_body} strong={f_strong}({round(body_pct,1)}%) vol={f_vol} atr={f_atr}) | "
+        f"Path A armed={path_a_armed}({path_a_bars}b) retest={retest_sig} | "
+        f"Path B count={new_consec_b}/{PATH_B_ACCEPTANCE_BARS} accept={accept_sig} | "
+        f"cool={f_cooldown}({bars_since_disp}b) → chosen={chosen} | "
         f"lowerLvl={round(lower_lvl, precision)} lastPH={round(last_ph, precision)}"
     )
 
-    if not short_sig:
-        save_state(all_state)
-        return
+    # =========================================================================
+    # ENTRY (if a path was chosen)
+    # =========================================================================
+    if chosen is not None:
+        entry_price = last_close
+        sl_price    = last_ph * (1 + TL_SL_BUFFER_PCT / 100)
+        risk        = sl_price - entry_price
 
-    # === Pine SL/TP geometry ===
-    entry_price = last_close
-    sl_price    = last_ph * (1 + TL_SL_BUFFER_PCT / 100)
-    risk        = sl_price - entry_price
+        if risk <= 0:
+            print(f"[SKIP] {symbol} [{chosen}] invalid risk: SL {sl_price} ≤ entry {entry_price}")
+        else:
+            tp_price = entry_price - risk * TL_RR_RATIO
 
-    if risk <= 0:
-        print(f"[SKIP] {symbol} — invalid risk: SL {sl_price} ≤ entry {entry_price}")
-        save_state(all_state)
-        return
+            # Race-condition guards
+            if get_position_by_pair(symbol) is not None:
+                print(f"[ABORT] {symbol} — position appeared just before placement")
+                return
+            if has_open_order(symbol):
+                print(f"[ABORT] {symbol} — order appeared just before placement")
+                return
 
-    tp_price = entry_price - risk * TL_RR_RATIO
+            # Build path-specific trigger details for telegram
+            if chosen == "tl_break":
+                vol_thresh = (vol_sma[i] * TL_VOL_MULT) if vol_sma[i] is not None else None
+                atr_thresh = (lower_lvl - atr14[i] * TL_ATR_MULT) if atr14[i] is not None else None
+                trigger_details = [
+                    ("📉 redB",         "True"),
+                    ("🧱 lowerLvl",     round(lower_lvl, precision)),
+                    ("🔺 lastPH",       round(last_ph, precision)),
+                    ("🪵 Body break",   f"{f_body}  (max(o,c)={round(max(last_open,last_close), precision)} < lowerLvl)"),
+                    ("💪 Strong bar",   f"{f_strong}  (body {round(body_pct,1)}% ≥ {TL_MIN_BODY_PCT}%)"),
+                    ("📊 Volume",       f"{f_vol}  (vol={round(last_volume,2)} vs SMA20×{TL_VOL_MULT}={round(vol_thresh,2) if vol_thresh else 'N/A'})"),
+                    ("📐 ATR distance", f"{f_atr}  (close < lowerLvl − ATR14×{TL_ATR_MULT} = {round(atr_thresh, precision) if atr_thresh else 'N/A'})"),
+                    ("⏳ Cooldown",     f"{f_cooldown}  ({bars_since_disp} bars since last entry, need ≥{TL_COOLDOWN_BARS})"),
+                    ("⚖️ Risk",         f"{round(risk, precision)} → RR {TL_RR_RATIO}× = TP"),
+                ]
+            elif chosen == "tl_retest":
+                trigger_details = [
+                    ("🧱 lowerLvl",        round(lower_lvl, precision)),
+                    ("🔺 lastPH",          round(last_ph, precision)),
+                    ("⏱ Bars armed",      f"{path_a_bars} of {PATH_A_MAX_WAIT_BARS}"),
+                    ("📍 Retest high",     f"{round(last_high, precision)}  (floor {round(retest_floor, precision)}, tol ±{PATH_A_RETEST_TOLERANCE_PCT}%)"),
+                    ("📉 Closed below TL", f"{round(last_close, precision)} < {round(lower_lvl, precision)}"),
+                    ("🚫 Filters",         "skipped (Path A independent)"),
+                    ("⏳ Cooldown",         f"{f_cooldown}  ({bars_since_disp} bars since last entry, need ≥{TL_COOLDOWN_BARS})"),
+                    ("⚖️ Risk",            f"{round(risk, precision)} → RR {TL_RR_RATIO}× = TP"),
+                ]
+            else:  # tl_accept
+                trigger_details = [
+                    ("🧱 lowerLvl",         round(lower_lvl, precision)),
+                    ("🔺 lastPH",           round(last_ph, precision)),
+                    ("📊 Consec. below TL", f"{new_consec_b}  (≥ {PATH_B_ACCEPTANCE_BARS})"),
+                    ("🕯 Bearish bar",      f"close {round(last_close, precision)} < open {round(last_open, precision)}"),
+                    ("🚫 Filters",          "skipped (Path B independent)"),
+                    ("⏳ Cooldown",          f"{f_cooldown}  ({bars_since_disp} bars since last entry, need ≥{TL_COOLDOWN_BARS})"),
+                    ("⚖️ Risk",             f"{round(risk, precision)} → RR {TL_RR_RATIO}× = TP"),
+                ]
 
-    # Final race-condition guards
-    if get_position_by_pair(symbol) is not None:
-        print(f"[ABORT] {symbol} — position appeared just before placement")
-        return
-    if has_open_order(symbol):
-        print(f"[ABORT] {symbol} — order appeared just before placement")
-        return
+            placed = place_short_order(
+                symbol, entry_price, tp_price, sl_price, precision, chosen, trigger_details
+            )
+            if placed:
+                # Cooldown anchor + clear all arm states
+                st["tl_last_signal_ts"]        = last_ts
+                st["path_a_armed"]             = False
+                st["path_a_arm_ts"]            = None
+                st["path_a_bars_armed"]        = 0
+                st["path_b_consecutive_below"] = new_consec_b   # keep accurate; cooldown blocks re-fire
+                # Position state
+                st["in_position"] = True
+                st["entry_path"]  = chosen
+                st["entry_price"] = round(entry_price, precision)
+                st["tp_level"]    = round(tp_price,    precision)
+                st["sl_price"]    = round(sl_price,    precision)
+                update_sheet_tp(row, st["tp_level"])
+                update_sheet_sl(row, st["sl_price"])
+                save_state(all_state)
+                return
 
-    vol_thresh  = (vol_sma[i] * TL_VOL_MULT) if vol_sma[i] is not None else None
-    atr_thresh  = (lower_lvl - atr14[i] * TL_ATR_MULT) if atr14[i] is not None else None
-    signal_info = {
-        "lower_lvl":  round(lower_lvl, precision),
-        "last_ph":    round(last_ph, precision),
-        "f_body":     f_body,
-        "max_oc":     round(max(last_open, last_close), precision),
-        "f_strong":   f_strong,
-        "body_pct":   round(body_pct, 1),
-        "f_vol":      f_vol,
-        "vol":        round(last_volume, 2),
-        "vol_thresh": round(vol_thresh, 2) if vol_thresh is not None else None,
-        "f_atr":      f_atr,
-        "atr_thresh": round(atr_thresh, precision) if atr_thresh is not None else None,
-        "f_cooldown": f_cooldown,
-        "bars_since": bars_since_disp,
-        "risk":       round(risk, precision),
-    }
+    # =========================================================================
+    # NO ENTRY — update arm states for next bar
+    # =========================================================================
+    # Path A arming / lifecycle
+    if PATH_A_ENABLED:
+        if red_b and not filters_pass:
+            # New break with failed filters — arm (or re-arm) Path A
+            st["path_a_armed"]      = True
+            st["path_a_arm_ts"]     = last_ts
+            st["path_a_bars_armed"] = 0
+            print(
+                f"[PATH-A] {symbol} — ARMED (redB but filters failed: "
+                f"body={f_body} strong={f_strong} vol={f_vol} atr={f_atr})"
+            )
+        elif st.get("path_a_armed"):
+            st["path_a_bars_armed"] = st.get("path_a_bars_armed", 0) + 1
+            # Invalidation — close reclaimed the trendline
+            if last_close > lower_lvl * (1 + PATH_A_INVALIDATION_PCT / 100):
+                print(
+                    f"[PATH-A] {symbol} — DISARM (close {last_close} reclaimed lowerLvl "
+                    f"{round(lower_lvl, precision)} by >{PATH_A_INVALIDATION_PCT}%)"
+                )
+                st["path_a_armed"]      = False
+                st["path_a_arm_ts"]     = None
+                st["path_a_bars_armed"] = 0
+            elif st["path_a_bars_armed"] >= PATH_A_MAX_WAIT_BARS:
+                print(f"[PATH-A] {symbol} — DISARM (timed out at {PATH_A_MAX_WAIT_BARS} bars)")
+                st["path_a_armed"]      = False
+                st["path_a_arm_ts"]     = None
+                st["path_a_bars_armed"] = 0
 
-    placed = place_short_order(symbol, entry_price, tp_price, sl_price, precision, "tl_break", signal_info)
-    if placed:
-        st["tl_last_signal_ts"] = last_ts
-        st["in_position"]       = True
-        st["entry_path"]        = "tl_break"
-        st["entry_price"]       = round(entry_price, precision)
-        st["tp_level"]          = round(tp_price,    precision)
-        st["sl_price"]          = round(sl_price,    precision)
-        update_sheet_tp(row, st["tp_level"])
-        update_sheet_sl(row, st["sl_price"])
+    # Path B counter — always tracked
+    st["path_b_consecutive_below"] = new_consec_b
+
     save_state(all_state)
 
 
@@ -893,17 +978,24 @@ consecutive_errors = 0
 MAX_CONSECUTIVE_ERRORS = 10
 
 send_telegram(
-    f"✅ <b>SHORT Bot Started — TL Break + Anti-Fakeout</b>\n"
+    f"✅ <b>SHORT Bot Started — TL Break (3 paths)</b>\n"
     f"━━━━━━━━━━━━━━━━━━\n"
     f"📐 Strategy : <code>LuxAlgo Trendlines with Breaks (SHORT)</code>\n"
     f"⏱ Analysis : <code>4h closed bars</code>\n"
     f"🔁 Scan     : <code>Every 30 minutes</code>\n"
     f"📏 Length   : <code>{TL_LENGTH} (slope mult {TL_SLOPE_MULT}, method {TL_CALC_METHOD})</code>\n"
-    f"🧱 Filters  : <code>body={TL_USE_BODY_BREAK}, strong≥{TL_MIN_BODY_PCT}%={TL_USE_STRONG_BAR}, "
-    f"vol×{TL_VOL_MULT}={TL_USE_VOLUME}, atr×{TL_ATR_MULT}={TL_USE_ATR_DIST}, "
-    f"cool={TL_COOLDOWN_BARS}b={TL_USE_COOLDOWN}</code>\n"
+    f"━━━━━━━━━━━━━━━━━━\n"
+    f"🅿️ <b>Path 0 (tl_break)</b> — <code>redB + ALL filters</code>\n"
+    f"  └ body={TL_USE_BODY_BREAK}, strong≥{TL_MIN_BODY_PCT}%={TL_USE_STRONG_BAR}, "
+    f"vol×{TL_VOL_MULT}={TL_USE_VOLUME}, atr×{TL_ATR_MULT}={TL_USE_ATR_DIST}\n"
+    f"🅰️ <b>Path A (tl_retest)</b> — <code>retest of lowerLvl from below, NO filters</code>\n"
+    f"  └ tol ±{PATH_A_RETEST_TOLERANCE_PCT}%, max wait {PATH_A_MAX_WAIT_BARS}b, "
+    f"invalidate &gt;{PATH_A_INVALIDATION_PCT}% reclaim\n"
+    f"🅱️ <b>Path B (tl_accept)</b> — <code>≥{PATH_B_ACCEPTANCE_BARS} consec closes below TL + bearish bar, NO filters</code>\n"
+    f"━━━━━━━━━━━━━━━━━━\n"
     f"🎯 TP       : <code>RR = {TL_RR_RATIO}× risk</code>\n"
-    f"🛑 SL       : <code>lastPH × (1 + {TL_SL_BUFFER_PCT}%)</code>\n"
+    f"🛑 SL       : <code>lastPH × (1 + {TL_SL_BUFFER_PCT}%)</code>  (all paths)\n"
+    f"⏳ Cooldown : <code>{TL_COOLDOWN_BARS} × 4h bars (shared)</code>\n"
     f"💰 Capital  : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
 )
 
