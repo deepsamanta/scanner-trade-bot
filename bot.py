@@ -26,17 +26,21 @@ BASE_URL = "https://api.coindcx.com"
 #     filtered by: body break, strong-bar, volume confirmation, ATR distance,
 #     and per-bar dedupe (cooldown).
 #   - Entry  = bar close
-#   - SL     = lastPH * (1 + slBuffer%)
-#   - Risk   = SL - entry
-#   - TP     = entry - risk * RR
+#   - SL     = lowerLvl × (1 + SL_BUFFER_TL_PCT%)   — above broken trendline
+#   - TP     = entry    × (1 − TP_PCT_FIXED%)       — fixed % below entry
 # =============================================================================
 
 # ─── Trendline core ──────────────────────────────────────────────────────────
 TL_LENGTH        = 14            # swing lookback (pivot strength + atr period)
 TL_SLOPE_MULT    = 1.0           # slope multiplier
 TL_CALC_METHOD   = "Atr"         # 'Atr' | 'Stdev' | 'Linreg'
-TL_RR_RATIO      = 2.0           # reward : risk
-TL_SL_BUFFER_PCT = 0.1           # SL placed slBuffer% beyond lastPH
+
+# ─── SL / TP geometry (fixed) ────────────────────────────────────────────────
+# TP : entry × (1 − TP_PCT_FIXED/100)            → fixed % below entry
+# SL : lower_lvl × (1 + SL_BUFFER_TL_PCT/100)    → fixed % above the broken
+#                                                  trendline (now resistance)
+TP_PCT_FIXED     = 3.0
+SL_BUFFER_TL_PCT = 1.5
 
 # ─── Anti-fakeout filters ────────────────────────────────────────────────────
 TL_USE_BODY_BREAK = True
@@ -65,6 +69,12 @@ PATH_A_INVALIDATION_PCT     = 1.0    # close > lowerLvl × (1 + 1.0%) → disarm
 # any close reclaims lowerLvl.
 PATH_B_ENABLED         = True
 PATH_B_ACCEPTANCE_BARS = 3
+
+# ─── Risk sanity ─────────────────────────────────────────────────────────────
+# If lowerLvl is far above current price, SL = lowerLvl × (1+SL_BUFFER_TL_PCT%)
+# can be huge, producing a terrible implied RR with the fixed 3% TP. Skip any
+# setup whose SL distance from entry exceeds this cap.
+MAX_SL_DISTANCE_PCT = 8.0
 
 # ─── Timeframe / scan ────────────────────────────────────────────────────────
 RESOLUTION_PRIMARY = "240"
@@ -796,7 +806,7 @@ def check_and_trade(symbol, row, df, all_state):
     #                           Filters are NOT required.
     #
     # Cooldown applies globally. SL / TP geometry is identical across paths
-    # (entry = close, SL = lastPH × (1+TL_SL_BUFFER_PCT%), TP = entry − risk×RR).
+    # (entry = close, SL = lowerLvl × (1+SL_BUFFER_TL_PCT%), TP = entry × (1−TP_PCT_FIXED%)).
     # =========================================================================
     if lower_lvl is None or last_ph is None:
         print(
@@ -884,13 +894,51 @@ def check_and_trade(symbol, row, df, all_state):
     # =========================================================================
     if chosen is not None:
         entry_price = last_close
-        sl_price    = last_ph * (1 + TL_SL_BUFFER_PCT / 100)
+        sl_price    = lower_lvl * (1 + SL_BUFFER_TL_PCT / 100)
+        tp_price    = entry_price * (1 - TP_PCT_FIXED / 100)
         risk        = sl_price - entry_price
 
         if risk <= 0:
-            print(f"[SKIP] {symbol} [{chosen}] invalid risk: SL {sl_price} ≤ entry {entry_price}")
+            print(
+                f"[SKIP] {symbol} [{chosen}] invalid risk: SL {round(sl_price, precision)} "
+                f"≤ entry {round(entry_price, precision)} (lowerLvl too close / below entry)"
+            )
         else:
-            tp_price = entry_price - risk * TL_RR_RATIO
+            sl_distance_pct = (sl_price - entry_price) / entry_price * 100
+
+            # ── Risk sanity gate ────────────────────────────────────────────
+            # Skip if SL is too far above entry (RR becomes terrible with the
+            # fixed 3% TP). Disarm the path that produced the bad geometry so
+            # we don't retry the same setup every bar.
+            if sl_distance_pct > MAX_SL_DISTANCE_PCT:
+                reason = f"SL distance {sl_distance_pct:.2f}% > cap {MAX_SL_DISTANCE_PCT}%"
+                print(
+                    f"[SKIP-RISK] {symbol} [{chosen}] {reason} | "
+                    f"entry={round(entry_price, precision)} sl={round(sl_price, precision)} "
+                    f"tp={round(tp_price, precision)} lastPH={round(last_ph, precision)}"
+                )
+                send_telegram(
+                    f"⏭️ <b>SHORT SKIPPED — {symbol}</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"🛤 Path        : <code>{chosen}</code>\n"
+                    f"📍 Entry       : <code>{round(entry_price, precision)}</code>\n"
+                    f"🛑 SL          : <code>{round(sl_price, precision)}</code>  "
+                    f"(+{sl_distance_pct:.2f}%)\n"
+                    f"🎯 TP would be : <code>{round(tp_price, precision)}</code>\n"
+                    f"🔺 lastPH      : <code>{round(last_ph, precision)}</code>\n"
+                    f"❌ Reason      : <code>{reason}</code>"
+                )
+                # Disarm the offending path so we don't retry the same setup
+                if chosen == "tl_retest":
+                    st["path_a_armed"]      = False
+                    st["path_a_arm_ts"]     = None
+                    st["path_a_bars_armed"] = 0
+                elif chosen == "tl_accept":
+                    st["path_b_consecutive_below"] = 0
+                # (For tl_break we don't disarm anything — the next redB with a
+                # fresher lastPH may produce a tradeable setup.)
+                save_state(all_state)
+                return
 
             # Race-condition guards
             if get_position_by_pair(symbol) is not None:
@@ -913,7 +961,7 @@ def check_and_trade(symbol, row, df, all_state):
                     ("📊 Volume",       f"{f_vol}  (vol={round(last_volume,2)} vs SMA20×{TL_VOL_MULT}={round(vol_thresh,2) if vol_thresh else 'N/A'})"),
                     ("📐 ATR distance", f"{f_atr}  (close < lowerLvl − ATR14×{TL_ATR_MULT} = {round(atr_thresh, precision) if atr_thresh else 'N/A'})"),
                     ("⏳ Cooldown",     f"{f_cooldown}  ({bars_since_disp} bars since last entry, need ≥{TL_COOLDOWN_BARS})"),
-                    ("⚖️ Risk",         f"{round(risk, precision)} → RR {TL_RR_RATIO}× = TP"),
+                    ("⚖️ Risk",         f"SL +{sl_distance_pct:.2f}% / TP −{TP_PCT_FIXED}% (RR {TP_PCT_FIXED/sl_distance_pct:.2f}×)"),
                 ]
             elif chosen == "tl_retest":
                 trigger_details = [
@@ -924,7 +972,7 @@ def check_and_trade(symbol, row, df, all_state):
                     ("📉 Closed below TL", f"{round(last_close, precision)} < {round(lower_lvl, precision)}"),
                     ("🚫 Filters",         "skipped (Path A independent)"),
                     ("⏳ Cooldown",         f"{f_cooldown}  ({bars_since_disp} bars since last entry, need ≥{TL_COOLDOWN_BARS})"),
-                    ("⚖️ Risk",            f"{round(risk, precision)} → RR {TL_RR_RATIO}× = TP"),
+                    ("⚖️ Risk",            f"SL +{sl_distance_pct:.2f}% / TP −{TP_PCT_FIXED}% (RR {TP_PCT_FIXED/sl_distance_pct:.2f}×)"),
                 ]
             else:  # tl_accept
                 trigger_details = [
@@ -934,7 +982,7 @@ def check_and_trade(symbol, row, df, all_state):
                     ("🕯 Bearish bar",      f"close {round(last_close, precision)} < open {round(last_open, precision)}"),
                     ("🚫 Filters",          "skipped (Path B independent)"),
                     ("⏳ Cooldown",          f"{f_cooldown}  ({bars_since_disp} bars since last entry, need ≥{TL_COOLDOWN_BARS})"),
-                    ("⚖️ Risk",             f"{round(risk, precision)} → RR {TL_RR_RATIO}× = TP"),
+                    ("⚖️ Risk",             f"SL +{sl_distance_pct:.2f}% / TP −{TP_PCT_FIXED}% (RR {TP_PCT_FIXED/sl_distance_pct:.2f}×)"),
                 ]
 
             placed = place_short_order(
@@ -1019,8 +1067,8 @@ send_telegram(
     f"invalidate &gt;{PATH_A_INVALIDATION_PCT}% reclaim\n"
     f"🅱️ <b>Path B (tl_accept)</b> — <code>≥{PATH_B_ACCEPTANCE_BARS} consec closes below TL + bearish bar, NO filters</code>\n"
     f"━━━━━━━━━━━━━━━━━━\n"
-    f"🎯 TP       : <code>RR = {TL_RR_RATIO}× risk</code>\n"
-    f"🛑 SL       : <code>lastPH × (1 + {TL_SL_BUFFER_PCT}%)</code>  (all paths)\n"
+    f"🎯 TP       : <code>entry × (1 − {TP_PCT_FIXED}%)</code>  (fixed)\n"
+    f"🛑 SL       : <code>lowerLvl × (1 + {SL_BUFFER_TL_PCT}%)</code>  (all paths)\n"
     f"⏳ Cooldown : <code>{TL_COOLDOWN_BARS} × 4h bars (shared)</code>\n"
     f"💰 Capital  : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
 )
