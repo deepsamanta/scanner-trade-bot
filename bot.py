@@ -49,6 +49,23 @@ TL_ATR_MULT       = 0.25
 TL_USE_COOLDOWN   = True
 TL_COOLDOWN_BARS  = 5
 
+# ─── Path A — Retest after failed break ──────────────────────────────────────
+# Arms when redB fires this bar BUT filters fail. Watches subsequent bars for
+# a retest of lowerLvl from below (high pokes back up to the line) followed by
+# a close below it. Filters are NOT required on the entry bar.
+PATH_A_ENABLED              = True
+PATH_A_MAX_WAIT_BARS        = 10     # disarm if no retest within N bars
+PATH_A_RETEST_TOLERANCE_PCT = 0.3    # bar high reaches within −0.3% of lowerLvl
+PATH_A_INVALIDATION_PCT     = 1.0    # close > lowerLvl × (1 + 1.0%) → disarm
+
+# ─── Path B — Acceptance / grind-down ────────────────────────────────────────
+# Tracks consecutive 4h closes below lowerLvl. Once >= threshold, considered
+# "accepted below". Enters on first subsequent bearish bar (close < open) below
+# the line. Fully independent of whether the core break ever fired. Resets if
+# any close reclaims lowerLvl.
+PATH_B_ENABLED         = True
+PATH_B_ACCEPTANCE_BARS = 3
+
 # ─── Timeframe / scan ────────────────────────────────────────────────────────
 RESOLUTION_PRIMARY = "240"
 CANDLE_SECONDS     = 4 * 3600
@@ -156,6 +173,12 @@ def init_symbol_state():
     return {
         # ── Trendline-break state ─────────────────────
         "tl_last_signal_ts": None,   # ts of last bar that produced a SHORT entry
+        # ── Path A: pending retest after failed break ─
+        "path_a_armed":      False,
+        "path_a_arm_ts":     None,
+        "path_a_bars_armed": 0,
+        # ── Path B: acceptance / grind-down ───────────
+        "path_b_consecutive_below": 0,
         # ── Position state ────────────────────────────
         "in_position":  False,
         "entry_path":   None,
@@ -828,9 +851,12 @@ def check_and_trade(symbol, row, df, all_state):
     retest_sig       = PATH_A_ENABLED and path_a_armed and retested and closed_below_tl
 
     # ── Path B candidate (acceptance) — NO filters ───────────────────────────
+    # Strictly post-break: the redB bar itself routes to Path 0 (if filters pass)
+    # or to Path A arming (if filters fail), never to Path B.
     prev_consec_b = st.get("path_b_consecutive_below", 0)
     new_consec_b  = prev_consec_b + 1 if closed_below_tl else 0
     accept_sig    = (PATH_B_ENABLED
+                     and not red_b
                      and new_consec_b >= PATH_B_ACCEPTANCE_BARS
                      and last_close < last_open)                # bearish continuation bar
 
