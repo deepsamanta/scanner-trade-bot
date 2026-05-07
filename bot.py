@@ -236,7 +236,9 @@ def send_telegram(message):
     try:
         url  = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         data = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
-        requests.post(url, data=data, timeout=TELEGRAM_TIMEOUT)
+        r = requests.post(url, data=data, timeout=TELEGRAM_TIMEOUT)
+        if r.status_code != 200:
+            print(f"[TELEGRAM] Non-200 response {r.status_code}: {r.text[:200]}")
     except Exception as e:
         print(f"[TELEGRAM] Failed to send message: {e}")
 
@@ -911,7 +913,7 @@ def check_and_trade(symbol, row, df, all_state):
             # fixed 3% TP). Disarm the path that produced the bad geometry so
             # we don't retry the same setup every bar.
             if sl_distance_pct > MAX_SL_DISTANCE_PCT:
-                reason = f"SL distance {sl_distance_pct:.2f}% > cap {MAX_SL_DISTANCE_PCT}%"
+                reason = f"SL distance {sl_distance_pct:.2f}% &gt; cap {MAX_SL_DISTANCE_PCT}%"
                 print(
                     f"[SKIP-RISK] {symbol} [{chosen}] {reason} | "
                     f"entry={round(entry_price, precision)} sl={round(sl_price, precision)} "
@@ -956,10 +958,10 @@ def check_and_trade(symbol, row, df, all_state):
                     ("📉 redB",         "True"),
                     ("🧱 lowerLvl",     round(lower_lvl, precision)),
                     ("🔺 lastPH",       round(last_ph, precision)),
-                    ("🪵 Body break",   f"{f_body}  (max(o,c)={round(max(last_open,last_close), precision)} < lowerLvl)"),
+                    ("🪵 Body break",   f"{f_body}  (max(o,c)={round(max(last_open,last_close), precision)} &lt; lowerLvl)"),
                     ("💪 Strong bar",   f"{f_strong}  (body {round(body_pct,1)}% ≥ {TL_MIN_BODY_PCT}%)"),
                     ("📊 Volume",       f"{f_vol}  (vol={round(last_volume,2)} vs SMA20×{TL_VOL_MULT}={round(vol_thresh,2) if vol_thresh else 'N/A'})"),
-                    ("📐 ATR distance", f"{f_atr}  (close < lowerLvl − ATR14×{TL_ATR_MULT} = {round(atr_thresh, precision) if atr_thresh else 'N/A'})"),
+                    ("📐 ATR distance", f"{f_atr}  (close &lt; lowerLvl − ATR14×{TL_ATR_MULT} = {round(atr_thresh, precision) if atr_thresh else 'N/A'})"),
                     ("⏳ Cooldown",     f"{f_cooldown}  ({bars_since_disp} bars since last entry, need ≥{TL_COOLDOWN_BARS})"),
                     ("⚖️ Risk",         f"SL +{sl_distance_pct:.2f}% / TP −{TP_PCT_FIXED}% (RR {TP_PCT_FIXED/sl_distance_pct:.2f}×)"),
                 ]
@@ -969,7 +971,7 @@ def check_and_trade(symbol, row, df, all_state):
                     ("🔺 lastPH",          round(last_ph, precision)),
                     ("⏱ Bars armed",      f"{path_a_bars} of {PATH_A_MAX_WAIT_BARS}"),
                     ("📍 Retest high",     f"{round(last_high, precision)}  (floor {round(retest_floor, precision)}, tol ±{PATH_A_RETEST_TOLERANCE_PCT}%)"),
-                    ("📉 Closed below TL", f"{round(last_close, precision)} < {round(lower_lvl, precision)}"),
+                    ("📉 Closed below TL", f"{round(last_close, precision)} &lt; {round(lower_lvl, precision)}"),
                     ("🚫 Filters",         "skipped (Path A independent)"),
                     ("⏳ Cooldown",         f"{f_cooldown}  ({bars_since_disp} bars since last entry, need ≥{TL_COOLDOWN_BARS})"),
                     ("⚖️ Risk",            f"SL +{sl_distance_pct:.2f}% / TP −{TP_PCT_FIXED}% (RR {TP_PCT_FIXED/sl_distance_pct:.2f}×)"),
@@ -979,7 +981,7 @@ def check_and_trade(symbol, row, df, all_state):
                     ("🧱 lowerLvl",         round(lower_lvl, precision)),
                     ("🔺 lastPH",           round(last_ph, precision)),
                     ("📊 Consec. below TL", f"{new_consec_b}  (≥ {PATH_B_ACCEPTANCE_BARS})"),
-                    ("🕯 Bearish bar",      f"close {round(last_close, precision)} < open {round(last_open, precision)}"),
+                    ("🕯 Bearish bar",      f"close {round(last_close, precision)} &lt; open {round(last_open, precision)}"),
                     ("🚫 Filters",          "skipped (Path B independent)"),
                     ("⏳ Cooldown",          f"{f_cooldown}  ({bars_since_disp} bars since last entry, need ≥{TL_COOLDOWN_BARS})"),
                     ("⚖️ Risk",             f"SL +{sl_distance_pct:.2f}% / TP −{TP_PCT_FIXED}% (RR {TP_PCT_FIXED/sl_distance_pct:.2f}×)"),
