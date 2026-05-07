@@ -401,11 +401,13 @@ def compute_trendlines(opens, highs, lows, closes, length, mult):
                     in_approach = False
 
     return {
-        "upper_lvl":     upper_lvl,
-        "lower_lvl":     lower_lvl,
-        "last_ph":       cur_last_ph,
-        "last_pl":       cur_last_pl,
-        "touches_below": touches_below,
+        "upper_lvl":       upper_lvl,
+        "lower_lvl":       lower_lvl,
+        "last_ph":         cur_last_ph,
+        "last_pl":         cur_last_pl,
+        "last_pl_bar_idx": last_pl_bar_idx,    # bar index where pivot low confirmed
+        "slope_pl_now":    cur_slope_pl,       # current per-bar slope of lower TL
+        "touches_below":   touches_below,
     }
 
 
@@ -660,6 +662,7 @@ def place_short_order(symbol, entry_price, tp_price, sl_price, precision, entry_
                 f"🔴 lastPH     : <code>{signal_info.get('last_ph')}</code>\n"
                 f"🟢 lastPL     : <code>{signal_info.get('last_pl')}</code>\n"
                 f"🪢 Touches    : <code>{signal_info.get('touches_below')}</code> (≥ {MIN_TL_TOUCHES})\n"
+                f"🪜 TL anchor  : <code>{signal_info.get('tl_anchor')}</code>\n"
                 f"🧱 armed @TL  : <code>{signal_info.get('armed_lower_lvl')}</code>\n"
                 f"⏳ bars armed : <code>{signal_info.get('bars_armed')}</code> / {RETEST_MAX_BARS}\n"
                 f"<b>✅ Retest conditions:</b>\n"
@@ -685,6 +688,7 @@ def place_short_order(symbol, entry_price, tp_price, sl_price, precision, entry_
                 f"🔴 lastPH     : <code>{signal_info.get('last_ph')}</code>\n"
                 f"🟢 lastPL     : <code>{signal_info.get('last_pl')}</code>\n"
                 f"🪢 Touches    : <code>{signal_info.get('touches_below')}</code> (≥ {MIN_TL_TOUCHES})\n"
+                f"🪜 TL anchor  : <code>{signal_info.get('tl_anchor')}</code>\n"
                 f"<b>✅ Filters passed:</b>\n"
                 f"• fresh cross : <code>True</code> "
                 f"(prev≥{signal_info.get('lower_lvl')} &amp; c15&lt;{signal_info.get('lower_lvl')})\n"
@@ -740,10 +744,12 @@ def check_and_trade(symbol, row, df, all_state):
     opens_1h  = [float(c["open"])  for c in candles_1h]
 
     tl = compute_trendlines(opens_1h, highs_1h, lows_1h, closes_1h, SWING_LOOKBACK, SLOPE_MULT)
-    lower_lvl     = tl["lower_lvl"]
-    last_ph       = tl["last_ph"]
-    last_pl       = tl["last_pl"]
-    touches_below = tl["touches_below"]
+    lower_lvl       = tl["lower_lvl"]
+    last_ph         = tl["last_ph"]
+    last_pl         = tl["last_pl"]
+    last_pl_bar_idx = tl["last_pl_bar_idx"]
+    slope_pl_now    = tl["slope_pl_now"]
+    touches_below   = tl["touches_below"]
 
     if lower_lvl is None or last_ph is None or last_pl is None:
         print(f"[SKIP] {symbol} — trendline / pivots not ready yet")
@@ -751,6 +757,22 @@ def check_and_trade(symbol, row, df, all_state):
 
     precision     = get_precision(candles_1h[-1]["close"])
     last_close_1h = closes_1h[-1]
+
+    # ── Build "TL anchor" descriptor (which pivot low started the trendline) ─
+    if last_pl_bar_idx is not None and last_pl is not None:
+        last_idx_1h    = len(candles_1h) - 1
+        bars_since_pl  = last_idx_1h - last_pl_bar_idx
+        pl_ts_ms       = int(candles_1h[last_pl_bar_idx]["time"])
+        last_ts_ms     = int(candles_1h[last_idx_1h]["time"])
+        pl_age_hours   = (last_ts_ms - pl_ts_ms) / 1000 / 3600
+        decay          = slope_pl_now * bars_since_pl
+        tl_anchor_str  = (
+            f"PL {round(last_pl, precision)} @ -{bars_since_pl}b "
+            f"(~{int(pl_age_hours)}h ago) + slope {slope_pl_now:.2e}/bar × "
+            f"{bars_since_pl}b = decay {round(decay, precision)} → lowerLvl {round(lower_lvl, precision)}"
+        )
+    else:
+        tl_anchor_str = "n/a (no confirmed pivot low yet)"
 
     # Per-symbol state
     st = all_state.get(symbol)
@@ -1047,6 +1069,7 @@ def check_and_trade(symbol, row, df, all_state):
                                 (ts15 - last_entry_ts) // (ENTRY_CANDLE_SECONDS * 1000)
                                 if last_entry_ts > 0 else "n/a"
                             ),
+                            "tl_anchor":       tl_anchor_str,
                         }
 
     # =========================================================================
@@ -1078,6 +1101,7 @@ def check_and_trade(symbol, row, df, all_state):
             "bars_since_last": bars_since_last,
             "cooldown_bars":   COOLDOWN_BARS,
             "touches_below":   touches_below,
+            "tl_anchor":       tl_anchor_str,
         }
     elif retest_sig:
         entry_path = "tl_retest"
