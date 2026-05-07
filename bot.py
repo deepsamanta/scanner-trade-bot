@@ -1,4 +1,3 @@
-import math
 import pandas as pd
 import requests
 import time
@@ -17,89 +16,88 @@ getcontext().prec = 28
 BASE_URL = "https://api.coindcx.com"
 
 # =============================================================================
-# STRATEGY: LuxAlgo "Trendlines with Breaks" + Anti-Fakeout (SHORT only)
+# STRATEGY PARAMETERS  (Trendline Break + Anti-Fakeout — SHORT ONLY)
 #
-# CORE:
-#   - On 4h closed bars, fit decaying trendlines from pivot highs (upper) and
-#     pivot lows (lower) using ATR-based slope decay.
-#   - SHORT signal = redB (close breaks below the lower trendline that bar)
-#     filtered by: body break, strong-bar, volume confirmation, ATR distance,
-#     and per-bar dedupe (cooldown).
-#   - Entry  = bar close
-#   - SL     = lowerLvl × (1 + SL_BUFFER_TL_PCT%)   — above broken trendline
-#   - TP     = entry    × (1 − TP_PCT_FIXED%)       — fixed % below entry
+# TIMEFRAME ARCHITECTURE (mirror of the LONG bot):
+#   - Trendline / S-R levels  : 1h closed candles
+#   - Entry confirmation      : 15m closed candles
+#   - Scan interval           : 15 minutes
+#
+# ENTRY PATHS:
+#   - tl_break  : fresh cross-DOWN through lower_lvl on the latest 15m bar
+#                 + ALL anti-fakeout filters pass on that same bar.
+#   - tl_retest : when a fresh cross-down fires but filters fail, the bot ARMS
+#                 a retest watch. If price pulls back UP to lower_lvl and gets
+#                 rejected (15m wick touches the line, then closes back below
+#                 with a bearish body), it shorts. Captures the case where the
+#                 broken support acts as new resistance.
 # =============================================================================
 
-# ─── Trendline core ──────────────────────────────────────────────────────────
-TL_LENGTH        = 14            # swing lookback (pivot strength + atr period)
-TL_SLOPE_MULT    = 1.0           # slope multiplier
-TL_CALC_METHOD   = "Atr"         # 'Atr' | 'Stdev' | 'Linreg'
+# ─── TRENDLINE TOUCH CONFIRMATION ───────────────────────────────────────────
+# Before either path can fire, the trendline must have been TOUCHED at least
+# this many times since its anchor pivot. A "touch" = a 1h bar whose low
+# reached within TOUCH_TOLERANCE_PCT of the line but whose close stayed
+# above (price tried to break the support and failed). Consecutive bars in
+# the same approach are collapsed via state machine: price must rise
+# ≥ TOUCH_GAP_PCT above the line before the next attempt counts.
+MIN_TL_TOUCHES       = 2
+TOUCH_TOLERANCE_PCT  = 0.5
+TOUCH_GAP_PCT        = 1.0
 
-# ─── SL / TP geometry (fixed) ────────────────────────────────────────────────
-# TP : entry × (1 − TP_PCT_FIXED/100)            → fixed % below entry
-# SL : lower_lvl × (1 + SL_BUFFER_TL_PCT/100)    → fixed % above the broken
-#                                                  trendline (now resistance)
-TP_PCT_FIXED     = 3.0
-SL_BUFFER_TL_PCT = 1.5
+# ─── TRENDLINE CALC (1h) ─────────────────────────────────────────────────────
+SWING_LOOKBACK   = 14
+SLOPE_MULT       = 1.0
+ATR_PERIOD_TL    = 14
 
-# ─── Anti-fakeout filters ────────────────────────────────────────────────────
-TL_USE_BODY_BREAK = True
-TL_USE_STRONG_BAR = True
-TL_MIN_BODY_PCT   = 50.0
-TL_USE_VOLUME     = True
-TL_VOL_MULT       = 1.2
-TL_USE_ATR_DIST   = True
-TL_ATR_MULT       = 0.25
-TL_USE_COOLDOWN   = True
-TL_COOLDOWN_BARS  = 5
+# ─── RISK ────────────────────────────────────────────────────────────────────
+TP_PCT           = 3.0         # fixed take-profit: entry × (1 − TP_PCT/100)
+SL_ABOVE_TL_PCT  = 1.5         # SL placed X% above the lower trendline (broken support → resistance)
 
-# ─── Path A — Retest after failed break ──────────────────────────────────────
-# Arms when redB fires this bar BUT filters fail. Watches subsequent bars for
-# a retest of lowerLvl from below (high pokes back up to the line) followed by
-# a close below it. Filters are NOT required on the entry bar.
-PATH_A_ENABLED              = True
-PATH_A_MAX_WAIT_BARS        = 10     # disarm if no retest within N bars
-PATH_A_RETEST_TOLERANCE_PCT = 0.3    # bar high reaches within −0.3% of lowerLvl
-PATH_A_INVALIDATION_PCT     = 1.0    # close > lowerLvl × (1 + 1.0%) → disarm
+# ─── ANTI-FAKEOUT FILTERS (applied on 15m entry candle, tl_break path) ──────
+USE_BODY_BREAK   = True
+USE_STRONG_BAR   = True
+MIN_BODY_PCT     = 50.0
+USE_VOLUME       = True
+VOL_MULT         = 1.2
+VOL_SMA_PERIOD   = 20
+USE_ATR_DIST     = True
+ATR_MULT         = 0.25
+ATR_PERIOD_15M   = 14
+USE_COOLDOWN     = True
+COOLDOWN_BARS    = 5
 
-# ─── Path B — Acceptance / grind-down ────────────────────────────────────────
-# Tracks consecutive 4h closes below lowerLvl. Once >= threshold, considered
-# "accepted below". Enters on first subsequent bearish bar (close < open) below
-# the line. Fully independent of whether the core break ever fired. Resets if
-# any close reclaims lowerLvl.
-PATH_B_ENABLED         = True
-PATH_B_ACCEPTANCE_BARS = 3
+# ─── RETEST PATH (tl_retest) ─────────────────────────────────────────────────
+USE_RETEST_PATH      = True
+RETEST_MAX_BARS      = 20
+RETEST_TOUCH_PCT     = 0.3
+RETEST_MIN_BODY_PCT  = 30
+RETEST_CANCEL_PCT    = 1.0     # cancel retest if 15m close rises X% above TL
 
-# ─── Risk sanity ─────────────────────────────────────────────────────────────
-# If lowerLvl is far above current price, SL = lowerLvl × (1+SL_BUFFER_TL_PCT%)
-# can be huge, producing a terrible implied RR with the fixed 3% TP. Skip any
-# setup whose SL distance from entry exceeds this cap.
-MAX_SL_DISTANCE_PCT = 8.0
+# ─── CANDLE COUNTS ───────────────────────────────────────────────────────────
+TL_CANDLES_1H    = 500
+ENTRY_CANDLES    = 60
 
-# ─── Trendline validation ─────────────────────────────────────────────────────
-# A trendline is considered "real" only after it has been TOUCHED at least N
-# times (price approached the line from above and the line held — close stayed
-# above). Touches accumulate from the bar a new pivot low confirms the line,
-# and reset each time a fresh pivot low forms (new line = new validation).
-MIN_TOUCHES_REQUIRED = 2
-TOUCH_TOLERANCE_PCT  = 0.5    # bar low within this % above lowerLvl counts as a touch
+# ─── TIMEFRAME / SCAN ────────────────────────────────────────────────────────
+RESOLUTION_PRIMARY    = "60"            # 1h
+RESOLUTION_ENTRY      = "15"            # 15m
+CANDLE_SECONDS        = 60 * 60
+ENTRY_CANDLE_SECONDS  = 15 * 60
+SCAN_INTERVAL         = 15 * 60
 
-# ─── Timeframe / scan ────────────────────────────────────────────────────────
-RESOLUTION_PRIMARY = "240"
-CANDLE_SECONDS     = 4 * 3600
-SCAN_INTERVAL      = 1800
-TL_CANDLES_NEEDED  = 200
+# ─── REQUEST TIMEOUTS ────────────────────────────────────────────────────────
+REQUEST_TIMEOUT      = 15
+TELEGRAM_TIMEOUT     = 10
 
-# ─── Misc / IO ───────────────────────────────────────────────────────────────
-REQUEST_TIMEOUT        = 15
-TELEGRAM_TIMEOUT       = 10
+# ─── GSPREAD RE-AUTH INTERVAL ────────────────────────────────────────────────
 GSHEET_REAUTH_INTERVAL = 45 * 60
-STATE_FILE             = "short_bot_state.json"
+
+# ─── LOCAL STATE FILE ────────────────────────────────────────────────────────
+STATE_FILE           = "short_bot_state.json"
 # =============================================================================
 
 
 # =====================================================
-# GOOGLE SHEETS — with periodic re-auth
+# GOOGLE SHEETS
 # =====================================================
 
 SCOPE = [
@@ -147,7 +145,7 @@ def update_sheet_tp(row, value):
         sheet = get_sheet()
         if sheet is None:
             return
-        sheet.update(f"B{row + 1}", [[str(value)]])
+        sheet.update_acell(f"B{row + 1}", str(value))
         print(f"[SHEET] Row {row + 1} col B -> {value}")
     except Exception as e:
         print("Sheet update error:", e)
@@ -158,7 +156,7 @@ def update_sheet_sl(row, value):
         sheet = get_sheet()
         if sheet is None:
             return
-        sheet.update(f"C{row + 1}", [[str(value)]])
+        sheet.update_acell(f"C{row + 1}", str(value))
         print(f"[SHEET] Row {row + 1} col C (SL) -> {value}")
     except Exception as e:
         print("Sheet SL update error:", e)
@@ -189,20 +187,18 @@ def save_state(state):
 
 def init_symbol_state():
     return {
-        # ── Trendline-break state ─────────────────────
-        "tl_last_signal_ts": None,   # ts of last bar that produced a SHORT entry
-        # ── Path A: pending retest after failed break ─
-        "path_a_armed":      False,
-        "path_a_arm_ts":     None,
-        "path_a_bars_armed": 0,
-        # ── Path B: acceptance / grind-down ───────────
-        "path_b_consecutive_below": 0,
-        # ── Position state ────────────────────────────
-        "in_position":  False,
-        "entry_path":   None,
-        "entry_price":  None,
-        "tp_level":     None,
-        "sl_price":     None,
+        "in_position":        False,
+        "entry_path":         None,
+        "entry_price":        None,
+        "tp_level":           None,
+        "sl_price":           None,
+        "last_entry_ts":      0,        # ms ts of last entry (cooldown anchor)
+
+        # ── Retest path state ──────────────────────────────
+        "retest_armed":       False,
+        "retest_armed_ts":    0,
+        "retest_lower_lvl":   None,     # lower_lvl snapshot at arming
+        "retest_last_pl":     None,     # for telegram/log only
     }
 
 
@@ -222,7 +218,7 @@ def fut_pair(symbol):
 
 
 # =====================================================
-# SIGN REQUEST / TELEGRAM / PRECISION
+# SIGN REQUEST
 # =====================================================
 
 def sign_request(body):
@@ -240,16 +236,28 @@ def sign_request(body):
     return payload, headers
 
 
+# =====================================================
+# TELEGRAM
+# =====================================================
+
 def send_telegram(message):
     try:
         url  = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        data = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+        data = {
+            "chat_id":    TELEGRAM_CHAT_ID,
+            "text":       message,
+            "parse_mode": "HTML",
+        }
         r = requests.post(url, data=data, timeout=TELEGRAM_TIMEOUT)
         if r.status_code != 200:
             print(f"[TELEGRAM] Non-200 response {r.status_code}: {r.text[:200]}")
     except Exception as e:
         print(f"[TELEGRAM] Failed to send message: {e}")
 
+
+# =====================================================
+# PRECISION
+# =====================================================
 
 def get_precision(raw_candle_close):
     s = str(raw_candle_close)
@@ -259,7 +267,150 @@ def get_precision(raw_candle_close):
 
 
 # =====================================================
-# CANDLE FETCH (4h primary)
+# INDICATORS
+# =====================================================
+
+def compute_atr(highs, lows, closes, period):
+    """Wilder's ATR (matches Pine ta.atr / RMA smoothing)."""
+    n = len(closes)
+    if n == 0:
+        return []
+    tr = [highs[0] - lows[0]]
+    for i in range(1, n):
+        tr.append(max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i]  - closes[i - 1]),
+        ))
+    atr = [None] * n
+    if n < period:
+        return atr
+    atr[period - 1] = sum(tr[:period]) / period
+    for i in range(period, n):
+        atr[i] = (atr[i - 1] * (period - 1) + tr[i]) / period
+    return atr
+
+
+def compute_trendlines(opens, highs, lows, closes, length, mult):
+    """
+    LuxAlgo-style Trendlines with Breaks (short-side fields).
+
+    Pivot detection uses the CANDLE BODY (max(open,close) for highs,
+    min(open,close) for lows), so wicks/spikes never anchor a trendline.
+    ATR (used for slope decay) still uses true high/low.
+
+    Returns final-bar values:
+        lower_lvl      = projected support level (cur_lower + slope_pl × length)
+        last_pl        = most recent pivot low body-bottom (anchors lower TL)
+        last_ph        = most recent pivot high body-top (context)
+        touches_below  = count of failed-break attempts on the lower TL
+                         since its anchor pivot confirmed
+    """
+    n = len(closes)
+    atr_arr = compute_atr(highs, lows, closes, ATR_PERIOD_TL)
+
+    body_tops    = [max(opens[i], closes[i]) for i in range(n)]
+    body_bottoms = [min(opens[i], closes[i]) for i in range(n)]
+
+    cur_upper = 0.0
+    cur_lower = 0.0
+    cur_slope_ph = 0.0
+    cur_slope_pl = 0.0
+    cur_last_ph = None
+    cur_last_pl = None
+    have_upper = False
+    have_lower = False
+
+    lower_lvl_history = [None] * n
+    last_pl_bar_idx   = None     # bar index where most recent pivot low confirmed
+
+    for i in range(n):
+        ph = None
+        pl = None
+
+        # Pivot at index (i-length) is confirmed at bar i — body-based
+        if i >= 2 * length:
+            c    = i - length
+            bt_c = body_tops[c]
+            bb_c = body_bottoms[c]
+            is_ph = True
+            is_pl = True
+            for k in range(1, length + 1):
+                if body_tops[c - k]    >= bt_c or body_tops[c + k]    >= bt_c:
+                    is_ph = False
+                if body_bottoms[c - k] <= bb_c or body_bottoms[c + k] <= bb_c:
+                    is_pl = False
+                if not is_ph and not is_pl:
+                    break
+            if is_ph:
+                ph = bt_c
+            if is_pl:
+                pl = bb_c
+
+        slope = (atr_arr[i] / length * mult) if (atr_arr[i] is not None) else 0.0
+
+        # Upper trendline (descending resistance — context only here)
+        if ph is not None:
+            cur_slope_ph = slope
+            cur_upper    = ph
+            cur_last_ph  = ph
+            have_upper   = True
+        elif have_upper:
+            cur_upper -= cur_slope_ph
+
+        # Lower trendline (ascending support — anchors SL for SHORT entries)
+        if pl is not None:
+            cur_slope_pl    = slope
+            cur_lower       = pl
+            cur_last_pl     = pl
+            have_lower      = True
+            last_pl_bar_idx = i
+        elif have_lower:
+            cur_lower += cur_slope_pl
+
+        if have_lower:
+            lower_lvl_history[i] = cur_lower + cur_slope_pl * length
+
+    upper_lvl = (cur_upper - cur_slope_ph * length) if have_upper else None
+    lower_lvl = (cur_lower + cur_slope_pl * length) if have_lower else None
+
+    # ── Count touches on the CURRENT lower trendline ───────────────────────
+    # A touch = a 1h bar whose low reached within TOUCH_TOLERANCE_PCT above
+    # the line, but whose close stayed above (line held as support).
+    # Sequential bars in the same approach are collapsed: only count a NEW
+    # touch after price has risen ≥ TOUCH_GAP_PCT above the line in between.
+    touches_below = 0
+    if last_pl_bar_idx is not None and last_pl_bar_idx + 1 < n:
+        in_approach = False
+        for j in range(last_pl_bar_idx + 1, n):
+            lvl = lower_lvl_history[j]
+            if lvl is None or lvl <= 0:
+                continue
+            approach_thresh = lvl * (1 + TOUCH_TOLERANCE_PCT / 100)
+            gap_thresh      = lvl * (1 + TOUCH_GAP_PCT       / 100)
+
+            approached = lows[j]   <= approach_thresh
+            close_high = closes[j] >  lvl
+
+            if approached and close_high:
+                if not in_approach:
+                    touches_below += 1
+                    in_approach = True
+            else:
+                if lows[j] > gap_thresh:
+                    in_approach = False
+
+    return {
+        "upper_lvl":     upper_lvl,
+        "lower_lvl":     lower_lvl,
+        "last_ph":       cur_last_ph,
+        "last_pl":       cur_last_pl,
+        "touches_below": touches_below,
+    }
+
+
+# =====================================================
+# CANDLE FETCH
 # =====================================================
 
 def fetch_candles(symbol, num_candles_needed, resolution_str=None, candle_seconds=None):
@@ -283,14 +434,15 @@ def fetch_candles(symbol, num_candles_needed, resolution_str=None, candle_second
     try:
         response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
         data     = response.json().get("data", [])
-        return sorted(data, key=lambda x: x["time"])
+        candles  = sorted(data, key=lambda x: x["time"])
+        return candles
     except Exception as e:
         print(f"[CANDLES {resolution_str}] {symbol} fetch error: {e}")
         return []
 
 
 # =====================================================
-# RECENT LOW (TP wick detection between scans)
+# RECENT LOW (TP wick detection between scans — SHORT)
 # =====================================================
 
 def get_recent_low(symbol):
@@ -313,226 +465,6 @@ def get_recent_low(symbol):
     except Exception as e:
         print(f"[RECENT LOW] {symbol} error: {e}")
         return None
-
-
-# =====================================================
-# INDICATORS (helpers for trendline state)
-# =====================================================
-
-def calc_true_range(highs, lows, closes):
-    n = len(closes)
-    if n == 0:
-        return []
-    tr = [highs[0] - lows[0]]
-    for i in range(1, n):
-        tr.append(max(
-            highs[i] - lows[i],
-            abs(highs[i] - closes[i-1]),
-            abs(lows[i]  - closes[i-1]),
-        ))
-    return tr
-
-
-def calc_rma(values, period):
-    """Wilder's RMA — matches Pine ta.atr / ta.rma."""
-    n = len(values)
-    out = [None] * n
-    if n < period:
-        return out
-    initial = sum(values[:period]) / period
-    out[period - 1] = initial
-    for i in range(period, n):
-        out[i] = (out[i-1] * (period - 1) + values[i]) / period
-    return out
-
-
-def calc_sma(values, period):
-    n = len(values)
-    out = [None] * n
-    s = 0.0
-    for i in range(n):
-        s += values[i]
-        if i >= period:
-            s -= values[i - period]
-        if i >= period - 1:
-            out[i] = s / period
-    return out
-
-
-def calc_stdev(values, period):
-    """Population stdev — matches Pine ta.stdev default."""
-    n = len(values)
-    out = [None] * n
-    if n < period:
-        return out
-    sma = calc_sma(values, period)
-    for i in range(period - 1, n):
-        m = sma[i]
-        var = sum((values[j] - m) ** 2 for j in range(i - period + 1, i + 1)) / period
-        out[i] = math.sqrt(var)
-    return out
-
-
-# =====================================================
-# TRENDLINE STATE (LuxAlgo Trendlines with Breaks)
-# =====================================================
-
-def compute_trendline_state(candles, length=TL_LENGTH, mult=TL_SLOPE_MULT, method=TL_CALC_METHOD):
-    """
-    Streaming replication of the Pine logic. Returns per-bar arrays plus latest
-    pivot references. Last index = most recent CLOSED bar.
-    """
-    n = len(candles)
-    if n < length * 3 + 5:
-        return None
-
-    opens   = [float(c["open"])   for c in candles]
-    highs   = [float(c["high"])   for c in candles]
-    lows    = [float(c["low"])    for c in candles]
-    closes  = [float(c["close"])  for c in candles]
-    volumes = [float(c.get("volume", 0)) for c in candles]
-
-    # Per-bar slope value
-    if method == "Stdev":
-        sd = calc_stdev(closes, length)
-        slopes = [(s / length * mult) if s is not None else 0.0 for s in sd]
-    elif method == "Linreg":
-        # simplified linreg-slope proxy (rare path); fall back to ATR shape
-        tr = calc_true_range(highs, lows, closes)
-        atr_len = calc_rma(tr, length)
-        slopes = [(a / length * mult) if a is not None else 0.0 for a in atr_len]
-    else:  # 'Atr'
-        tr = calc_true_range(highs, lows, closes)
-        atr_len = calc_rma(tr, length)
-        slopes = [(a / length * mult) if a is not None else 0.0 for a in atr_len]
-
-    # Pivot confirmations: ta.pivothigh(length, length) — pivot at bar (i-length)
-    # is reported at bar i. We populate the *confirmation bar*.
-    #
-    # IMPORTANT: pivots are detected against BODY extremes, not wicks. A bar's
-    # candidate value is min(open, close) for a pivot low and max(open, close)
-    # for a pivot high. This prevents single-bar wick spikes from resetting the
-    # trendline anchor — the anchor only moves when an actual close-based swing
-    # forms.
-    body_highs = [max(opens[k], closes[k]) for k in range(n)]
-    body_lows  = [min(opens[k], closes[k]) for k in range(n)]
-
-    ph_event = [None] * n
-    pl_event = [None] * n
-    for i in range(length, n - length):
-        confirm = i + length
-        if confirm >= n:
-            break
-        bh, bl = body_highs[i], body_lows[i]
-        is_ph, is_pl = True, True
-        for k in range(1, length + 1):
-            if body_highs[i-k] >= bh or body_highs[i+k] >= bh:
-                is_ph = False
-                break
-        if is_ph:
-            ph_event[confirm] = bh
-        for k in range(1, length + 1):
-            if body_lows[i-k] <= bl or body_lows[i+k] <= bl:
-                is_pl = False
-                break
-        if is_pl:
-            pl_event[confirm] = bl
-
-    upper = None
-    lower = None
-    slope_ph = 0.0
-    slope_pl = 0.0
-    last_ph = None
-    last_pl = None
-    last_pl_idx = None     # bar index of the most recent CONFIRMED pivot low
-    last_ph_idx = None     # bar index of the most recent CONFIRMED pivot high
-    upos = 0
-    dnos = 0
-
-    green_b   = [False] * n
-    red_b     = [False] * n
-    upper_lvl = [None]  * n
-    lower_lvl = [None]  * n
-
-    # Touch tracking (resets each time a new pivot low forms a new lower TL)
-    touches_count   = 0
-    touches_pre_arr = [0] * n     # touches accumulated BEFORE bar i's contribution
-
-    for i in range(n):
-        slope = slopes[i]
-        ph    = ph_event[i]
-        pl    = pl_event[i]
-
-        if ph is not None: slope_ph = slope
-        if pl is not None: slope_pl = slope
-
-        if ph is not None:
-            upper = ph
-        elif upper is not None:
-            upper = upper - slope_ph
-
-        if pl is not None:
-            lower = pl
-            touches_count = 0           # new trendline → reset touch validation
-        elif lower is not None:
-            lower = lower + slope_pl
-
-        if ph is not None:
-            last_ph = ph
-            last_ph_idx = i - length     # actual swing bar (confirmation is `length` bars later)
-        if pl is not None:
-            last_pl = pl
-            last_pl_idx = i - length     # actual swing bar (confirmation is `length` bars later)
-
-        prev_upos, prev_dnos = upos, dnos
-        c = closes[i]
-
-        if upper is not None:
-            if ph is not None:
-                upos = 0
-            elif c > upper - slope_ph * length:
-                upos = 1
-
-        if lower is not None:
-            if pl is not None:
-                dnos = 0
-            elif c < lower + slope_pl * length:
-                dnos = 1
-
-        green_b[i] = upos > prev_upos
-        red_b[i]   = dnos > prev_dnos
-
-        if upper is not None: upper_lvl[i] = upper - slope_ph * length
-        if lower is not None: lower_lvl[i] = lower + slope_pl * length
-
-        # Snapshot touches BEFORE this bar's potential contribution
-        touches_pre_arr[i] = touches_count
-
-        # Detect touch on THIS bar: low approached the line, close held above
-        if lower_lvl[i] is not None:
-            approached = lows[i] <= lower_lvl[i] * (1 + TOUCH_TOLERANCE_PCT / 100)
-            held       = c > lower_lvl[i]
-            if approached and held:
-                touches_count += 1
-
-    return {
-        "opens":     opens,
-        "highs":     highs,
-        "lows":      lows,
-        "closes":    closes,
-        "volumes":   volumes,
-        "green_b":   green_b,
-        "red_b":     red_b,
-        "upper_lvl": upper_lvl,
-        "lower_lvl": lower_lvl,
-        "last_ph":     last_ph,
-        "last_pl":     last_pl,
-        "last_ph_idx": last_ph_idx,
-        "last_pl_idx": last_pl_idx,
-        "lower_now":   lower,            # running anchor (pivot value + slope × bars_since)
-        "slope_pl_now": slope_pl,        # current per-bar slope
-        "touches_pre_arr": touches_pre_arr,
-    }
 
 
 # =====================================================
@@ -592,9 +524,33 @@ def has_open_order(symbol):
             if o.get("pair") == pair:
                 return True
         return False
+
     except Exception as e:
         print(f"has_open_order error ({symbol}):", e)
         return False
+
+
+def extract_tp_sl(obj):
+    """Pull (tp, sl) out of a CoinDCX position/order dict."""
+    if not isinstance(obj, dict):
+        return None, None
+    tp_keys = ["take_profit_price", "take_profit_trigger", "tp_price"]
+    sl_keys = ["stop_loss_price", "stop_loss_trigger", "sl_price"]
+
+    def _pick(keys):
+        for k in keys:
+            v = obj.get(k)
+            if v is None or v == "" or v == "0" or v == 0:
+                continue
+            try:
+                fv = float(v)
+                if fv > 0:
+                    return fv
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    return _pick(tp_keys), _pick(sl_keys)
 
 
 # =====================================================
@@ -635,24 +591,13 @@ def compute_qty(entry_price, symbol):
 # PLACE SHORT ORDER
 # =====================================================
 
-def place_short_order(symbol, entry_price, tp_price, sl_price, precision, entry_path, trigger_details=None):
+def place_short_order(symbol, entry_price, tp_price, sl_price, precision, entry_path, signal_info=None):
     entry = round(entry_price, precision)
     tp    = round(tp_price,    precision)
     sl    = round(sl_price,    precision)
 
-    if sl <= entry:
-        print(f"[SKIP] {symbol} [{entry_path}] SL {sl} not above entry {entry}")
-        send_telegram(
-            f"⚠️ <b>SHORT SKIPPED — {symbol}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"❌ Reason : <code>SL {sl} not above entry {entry}</code>"
-        )
-        return False
-    if tp >= entry:
-        print(f"[SKIP] {symbol} [{entry_path}] TP {tp} not below entry {entry}")
-        return False
-
     qty = compute_qty(entry_price, symbol)
+
     tp_pct_display = round(((entry - tp) / entry) * 100, 2) if entry else 0
     sl_pct_display = round(((sl - entry) / entry) * 100, 2) if entry else 0
 
@@ -674,11 +619,14 @@ def place_short_order(symbol, entry_price, tp_price, sl_price, precision, entry_
             "stop_loss_price":   sl,
         },
     }
+
     payload, headers = sign_request(body)
     try:
         response = requests.post(
             BASE_URL + "/exchange/v1/derivatives/futures/orders/create",
-            data=payload, headers=headers, timeout=REQUEST_TIMEOUT,
+            data=payload,
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
         )
         result = response.json()
     except Exception as e:
@@ -700,62 +648,128 @@ def place_short_order(symbol, entry_price, tp_price, sl_price, precision, entry_
         )
         return False
 
-    msg = (
+    sig_block = ""
+    if signal_info:
+        if entry_path == "tl_retest":
+            sig_block = (
+                f"\n━━━━━━━━━━━━━━━━━━\n"
+                f"<b>📊 Retest signal:</b>\n"
+                f"📍 c15        : <code>{signal_info.get('c15')}</code>\n"
+                f"⏫ high15     : <code>{signal_info.get('h15')}</code>\n"
+                f"📉 lowerLvl   : <code>{signal_info.get('lower_lvl')}</code>\n"
+                f"🔴 lastPH     : <code>{signal_info.get('last_ph')}</code>\n"
+                f"🟢 lastPL     : <code>{signal_info.get('last_pl')}</code>\n"
+                f"🪢 Touches    : <code>{signal_info.get('touches_below')}</code> (≥ {MIN_TL_TOUCHES})\n"
+                f"🧱 armed @TL  : <code>{signal_info.get('armed_lower_lvl')}</code>\n"
+                f"⏳ bars armed : <code>{signal_info.get('bars_armed')}</code> / {RETEST_MAX_BARS}\n"
+                f"<b>✅ Retest conditions:</b>\n"
+                f"• wick touched line : <code>True</code> "
+                f"(high {signal_info.get('h15')} within ±{RETEST_TOUCH_PCT}% of lowerLvl)\n"
+                f"• close below line  : <code>True</code> "
+                f"(c15 {signal_info.get('c15')} &lt; lowerLvl)\n"
+                f"• bearish bar       : <code>True</code> "
+                f"(c15 &lt; o15)\n"
+                f"• body strong       : <code>True</code> "
+                f"(body={signal_info.get('body_pct')}% ≥ {RETEST_MIN_BODY_PCT}%)\n"
+                f"• cooldown          : <code>True</code> "
+                f"({signal_info.get('bars_since_last')} bars, need ≥{COOLDOWN_BARS})"
+            )
+        else:
+            # tl_break
+            sig_block = (
+                f"\n━━━━━━━━━━━━━━━━━━\n"
+                f"<b>📊 Signal that fired:</b>\n"
+                f"📍 c15        : <code>{signal_info.get('c15')}</code>\n"
+                f"⏪ prev_c15   : <code>{signal_info.get('prev_c15')}</code>\n"
+                f"📉 lowerLvl   : <code>{signal_info.get('lower_lvl')}</code>\n"
+                f"🔴 lastPH     : <code>{signal_info.get('last_ph')}</code>\n"
+                f"🟢 lastPL     : <code>{signal_info.get('last_pl')}</code>\n"
+                f"🪢 Touches    : <code>{signal_info.get('touches_below')}</code> (≥ {MIN_TL_TOUCHES})\n"
+                f"<b>✅ Filters passed:</b>\n"
+                f"• fresh cross : <code>True</code> "
+                f"(prev≥{signal_info.get('lower_lvl')} &amp; c15&lt;{signal_info.get('lower_lvl')})\n"
+                f"• body break  : <code>True</code> "
+                f"(max(o,c)={signal_info.get('max_oc')} &lt; lowerLvl)\n"
+                f"• strong bar  : <code>True</code> "
+                f"(body={signal_info.get('body_pct')}% ≥ {signal_info.get('min_body_pct')}%)\n"
+                f"• volume      : <code>True</code> "
+                f"(vol={signal_info.get('vol')} &gt; SMA20×{signal_info.get('vol_mult')}={signal_info.get('vol_threshold')})\n"
+                f"• ATR distance: <code>True</code> "
+                f"(c15 &lt; lowerLvl − {signal_info.get('atr_mult')}×ATR = {signal_info.get('atr_threshold')})\n"
+                f"• cooldown    : <code>True</code> "
+                f"({signal_info.get('bars_since_last')} bars since last entry, need ≥{signal_info.get('cooldown_bars')})"
+            )
+
+    send_telegram(
         f"🔴 <b>NEW SHORT ({entry_path.upper()}) — {symbol}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"📍 Entry  : <code>{entry}</code>\n"
-        f"🎯 TP     : <code>{tp}</code>  (-{tp_pct_display}%)\n"
-        f"🛑 SL     : <code>{sl}</code>  (+{sl_pct_display}%)\n"
-        f"📦 Qty    : <code>{qty}</code>\n"
-        f"💰 Margin : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
+        f"📍 Entry   : <code>{entry}</code>\n"
+        f"🎯 TP      : <code>{tp}</code>  (-{tp_pct_display}%)\n"
+        f"🛑 SL      : <code>{sl}</code>  (+{sl_pct_display}%)\n"
+        f"📦 Qty     : <code>{qty}</code>\n"
+        f"💰 Margin  : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
+        f"{sig_block}"
     )
-    if trigger_details:
-        msg += f"\n━━━━━━━━━━━━━━━━━━\n🧠 <b>Trigger conditions ({entry_path})</b>"
-        for label, value in trigger_details:
-            msg += f"\n{label} : <code>{value}</code>"
-    send_telegram(msg)
     return True
 
 
 # =====================================================
-# MAIN PER-SYMBOL LOGIC
+# MAIN PER-SYMBOL LOGIC  (Trendline Break — SHORT only)
 # =====================================================
 
 def check_and_trade(symbol, row, df, all_state):
-    candles = fetch_candles(symbol, TL_CANDLES_NEEDED)
+    # ─── Fetch 1h for trendline ──────────────────────────────
+    candles_1h = fetch_candles(symbol, TL_CANDLES_1H, RESOLUTION_PRIMARY, CANDLE_SECONDS)
+    min_1h_needed = SWING_LOOKBACK * 2 + ATR_PERIOD_TL + 5
 
-    if len(candles) < TL_LENGTH * 3 + 5:
-        print(f"[SKIP] {symbol} — insufficient candles ({len(candles)})")
+    if len(candles_1h) < min_1h_needed:
+        print(f"[SKIP] {symbol} — insufficient 1h candles ({len(candles_1h)})")
         return
 
-    # Drop in-progress 4h bar
-    if len(candles) >= 2:
-        now_ms = int(time.time() * 1000)
-        last_candle_time = int(candles[-1]["time"])
-        bar_elapsed_ms = now_ms - last_candle_time
-        if bar_elapsed_ms < CANDLE_SECONDS * 1000:
-            candles = candles[:-1]
-
-    if len(candles) < TL_LENGTH * 3 + 5:
-        print(f"[SKIP] {symbol} — insufficient closed candles ({len(candles)})")
+    # Drop in-progress 1h bar
+    now_ms = int(time.time() * 1000)
+    if len(candles_1h) >= 1 and (now_ms - int(candles_1h[-1]["time"])) < CANDLE_SECONDS * 1000:
+        candles_1h = candles_1h[:-1]
+    if len(candles_1h) < min_1h_needed:
+        print(f"[SKIP] {symbol} — insufficient closed 1h candles ({len(candles_1h)})")
         return
 
-    precision  = get_precision(candles[-1]["close"])
-    last_close = float(candles[-1]["close"])
-    last_ts    = int(candles[-1]["time"])
+    highs_1h  = [float(c["high"])  for c in candles_1h]
+    lows_1h   = [float(c["low"])   for c in candles_1h]
+    closes_1h = [float(c["close"]) for c in candles_1h]
+    opens_1h  = [float(c["open"])  for c in candles_1h]
 
+    tl = compute_trendlines(opens_1h, highs_1h, lows_1h, closes_1h, SWING_LOOKBACK, SLOPE_MULT)
+    lower_lvl     = tl["lower_lvl"]
+    last_ph       = tl["last_ph"]
+    last_pl       = tl["last_pl"]
+    touches_below = tl["touches_below"]
+
+    if lower_lvl is None or last_ph is None or last_pl is None:
+        print(f"[SKIP] {symbol} — trendline / pivots not ready yet")
+        return
+
+    precision     = get_precision(candles_1h[-1]["close"])
+    last_close_1h = closes_1h[-1]
+
+    # Per-symbol state
     st = all_state.get(symbol)
     if st is None:
         st = init_symbol_state()
         all_state[symbol] = st
 
+    # Backfill any missing fields for older state files
+    for k, v in init_symbol_state().items():
+        if k not in st:
+            st[k] = v
+
     # =========================================================================
-    # TP COMPLETED MONITORING
+    # TP COMPLETED MONITORING (SHORT: TP is BELOW entry, so check for new lows)
     # =========================================================================
     tp_raw = df.iloc[row, 1] if df.shape[1] > 1 else ""
 
     if str(tp_raw).strip().upper() == "TP COMPLETED":
-        print(f"[SKIP] {symbol} — TP COMPLETED marker, not re-entering")
+        print(f"[SKIP] {symbol} — TP COMPLETED marker in sheet, not re-entering")
         save_state(all_state)
         return
 
@@ -765,13 +779,22 @@ def check_and_trade(symbol, row, df, all_state):
         tp_stored = None
 
     if tp_stored is not None and tp_stored > 0:
-        tp_hit, hit_kind, hit_price = False, None, None
-        if last_close <= tp_stored:
-            tp_hit, hit_kind, hit_price = True, "close", last_close
+        tp_hit = False
+        hit_kind = None
+        hit_price = None
+
+        if last_close_1h <= tp_stored:
+            tp_hit    = True
+            hit_kind  = "close"
+            hit_price = last_close_1h
+
         if not tp_hit:
             recent_low = get_recent_low(symbol)
             if recent_low is not None and recent_low <= tp_stored:
-                tp_hit, hit_kind, hit_price = True, "wick", recent_low
+                tp_hit    = True
+                hit_kind  = "wick"
+                hit_price = recent_low
+
         if tp_hit:
             update_sheet_tp(row, "TP COMPLETED")
             print(f"[TP HIT] {symbol} — {hit_kind} {hit_price} ≤ stored TP {tp_stored}")
@@ -780,10 +803,12 @@ def check_and_trade(symbol, row, df, all_state):
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f"📍 {hit_kind.capitalize():8}: <code>{hit_price}</code>\n"
                 f"🎯 TP       : <code>{tp_stored}</code>\n"
-                f"✅ Marked <b>TP COMPLETED</b>"
+                f"✅ Marked <b>TP COMPLETED</b> — no further entries on this coin"
             )
             if st.get("in_position"):
+                prev_last_entry = st.get("last_entry_ts", 0)
                 all_state[symbol] = init_symbol_state()
+                all_state[symbol]["last_entry_ts"] = prev_last_entry
             save_state(all_state)
             return
 
@@ -794,11 +819,25 @@ def check_and_trade(symbol, row, df, all_state):
 
     if position is not None:
         if not st.get("in_position"):
-            entry_px = float(position.get("avg_price") or position.get("entry_price") or last_close)
+            entry_px = float(position.get("avg_price") or position.get("entry_price") or last_close_1h)
             st["in_position"] = True
-            st["entry_path"]  = st.get("entry_path") or "unknown"
+            st["entry_path"]  = st.get("entry_path") or "tl_break"
             st["entry_price"] = entry_px
             print(f"[RECONCILE] {symbol} — reconstructed state from exchange position")
+
+        tp_pos, sl_pos = extract_tp_sl(position)
+        if st.get("tp_level") is None and tp_pos is not None:
+            st["tp_level"] = round(tp_pos, precision)
+        if st.get("sl_price") is None and sl_pos is not None:
+            st["sl_price"] = round(sl_pos, precision)
+
+        b_val = str(df.iloc[row, 1]).strip() if df.shape[1] > 1 else ""
+        c_val = str(df.iloc[row, 2]).strip() if df.shape[1] > 2 else ""
+        if st.get("tp_level") is not None and b_val == "":
+            update_sheet_tp(row, st["tp_level"])
+        if st.get("sl_price") is not None and c_val == "":
+            update_sheet_sl(row, st["sl_price"])
+
         save_state(all_state)
         return
 
@@ -807,14 +846,14 @@ def check_and_trade(symbol, row, df, all_state):
         send_telegram(
             f"✅ <b>POSITION CLOSED — {symbol}</b>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"🛤 Path   : <code>{st.get('entry_path')}</code>\n"
-            f"📍 Entry  : <code>{st.get('entry_price')}</code>\n"
-            f"🎯 TP was : <code>{st.get('tp_level')}</code>\n"
-            f"🛑 SL was : <code>{st.get('sl_price')}</code>"
+            f"🛤 Path     : <code>{st.get('entry_path')}</code>\n"
+            f"📍 Entry    : <code>{st.get('entry_price')}</code>\n"
+            f"🎯 TP was   : <code>{st.get('tp_level')}</code>\n"
+            f"🛑 SL was   : <code>{st.get('sl_price')}</code>"
         )
-        last_sig = st.get("tl_last_signal_ts")          # preserve cooldown anchor
+        prev_last_entry = st.get("last_entry_ts", 0)
         all_state[symbol] = init_symbol_state()
-        all_state[symbol]["tl_last_signal_ts"] = last_sig
+        all_state[symbol]["last_entry_ts"] = prev_last_entry
         st = all_state[symbol]
         save_state(all_state)
 
@@ -823,297 +862,267 @@ def check_and_trade(symbol, row, df, all_state):
         return
 
     # =========================================================================
-    # COMPUTE TRENDLINE STATE
+    # FETCH 15m FOR ENTRY CONFIRMATION
     # =========================================================================
-    state = compute_trendline_state(candles)
-    if state is None:
-        print(f"[SKIP] {symbol} — trendline state not ready")
+    candles_15m = fetch_candles(symbol, ENTRY_CANDLES, RESOLUTION_ENTRY, ENTRY_CANDLE_SECONDS)
+    min_15m_needed = max(VOL_SMA_PERIOD, ATR_PERIOD_15M) + 5
+
+    if len(candles_15m) < min_15m_needed:
+        print(f"[SKIP] {symbol} — insufficient 15m candles ({len(candles_15m)})")
         return
 
-    i         = len(candles) - 1
-    red_b     = state["red_b"][i]
-    lower_lvl = state["lower_lvl"][i]
-    last_ph   = state["last_ph"]
-    last_pl   = state["last_pl"]
-
-    # ── Build "TL anchor" descriptor ──────────────────────────────────────────
-    # Shows which pivot low is anchoring the lower trendline at this bar, the
-    # slope being applied, and how many bars of decay have accumulated.
-    last_pl_idx  = state["last_pl_idx"]
-    slope_pl_now = state["slope_pl_now"]
-    if last_pl_idx is not None and last_pl is not None:
-        bars_since_pl = i - last_pl_idx
-        pl_ts_ms      = int(candles[last_pl_idx]["time"])
-        # CoinDCX returns ms timestamps; hours since pivot:
-        pl_age_hours  = (last_ts - pl_ts_ms) / 1000 / 3600
-        decay         = slope_pl_now * bars_since_pl
-        tl_anchor_str = (
-            f"PL {round(last_pl, precision)} @ -{bars_since_pl}b "
-            f"(~{int(pl_age_hours)}h ago) + slope {slope_pl_now:.2e}/bar × "
-            f"{bars_since_pl}b = decay {round(decay, precision)} → lowerLvl {round(lower_lvl, precision)}"
-        )
-    else:
-        tl_anchor_str = "n/a (no confirmed pivot low yet)"
-
-    # =========================================================================
-    # ENTRY EVALUATION — three independent paths
-    #
-    #   Path 0  ("tl_break")  — redB this bar  AND  ALL filters pass
-    #                           (body break, strong bar, volume, ATR distance)
-    #   Path A  ("tl_retest") — armed by an earlier redB whose filters failed;
-    #                           fires when a later bar's high retests lowerLvl
-    #                           from below and closes back beneath it.
-    #                           Filters are NOT required.
-    #   Path B  ("tl_accept") — independent of Path 0 / A. Tracks consecutive
-    #                           closes below lowerLvl; once the count reaches
-    #                           PATH_B_ACCEPTANCE_BARS, fires on the first
-    #                           bearish bar (close < open) below the line.
-    #                           Filters are NOT required.
-    #
-    # Cooldown applies globally. SL / TP geometry is identical across paths
-    # (entry = close, SL = lowerLvl × (1+SL_BUFFER_TL_PCT%), TP = entry × (1−TP_PCT_FIXED%)).
-    # =========================================================================
-    if lower_lvl is None or last_ph is None:
-        print(
-            f"[SCAN] {symbol} | close={last_close} | trendline state incomplete "
-            f"(lowerLvl={lower_lvl}, lastPH={last_ph})"
-        )
-        save_state(all_state)
+    if len(candles_15m) >= 1 and (now_ms - int(candles_15m[-1]["time"])) < ENTRY_CANDLE_SECONDS * 1000:
+        candles_15m = candles_15m[:-1]
+    if len(candles_15m) < min_15m_needed:
         return
 
-    last_open   = state["opens"][i]
-    last_high   = state["highs"][i]
-    last_low    = state["lows"][i]
-    last_volume = state["volumes"][i]
+    last15 = candles_15m[-1]
+    prev15 = candles_15m[-2]
 
-    # ── Cooldown gate (shared across all paths) ──────────────────────────────
-    last_sig_ts = st.get("tl_last_signal_ts")
-    if not TL_USE_COOLDOWN or last_sig_ts is None:
-        f_cooldown      = True
-        bars_since_disp = "∞"
-    else:
-        bars_since      = max(0, (last_ts - last_sig_ts) // (CANDLE_SECONDS * 1000))
-        f_cooldown      = bars_since >= TL_COOLDOWN_BARS
-        bars_since_disp = int(bars_since)
+    o15 = float(last15["open"])
+    h15 = float(last15["high"])
+    l15 = float(last15["low"])
+    c15 = float(last15["close"])
+    v15 = float(last15.get("volume", 0))
+    ts15 = int(last15["time"])
+    prev_c15 = float(prev15["close"])
 
-    # ── Filters — ONLY used by Path 0 (core break) ──────────────────────────
-    body_break_dn = max(last_open, last_close) < lower_lvl
-    f_body = (not TL_USE_BODY_BREAK) or body_break_dn
-
-    bar_range = last_high - last_low
-    bar_body  = abs(last_close - last_open)
+    # ─── 15m filter calcs ────────────────────────────────────
+    bar_range = h15 - l15
+    bar_body  = abs(c15 - o15)
     body_pct  = (bar_body / bar_range * 100) if bar_range > 0 else 0
-    f_strong  = (not TL_USE_STRONG_BAR) or body_pct >= TL_MIN_BODY_PCT
 
-    vol_sma = calc_sma(state["volumes"], 20)
-    f_vol   = (not TL_USE_VOLUME) or (vol_sma[i] is not None and last_volume > vol_sma[i] * TL_VOL_MULT)
+    vols = [float(c.get("volume", 0)) for c in candles_15m[-VOL_SMA_PERIOD:]]
+    vol_sma = sum(vols) / len(vols) if vols else 0
 
-    tr     = calc_true_range(state["highs"], state["lows"], state["closes"])
-    atr14  = calc_rma(tr, 14)
-    f_atr  = (not TL_USE_ATR_DIST) or (atr14[i] is not None and last_close < lower_lvl - atr14[i] * TL_ATR_MULT)
+    highs_15m  = [float(c["high"])  for c in candles_15m]
+    lows_15m   = [float(c["low"])   for c in candles_15m]
+    closes_15m = [float(c["close"]) for c in candles_15m]
+    atr_arr_15 = compute_atr(highs_15m, lows_15m, closes_15m, ATR_PERIOD_15M)
+    atr_15 = atr_arr_15[-1] if atr_arr_15[-1] is not None else 0
 
-    filters_pass = f_body and f_strong and f_vol and f_atr
+    # ─── Filter conditions (tl_break path — SHORT mirror) ───
+    fresh_cross = (c15 < lower_lvl) and (prev_c15 >= lower_lvl)        # first cross-down
+    body_break  = (not USE_BODY_BREAK) or (max(o15, c15) < lower_lvl)  # body fully below
+    strong_bar  = (not USE_STRONG_BAR) or (body_pct >= MIN_BODY_PCT)
+    vol_ok      = (not USE_VOLUME)     or (v15 > vol_sma * VOL_MULT)
+    atr_ok      = (not USE_ATR_DIST)   or (c15 < lower_lvl - atr_15 * ATR_MULT)
 
-    # ── Path 0 candidate ─────────────────────────────────────────────────────
-    core_sig = red_b and filters_pass
+    last_entry_ts = st.get("last_entry_ts", 0) or 0
+    if USE_COOLDOWN and last_entry_ts > 0:
+        bars_since  = (ts15 - last_entry_ts) // (ENTRY_CANDLE_SECONDS * 1000)
+        cooldown_ok = bars_since >= COOLDOWN_BARS
+    else:
+        cooldown_ok = True
 
-    # ── Path A candidate (retest) — NO filters ───────────────────────────────
-    path_a_armed     = st.get("path_a_armed", False)
-    path_a_bars      = st.get("path_a_bars_armed", 0)
-    retest_floor     = lower_lvl * (1 - PATH_A_RETEST_TOLERANCE_PCT / 100.0)
-    retested         = last_high >= retest_floor                # high climbed back near/over line
-    closed_below_tl  = last_close < lower_lvl                   # rejected back beneath it
-    retest_sig       = PATH_A_ENABLED and path_a_armed and retested and closed_below_tl
-
-    # ── Path B candidate (acceptance) — NO filters ───────────────────────────
-    # Strictly post-break: the redB bar itself routes to Path 0 (if filters pass)
-    # or to Path A arming (if filters fail), never to Path B.
-    prev_consec_b = st.get("path_b_consecutive_below", 0)
-    new_consec_b  = prev_consec_b + 1 if closed_below_tl else 0
-    accept_sig    = (PATH_B_ENABLED
-                     and not red_b
-                     and new_consec_b >= PATH_B_ACCEPTANCE_BARS
-                     and last_close < last_open)                # bearish continuation bar
-
-    # ── Trendline validation gate (must be touched ≥ N times) ────────────────
-    touches_pre = state["touches_pre_arr"][i]
-    touches_ok  = touches_pre >= MIN_TOUCHES_REQUIRED
-
-    # ── Pick the first path that fires ───────────────────────────────────────
-    chosen, trigger_details = None, None
-    if f_cooldown and touches_ok:
-        if core_sig:
-            chosen = "tl_break"
-        elif retest_sig:
-            chosen = "tl_retest"
-        elif accept_sig:
-            chosen = "tl_accept"
+    short_sig = (
+        fresh_cross and body_break and strong_bar and vol_ok and atr_ok
+        and cooldown_ok and (touches_below >= MIN_TL_TOUCHES)
+    )
 
     print(
-        f"[TL-EVAL] {symbol} | redB={red_b} filters={filters_pass} "
-        f"(body={f_body} strong={f_strong}({round(body_pct,1)}%) vol={f_vol} atr={f_atr}) | "
-        f"Path A armed={path_a_armed}({path_a_bars}b) retest={retest_sig} | "
-        f"Path B count={new_consec_b}/{PATH_B_ACCEPTANCE_BARS} accept={accept_sig} | "
-        f"cool={f_cooldown}({bars_since_disp}b) touches={touches_pre}/{MIN_TOUCHES_REQUIRED}({touches_ok}) → chosen={chosen} | "
-        f"lowerLvl={round(lower_lvl, precision)} lastPH={round(last_ph, precision)}"
+        f"[SCAN] {symbol} | c15={c15} prev_c15={prev_c15} | "
+        f"lowerLvl={round(lower_lvl, precision)} lastPL={round(last_pl, precision)} "
+        f"lastPH={round(last_ph, precision)} touches={touches_below}/{MIN_TL_TOUCHES} | "
+        f"fresh={fresh_cross} body={body_break} "
+        f"strong={strong_bar}({round(body_pct, 1)}%) "
+        f"vol={vol_ok}({round(v15, 2)} vs {round(vol_sma * VOL_MULT, 2)}) "
+        f"atr={atr_ok} cd={cooldown_ok}"
     )
 
     # =========================================================================
-    # ENTRY (if a path was chosen)
+    # RETEST PATH — arm / evaluate / cancel
     # =========================================================================
-    if chosen is not None:
-        entry_price = last_close
-        sl_price    = lower_lvl * (1 + SL_BUFFER_TL_PCT / 100)
-        tp_price    = entry_price * (1 - TP_PCT_FIXED / 100)
-        risk        = sl_price - entry_price
+    retest_sig         = False
+    retest_signal_info = None
 
-        if risk <= 0:
-            print(
-                f"[SKIP] {symbol} [{chosen}] invalid risk: SL {round(sl_price, precision)} "
-                f"≤ entry {round(entry_price, precision)} (lowerLvl too close / below entry)"
+    if USE_RETEST_PATH:
+        # ARM: fresh cross-down fired but main short_sig didn't go through
+        if fresh_cross and not short_sig and touches_below >= MIN_TL_TOUCHES:
+            st["retest_armed"]      = True
+            st["retest_armed_ts"]   = ts15
+            st["retest_lower_lvl"]  = lower_lvl
+            st["retest_last_pl"]    = last_pl
+            print(f"[RETEST-ARM] {symbol} — armed at lowerLvl={round(lower_lvl, precision)} "
+                  f"touches={touches_below} "
+                  f"(filters that blocked main: body={body_break} strong={strong_bar} "
+                  f"vol={vol_ok} atr={atr_ok} cd={cooldown_ok})")
+            send_telegram(
+                f"🟠 <b>RETEST ARMED — {symbol}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"📍 c15        : <code>{round(c15, precision)}</code>\n"
+                f"📉 lowerLvl   : <code>{round(lower_lvl, precision)}</code>\n"
+                f"🔴 lastPH     : <code>{round(last_ph, precision)}</code>\n"
+                f"🟢 lastPL     : <code>{round(last_pl, precision)}</code>\n"
+                f"🪢 Touches    : <code>{touches_below}</code> (≥ {MIN_TL_TOUCHES})\n"
+                f"⏳ Waiting up to {RETEST_MAX_BARS} × 15m bars for pullback-rejection"
             )
-        else:
-            sl_distance_pct = (sl_price - entry_price) / entry_price * 100
+        elif fresh_cross and not short_sig and touches_below < MIN_TL_TOUCHES:
+            print(f"[RETEST-NO-ARM] {symbol} — fresh cross but only {touches_below}/{MIN_TL_TOUCHES} touches, "
+                  f"trendline not tested enough")
 
-            # ── Risk sanity gate ────────────────────────────────────────────
-            # Skip if SL is too far above entry (RR becomes terrible with the
-            # fixed 3% TP). Disarm the path that produced the bad geometry so
-            # we don't retry the same setup every bar.
-            if sl_distance_pct > MAX_SL_DISTANCE_PCT:
-                reason = f"SL distance {sl_distance_pct:.2f}% &gt; cap {MAX_SL_DISTANCE_PCT}%"
-                print(
-                    f"[SKIP-RISK] {symbol} [{chosen}] {reason} | "
-                    f"entry={round(entry_price, precision)} sl={round(sl_price, precision)} "
-                    f"tp={round(tp_price, precision)} lastPH={round(last_ph, precision)}"
-                )
-                send_telegram(
-                    f"⏭️ <b>SHORT SKIPPED — {symbol}</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"🛤 Path        : <code>{chosen}</code>\n"
-                    f"📍 Entry       : <code>{round(entry_price, precision)}</code>\n"
-                    f"🛑 SL          : <code>{round(sl_price, precision)}</code>  "
-                    f"(+{sl_distance_pct:.2f}%)\n"
-                    f"🎯 TP would be : <code>{round(tp_price, precision)}</code>\n"
-                    f"🔺 lastPH      : <code>{round(last_ph, precision)}</code>\n"
-                    f"❌ Reason      : <code>{reason}</code>"
-                )
-                # Disarm the offending path so we don't retry the same setup
-                if chosen == "tl_retest":
-                    st["path_a_armed"]      = False
-                    st["path_a_arm_ts"]     = None
-                    st["path_a_bars_armed"] = 0
-                elif chosen == "tl_accept":
-                    st["path_b_consecutive_below"] = 0
-                # (For tl_break we don't disarm anything — the next redB with a
-                # fresher lastPH may produce a tradeable setup.)
-                save_state(all_state)
-                return
+        # EVALUATE: if armed, check for entry conditions on this 15m bar
+        if st.get("retest_armed"):
+            armed_ts  = st.get("retest_armed_ts", 0)
+            armed_lvl = st.get("retest_lower_lvl")
 
-            # Race-condition guards
-            if get_position_by_pair(symbol) is not None:
-                print(f"[ABORT] {symbol} — position appeared just before placement")
-                return
-            if has_open_order(symbol):
-                print(f"[ABORT] {symbol} — order appeared just before placement")
-                return
+            if armed_ts and armed_lvl:
+                bars_armed = max(0, (ts15 - armed_ts) // (ENTRY_CANDLE_SECONDS * 1000))
 
-            # Build path-specific trigger details for telegram
-            if chosen == "tl_break":
-                vol_thresh = (vol_sma[i] * TL_VOL_MULT) if vol_sma[i] is not None else None
-                atr_thresh = (lower_lvl - atr14[i] * TL_ATR_MULT) if atr14[i] is not None else None
-                trigger_details = [
-                    ("📉 redB",         "True"),
-                    ("🧱 lowerLvl",     round(lower_lvl, precision)),
-                    ("🔺 lastPH",       round(last_ph, precision)),
-                    ("🪜 TL anchor",    tl_anchor_str),
-                    ("👆 TL touches",   f"{touches_pre} prior touches (≥{MIN_TOUCHES_REQUIRED} required)"),
-                    ("🪵 Body break",   f"{f_body}  (max(o,c)={round(max(last_open,last_close), precision)} &lt; lowerLvl)"),
-                    ("💪 Strong bar",   f"{f_strong}  (body {round(body_pct,1)}% ≥ {TL_MIN_BODY_PCT}%)"),
-                    ("📊 Volume",       f"{f_vol}  (vol={round(last_volume,2)} vs SMA20×{TL_VOL_MULT}={round(vol_thresh,2) if vol_thresh else 'N/A'})"),
-                    ("📐 ATR distance", f"{f_atr}  (close &lt; lowerLvl − ATR14×{TL_ATR_MULT} = {round(atr_thresh, precision) if atr_thresh else 'N/A'})"),
-                    ("⏳ Cooldown",     f"{f_cooldown}  ({bars_since_disp} bars since last entry, need ≥{TL_COOLDOWN_BARS})"),
-                    ("⚖️ Risk",         f"SL +{sl_distance_pct:.2f}% / TP −{TP_PCT_FIXED}% (RR {TP_PCT_FIXED/sl_distance_pct:.2f}×)"),
-                ]
-            elif chosen == "tl_retest":
-                trigger_details = [
-                    ("🧱 lowerLvl",        round(lower_lvl, precision)),
-                    ("🔺 lastPH",          round(last_ph, precision)),
-                    ("🪜 TL anchor",       tl_anchor_str),
-                    ("👆 TL touches",      f"{touches_pre} prior touches (≥{MIN_TOUCHES_REQUIRED} required)"),
-                    ("⏱ Bars armed",      f"{path_a_bars} of {PATH_A_MAX_WAIT_BARS}"),
-                    ("📍 Retest high",     f"{round(last_high, precision)}  (floor {round(retest_floor, precision)}, tol ±{PATH_A_RETEST_TOLERANCE_PCT}%)"),
-                    ("📉 Closed below TL", f"{round(last_close, precision)} &lt; {round(lower_lvl, precision)}"),
-                    ("🚫 Filters",         "skipped (Path A independent)"),
-                    ("⏳ Cooldown",         f"{f_cooldown}  ({bars_since_disp} bars since last entry, need ≥{TL_COOLDOWN_BARS})"),
-                    ("⚖️ Risk",            f"SL +{sl_distance_pct:.2f}% / TP −{TP_PCT_FIXED}% (RR {TP_PCT_FIXED/sl_distance_pct:.2f}×)"),
-                ]
-            else:  # tl_accept
-                trigger_details = [
-                    ("🧱 lowerLvl",         round(lower_lvl, precision)),
-                    ("🔺 lastPH",           round(last_ph, precision)),
-                    ("🪜 TL anchor",        tl_anchor_str),
-                    ("👆 TL touches",       f"{touches_pre} prior touches (≥{MIN_TOUCHES_REQUIRED} required)"),
-                    ("📊 Consec. below TL", f"{new_consec_b}  (≥ {PATH_B_ACCEPTANCE_BARS})"),
-                    ("🕯 Bearish bar",      f"close {round(last_close, precision)} &lt; open {round(last_open, precision)}"),
-                    ("🚫 Filters",          "skipped (Path B independent)"),
-                    ("⏳ Cooldown",          f"{f_cooldown}  ({bars_since_disp} bars since last entry, need ≥{TL_COOLDOWN_BARS})"),
-                    ("⚖️ Risk",             f"SL +{sl_distance_pct:.2f}% / TP −{TP_PCT_FIXED}% (RR {TP_PCT_FIXED/sl_distance_pct:.2f}×)"),
-                ]
+                # Cancel: timed out
+                if bars_armed > RETEST_MAX_BARS:
+                    print(f"[RETEST-CANCEL] {symbol} — timed out after {bars_armed} bars")
+                    send_telegram(
+                        f"⌛ <b>RETEST EXPIRED — {symbol}</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"⏳ {bars_armed} &gt; {RETEST_MAX_BARS} × 15m bars, no rejection occurred"
+                    )
+                    st["retest_armed"]     = False
+                    st["retest_armed_ts"]  = 0
+                    st["retest_lower_lvl"] = None
+                    st["retest_last_pl"]   = None
 
-            placed = place_short_order(
-                symbol, entry_price, tp_price, sl_price, precision, chosen, trigger_details
-            )
-            if placed:
-                # Cooldown anchor + clear all arm states
-                st["tl_last_signal_ts"]        = last_ts
-                st["path_a_armed"]             = False
-                st["path_a_arm_ts"]            = None
-                st["path_a_bars_armed"]        = 0
-                st["path_b_consecutive_below"] = new_consec_b   # keep accurate; cooldown blocks re-fire
-                # Position state
-                st["in_position"] = True
-                st["entry_path"]  = chosen
-                st["entry_price"] = round(entry_price, precision)
-                st["tp_level"]    = round(tp_price,    precision)
-                st["sl_price"]    = round(sl_price,    precision)
-                update_sheet_tp(row, st["tp_level"])
-                update_sheet_sl(row, st["sl_price"])
-                save_state(all_state)
-                return
+                # Cancel: close rose well above the trendline (line reclaimed)
+                elif c15 > lower_lvl * (1 + RETEST_CANCEL_PCT / 100):
+                    print(f"[RETEST-CANCEL] {symbol} — close {c15} rose &gt;{RETEST_CANCEL_PCT}% "
+                          f"above lowerLvl {round(lower_lvl, precision)} → line reclaimed")
+                    send_telegram(
+                        f"❌ <b>RETEST CANCELLED — {symbol}</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"📍 c15      : <code>{round(c15, precision)}</code>\n"
+                        f"📉 lowerLvl : <code>{round(lower_lvl, precision)}</code>\n"
+                        f"⚠️ Reason   : line reclaimed (close rose &gt;{RETEST_CANCEL_PCT}% above)"
+                    )
+                    st["retest_armed"]     = False
+                    st["retest_armed_ts"]  = 0
+                    st["retest_lower_lvl"] = None
+                    st["retest_last_pl"]   = None
+
+                elif bars_armed < 1:
+                    print(f"[RETEST-WAIT] {symbol} — just armed this bar, "
+                          f"waiting for next 15m bar before checking rejection")
+
+                else:
+                    # TRIGGER conditions:
+                    #   1. wick of this 15m candle came within ±RETEST_TOUCH_PCT of lowerLvl from below
+                    #   2. close is back below lowerLvl
+                    #   3. candle is bearish (c15 < o15)
+                    #   4. body is reasonably strong (≥ RETEST_MIN_BODY_PCT of range)
+                    #   5. cooldown clear
+                    touch_floor = lower_lvl * (1 - RETEST_TOUCH_PCT / 100)
+                    touch_ceil  = lower_lvl * (1 + RETEST_TOUCH_PCT / 100)
+
+                    cond_touch     = touch_floor <= h15 <= touch_ceil
+                    cond_close_dn  = c15 < lower_lvl
+                    cond_bearish   = c15 < o15
+                    cond_body_ok   = body_pct >= RETEST_MIN_BODY_PCT
+                    cond_cd_ok     = cooldown_ok
+                    cond_touches   = touches_below >= MIN_TL_TOUCHES
+
+                    retest_sig = (cond_touch and cond_close_dn and cond_bearish
+                                  and cond_body_ok and cond_cd_ok and cond_touches
+                                  and not short_sig)
+
+                    print(
+                        f"[RETEST-EVAL] {symbol} | armed_lvl={round(armed_lvl, precision)} "
+                        f"lowerLvl={round(lower_lvl, precision)} bars={bars_armed}/{RETEST_MAX_BARS} "
+                        f"touches={touches_below}/{MIN_TL_TOUCHES} | "
+                        f"touch={cond_touch}(h15={h15}) closeDn={cond_close_dn} "
+                        f"bear={cond_bearish} body={cond_body_ok}({round(body_pct, 1)}%) "
+                        f"cd={cond_cd_ok} → retest={retest_sig}"
+                    )
+
+                    if retest_sig:
+                        retest_signal_info = {
+                            "c15":             round(c15, precision),
+                            "h15":             round(h15, precision),
+                            "lower_lvl":       round(lower_lvl, precision),
+                            "armed_lower_lvl": round(armed_lvl, precision),
+                            "last_pl":         round(last_pl, precision),
+                            "last_ph":         round(last_ph, precision),
+                            "body_pct":        round(body_pct, 1),
+                            "bars_armed":      int(bars_armed),
+                            "touches_below":   touches_below,
+                            "bars_since_last": (
+                                (ts15 - last_entry_ts) // (ENTRY_CANDLE_SECONDS * 1000)
+                                if last_entry_ts > 0 else "n/a"
+                            ),
+                        }
 
     # =========================================================================
-    # NO ENTRY — update arm states for next bar
+    # ENTRY DISPATCH — main path takes priority
     # =========================================================================
-    # Path A arming / lifecycle
-    if PATH_A_ENABLED:
-        if red_b and not filters_pass:
-            # New break with failed filters — arm (or re-arm) Path A
-            st["path_a_armed"]      = True
-            st["path_a_arm_ts"]     = last_ts
-            st["path_a_bars_armed"] = 0
-            print(
-                f"[PATH-A] {symbol} — ARMED (redB but filters failed: "
-                f"body={f_body} strong={f_strong} vol={f_vol} atr={f_atr})"
-            )
-        elif st.get("path_a_armed"):
-            st["path_a_bars_armed"] = st.get("path_a_bars_armed", 0) + 1
-            # Invalidation — close reclaimed the trendline
-            if last_close > lower_lvl * (1 + PATH_A_INVALIDATION_PCT / 100):
-                print(
-                    f"[PATH-A] {symbol} — DISARM (close {last_close} reclaimed lowerLvl "
-                    f"{round(lower_lvl, precision)} by >{PATH_A_INVALIDATION_PCT}%)"
-                )
-                st["path_a_armed"]      = False
-                st["path_a_arm_ts"]     = None
-                st["path_a_bars_armed"] = 0
-            elif st["path_a_bars_armed"] >= PATH_A_MAX_WAIT_BARS:
-                print(f"[PATH-A] {symbol} — DISARM (timed out at {PATH_A_MAX_WAIT_BARS} bars)")
-                st["path_a_armed"]      = False
-                st["path_a_arm_ts"]     = None
-                st["path_a_bars_armed"] = 0
+    entry_path = None
+    sig_info   = None
 
-    # Path B counter — always tracked
-    st["path_b_consecutive_below"] = new_consec_b
+    if short_sig:
+        entry_path = "tl_break"
+        bars_since_last = (
+            (ts15 - last_entry_ts) // (ENTRY_CANDLE_SECONDS * 1000)
+            if last_entry_ts > 0 else "n/a"
+        )
+        sig_info = {
+            "c15":             round(c15, precision),
+            "prev_c15":        round(prev_c15, precision),
+            "lower_lvl":       round(lower_lvl, precision),
+            "last_pl":         round(last_pl, precision),
+            "last_ph":         round(last_ph, precision),
+            "max_oc":          round(max(o15, c15), precision),
+            "body_pct":        round(body_pct, 1),
+            "min_body_pct":    MIN_BODY_PCT,
+            "vol":             round(v15, 2),
+            "vol_mult":        VOL_MULT,
+            "vol_threshold":   round(vol_sma * VOL_MULT, 2),
+            "atr_mult":        ATR_MULT,
+            "atr_threshold":   round(lower_lvl - atr_15 * ATR_MULT, precision),
+            "bars_since_last": bars_since_last,
+            "cooldown_bars":   COOLDOWN_BARS,
+            "touches_below":   touches_below,
+        }
+    elif retest_sig:
+        entry_path = "tl_retest"
+        sig_info   = retest_signal_info
+
+    if entry_path is None:
+        save_state(all_state)
+        return
+
+    # ─── Compute SL/TP (same geometry for both paths) ───────
+    # SL = SL_ABOVE_TL_PCT% above the lower trendline (broken support → resistance)
+    # TP = fixed TP_PCT% below entry
+    entry_price = c15
+    sl_price    = lower_lvl * (1 + SL_ABOVE_TL_PCT / 100)
+    tp_price    = entry_price * (1 - TP_PCT / 100)
+    risk        = sl_price - entry_price
+
+    if risk <= 0 or sl_price <= entry_price:
+        print(f"[SKIP] {symbol} — invalid risk (entry {entry_price} ≥ SL {sl_price})")
+        save_state(all_state)
+        return
+
+    # Last-second guards
+    if get_position_by_pair(symbol) is not None:
+        print(f"[ABORT] {symbol} — position appeared just before placement")
+        return
+    if has_open_order(symbol):
+        print(f"[ABORT] {symbol} — order appeared just before placement")
+        return
+
+    placed = place_short_order(symbol, entry_price, tp_price, sl_price, precision, entry_path, sig_info)
+    if placed:
+        st["in_position"]   = True
+        st["entry_path"]    = entry_path
+        st["entry_price"]   = round(entry_price, precision)
+        st["tp_level"]      = round(tp_price,    precision)
+        st["sl_price"]      = round(sl_price,    precision)
+        st["last_entry_ts"] = ts15
+        # Clear retest arming on any successful entry
+        st["retest_armed"]     = False
+        st["retest_armed_ts"]  = 0
+        st["retest_lower_lvl"] = None
+        st["retest_last_pl"]   = None
+        update_sheet_tp(row, st["tp_level"])
+        update_sheet_sl(row, st["sl_price"])
 
     save_state(all_state)
 
@@ -1127,33 +1136,29 @@ consecutive_errors = 0
 MAX_CONSECUTIVE_ERRORS = 10
 
 send_telegram(
-    f"✅ <b>SHORT Bot Started — TL Break (3 paths)</b>\n"
+    f"✅ <b>SHORT Bot Started</b>\n"
     f"━━━━━━━━━━━━━━━━━━\n"
-    f"📐 Strategy : <code>LuxAlgo Trendlines with Breaks (SHORT)</code>\n"
-    f"⏱ Analysis : <code>4h closed bars</code>\n"
-    f"🔁 Scan     : <code>Every 30 minutes</code>\n"
-    f"📏 Length   : <code>{TL_LENGTH} (slope mult {TL_SLOPE_MULT}, method {TL_CALC_METHOD})</code>\n"
-    f"━━━━━━━━━━━━━━━━━━\n"
-    f"🅿️ <b>Path 0 (tl_break)</b> — <code>redB + ALL filters</code>\n"
-    f"  └ body={TL_USE_BODY_BREAK}, strong≥{TL_MIN_BODY_PCT}%={TL_USE_STRONG_BAR}, "
-    f"vol×{TL_VOL_MULT}={TL_USE_VOLUME}, atr×{TL_ATR_MULT}={TL_USE_ATR_DIST}\n"
-    f"🅰️ <b>Path A (tl_retest)</b> — <code>retest of lowerLvl from below, NO filters</code>\n"
-    f"  └ tol ±{PATH_A_RETEST_TOLERANCE_PCT}%, max wait {PATH_A_MAX_WAIT_BARS}b, "
-    f"invalidate &gt;{PATH_A_INVALIDATION_PCT}% reclaim\n"
-    f"🅱️ <b>Path B (tl_accept)</b> — <code>≥{PATH_B_ACCEPTANCE_BARS} consec closes below TL + bearish bar, NO filters</code>\n"
-    f"━━━━━━━━━━━━━━━━━━\n"
-    f"🎯 TP       : <code>entry × (1 − {TP_PCT_FIXED}%)</code>  (fixed)\n"
-    f"🛑 SL       : <code>lowerLvl × (1 + {SL_BUFFER_TL_PCT}%)</code>  (all paths)\n"
-    f"⏳ Cooldown : <code>{TL_COOLDOWN_BARS} × 4h bars (shared)</code>\n"
-    f"👆 TL gate  : <code>≥{MIN_TOUCHES_REQUIRED} prior touches (tol {TOUCH_TOLERANCE_PCT}%)</code>\n"
-    f"💰 Capital  : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
+    f"📐 Strategy   : <code>Trendline Break + Anti-Fakeout (SHORT only)</code>\n"
+    f"⏱ TL / S-R   : <code>1h closed bars (lookback={SWING_LOOKBACK}, slope×{SLOPE_MULT})</code>\n"
+    f"⚡ Entry      : <code>15m close confirmation</code>\n"
+    f"🔁 Scan       : <code>Every 15 minutes</code>\n"
+    f"🧪 Filters    : <code>body-break, body≥{MIN_BODY_PCT:.0f}%, vol&gt;SMA{VOL_SMA_PERIOD}×{VOL_MULT}, "
+    f"break≥{ATR_MULT}×ATR{ATR_PERIOD_15M}, cooldown={COOLDOWN_BARS}×15m</code>\n"
+    f"🛤 Paths      : <code>tl_break + tl_retest "
+    f"(retest: {'ON' if USE_RETEST_PATH else 'OFF'}, "
+    f"max {RETEST_MAX_BARS} bars, ±{RETEST_TOUCH_PCT}% touch, body≥{RETEST_MIN_BODY_PCT}%)</code>\n"
+    f"🪢 Touches    : <code>require ≥ {MIN_TL_TOUCHES} prior failed-break attempts on the trendline</code>\n"
+    f"🎯 TP         : <code>entry × (1 − {TP_PCT}%)</code>\n"
+    f"🛑 SL         : <code>lowerLvl × (1 + {SL_ABOVE_TL_PCT}%)</code>\n"
+    f"💰 Capital    : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
 )
 
 while True:
     try:
         df = get_sheet_data()
+
         if df.empty:
-            print("[WARN] Sheet empty — possible auth issue, retrying in 30 min")
+            print("[WARN] Sheet returned empty — possible auth issue, retrying in scan interval")
             time.sleep(SCAN_INTERVAL)
             continue
 
@@ -1161,7 +1166,7 @@ while True:
         cycle += 1
         consecutive_errors = 0
 
-        print(f"----- SHORT TRADE SCAN — CYCLE {cycle} -----")
+        print(f"----- TRADE SCAN — CYCLE {cycle} -----")
 
         for row in range(len(df)):
             pair = df.iloc[row, 0]
@@ -1183,7 +1188,7 @@ while True:
 
         if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
             send_telegram(
-                f"🚨 <b>Short Bot Crashed — Restarting</b>\n"
+                f"🚨 <b>SHORT Bot Crashed — Restarting</b>\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f"❌ Error : <code>{str(e)[:200]}</code>\n"
                 f"🔁 {consecutive_errors} consecutive errors — triggering restart"
