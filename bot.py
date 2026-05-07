@@ -427,6 +427,8 @@ def compute_trendline_state(candles, length=TL_LENGTH, mult=TL_SLOPE_MULT, metho
     slope_pl = 0.0
     last_ph = None
     last_pl = None
+    last_pl_idx = None     # bar index of the most recent CONFIRMED pivot low
+    last_ph_idx = None     # bar index of the most recent CONFIRMED pivot high
     upos = 0
     dnos = 0
 
@@ -453,8 +455,12 @@ def compute_trendline_state(candles, length=TL_LENGTH, mult=TL_SLOPE_MULT, metho
         elif lower is not None:
             lower = lower + slope_pl
 
-        if ph is not None: last_ph = ph
-        if pl is not None: last_pl = pl
+        if ph is not None:
+            last_ph = ph
+            last_ph_idx = i - length     # actual swing bar (confirmation is `length` bars later)
+        if pl is not None:
+            last_pl = pl
+            last_pl_idx = i - length     # actual swing bar (confirmation is `length` bars later)
 
         prev_upos, prev_dnos = upos, dnos
         c = closes[i]
@@ -487,8 +493,12 @@ def compute_trendline_state(candles, length=TL_LENGTH, mult=TL_SLOPE_MULT, metho
         "red_b":     red_b,
         "upper_lvl": upper_lvl,
         "lower_lvl": lower_lvl,
-        "last_ph":   last_ph,
-        "last_pl":   last_pl,
+        "last_ph":     last_ph,
+        "last_pl":     last_pl,
+        "last_ph_idx": last_ph_idx,
+        "last_pl_idx": last_pl_idx,
+        "lower_now":   lower,            # running anchor (pivot value + slope × bars_since)
+        "slope_pl_now": slope_pl,        # current per-bar slope
     }
 
 
@@ -791,6 +801,26 @@ def check_and_trade(symbol, row, df, all_state):
     red_b     = state["red_b"][i]
     lower_lvl = state["lower_lvl"][i]
     last_ph   = state["last_ph"]
+    last_pl   = state["last_pl"]
+
+    # ── Build "TL anchor" descriptor ──────────────────────────────────────────
+    # Shows which pivot low is anchoring the lower trendline at this bar, the
+    # slope being applied, and how many bars of decay have accumulated.
+    last_pl_idx  = state["last_pl_idx"]
+    slope_pl_now = state["slope_pl_now"]
+    if last_pl_idx is not None and last_pl is not None:
+        bars_since_pl = i - last_pl_idx
+        pl_ts_ms      = int(candles[last_pl_idx]["time"])
+        # CoinDCX returns ms timestamps; hours since pivot:
+        pl_age_hours  = (last_ts - pl_ts_ms) / 1000 / 3600
+        decay         = slope_pl_now * bars_since_pl
+        tl_anchor_str = (
+            f"PL {round(last_pl, precision)} @ -{bars_since_pl}b "
+            f"(~{int(pl_age_hours)}h ago) + slope {slope_pl_now:.2e}/bar × "
+            f"{bars_since_pl}b = decay {round(decay, precision)} → lowerLvl {round(lower_lvl, precision)}"
+        )
+    else:
+        tl_anchor_str = "n/a (no confirmed pivot low yet)"
 
     # =========================================================================
     # ENTRY EVALUATION — three independent paths
@@ -958,6 +988,7 @@ def check_and_trade(symbol, row, df, all_state):
                     ("📉 redB",         "True"),
                     ("🧱 lowerLvl",     round(lower_lvl, precision)),
                     ("🔺 lastPH",       round(last_ph, precision)),
+                    ("🪜 TL anchor",    tl_anchor_str),
                     ("🪵 Body break",   f"{f_body}  (max(o,c)={round(max(last_open,last_close), precision)} &lt; lowerLvl)"),
                     ("💪 Strong bar",   f"{f_strong}  (body {round(body_pct,1)}% ≥ {TL_MIN_BODY_PCT}%)"),
                     ("📊 Volume",       f"{f_vol}  (vol={round(last_volume,2)} vs SMA20×{TL_VOL_MULT}={round(vol_thresh,2) if vol_thresh else 'N/A'})"),
@@ -969,6 +1000,7 @@ def check_and_trade(symbol, row, df, all_state):
                 trigger_details = [
                     ("🧱 lowerLvl",        round(lower_lvl, precision)),
                     ("🔺 lastPH",          round(last_ph, precision)),
+                    ("🪜 TL anchor",       tl_anchor_str),
                     ("⏱ Bars armed",      f"{path_a_bars} of {PATH_A_MAX_WAIT_BARS}"),
                     ("📍 Retest high",     f"{round(last_high, precision)}  (floor {round(retest_floor, precision)}, tol ±{PATH_A_RETEST_TOLERANCE_PCT}%)"),
                     ("📉 Closed below TL", f"{round(last_close, precision)} &lt; {round(lower_lvl, precision)}"),
@@ -980,6 +1012,7 @@ def check_and_trade(symbol, row, df, all_state):
                 trigger_details = [
                     ("🧱 lowerLvl",         round(lower_lvl, precision)),
                     ("🔺 lastPH",           round(last_ph, precision)),
+                    ("🪜 TL anchor",        tl_anchor_str),
                     ("📊 Consec. below TL", f"{new_consec_b}  (≥ {PATH_B_ACCEPTANCE_BARS})"),
                     ("🕯 Bearish bar",      f"close {round(last_close, precision)} &lt; open {round(last_open, precision)}"),
                     ("🚫 Filters",          "skipped (Path B independent)"),
