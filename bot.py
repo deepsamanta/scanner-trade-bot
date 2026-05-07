@@ -76,6 +76,14 @@ PATH_B_ACCEPTANCE_BARS = 3
 # setup whose SL distance from entry exceeds this cap.
 MAX_SL_DISTANCE_PCT = 8.0
 
+# ─── Trendline validation ─────────────────────────────────────────────────────
+# A trendline is considered "real" only after it has been TOUCHED at least N
+# times (price approached the line from above and the line held — close stayed
+# above). Touches accumulate from the bar a new pivot low confirms the line,
+# and reset each time a fresh pivot low forms (new line = new validation).
+MIN_TOUCHES_REQUIRED = 2
+TOUCH_TOLERANCE_PCT  = 0.5    # bar low within this % above lowerLvl counts as a touch
+
 # ─── Timeframe / scan ────────────────────────────────────────────────────────
 RESOLUTION_PRIMARY = "240"
 CANDLE_SECONDS     = 4 * 3600
@@ -446,6 +454,10 @@ def compute_trendline_state(candles, length=TL_LENGTH, mult=TL_SLOPE_MULT, metho
     upper_lvl = [None]  * n
     lower_lvl = [None]  * n
 
+    # Touch tracking (resets each time a new pivot low forms a new lower TL)
+    touches_count   = 0
+    touches_pre_arr = [0] * n     # touches accumulated BEFORE bar i's contribution
+
     for i in range(n):
         slope = slopes[i]
         ph    = ph_event[i]
@@ -461,6 +473,7 @@ def compute_trendline_state(candles, length=TL_LENGTH, mult=TL_SLOPE_MULT, metho
 
         if pl is not None:
             lower = pl
+            touches_count = 0           # new trendline → reset touch validation
         elif lower is not None:
             lower = lower + slope_pl
 
@@ -492,6 +505,16 @@ def compute_trendline_state(candles, length=TL_LENGTH, mult=TL_SLOPE_MULT, metho
         if upper is not None: upper_lvl[i] = upper - slope_ph * length
         if lower is not None: lower_lvl[i] = lower + slope_pl * length
 
+        # Snapshot touches BEFORE this bar's potential contribution
+        touches_pre_arr[i] = touches_count
+
+        # Detect touch on THIS bar: low approached the line, close held above
+        if lower_lvl[i] is not None:
+            approached = lows[i] <= lower_lvl[i] * (1 + TOUCH_TOLERANCE_PCT / 100)
+            held       = c > lower_lvl[i]
+            if approached and held:
+                touches_count += 1
+
     return {
         "opens":     opens,
         "highs":     highs,
@@ -508,6 +531,7 @@ def compute_trendline_state(candles, length=TL_LENGTH, mult=TL_SLOPE_MULT, metho
         "last_pl_idx": last_pl_idx,
         "lower_now":   lower,            # running anchor (pivot value + slope × bars_since)
         "slope_pl_now": slope_pl,        # current per-bar slope
+        "touches_pre_arr": touches_pre_arr,
     }
 
 
@@ -911,9 +935,13 @@ def check_and_trade(symbol, row, df, all_state):
                      and new_consec_b >= PATH_B_ACCEPTANCE_BARS
                      and last_close < last_open)                # bearish continuation bar
 
+    # ── Trendline validation gate (must be touched ≥ N times) ────────────────
+    touches_pre = state["touches_pre_arr"][i]
+    touches_ok  = touches_pre >= MIN_TOUCHES_REQUIRED
+
     # ── Pick the first path that fires ───────────────────────────────────────
     chosen, trigger_details = None, None
-    if f_cooldown:
+    if f_cooldown and touches_ok:
         if core_sig:
             chosen = "tl_break"
         elif retest_sig:
@@ -926,7 +954,7 @@ def check_and_trade(symbol, row, df, all_state):
         f"(body={f_body} strong={f_strong}({round(body_pct,1)}%) vol={f_vol} atr={f_atr}) | "
         f"Path A armed={path_a_armed}({path_a_bars}b) retest={retest_sig} | "
         f"Path B count={new_consec_b}/{PATH_B_ACCEPTANCE_BARS} accept={accept_sig} | "
-        f"cool={f_cooldown}({bars_since_disp}b) → chosen={chosen} | "
+        f"cool={f_cooldown}({bars_since_disp}b) touches={touches_pre}/{MIN_TOUCHES_REQUIRED}({touches_ok}) → chosen={chosen} | "
         f"lowerLvl={round(lower_lvl, precision)} lastPH={round(last_ph, precision)}"
     )
 
@@ -998,6 +1026,7 @@ def check_and_trade(symbol, row, df, all_state):
                     ("🧱 lowerLvl",     round(lower_lvl, precision)),
                     ("🔺 lastPH",       round(last_ph, precision)),
                     ("🪜 TL anchor",    tl_anchor_str),
+                    ("👆 TL touches",   f"{touches_pre} prior touches (≥{MIN_TOUCHES_REQUIRED} required)"),
                     ("🪵 Body break",   f"{f_body}  (max(o,c)={round(max(last_open,last_close), precision)} &lt; lowerLvl)"),
                     ("💪 Strong bar",   f"{f_strong}  (body {round(body_pct,1)}% ≥ {TL_MIN_BODY_PCT}%)"),
                     ("📊 Volume",       f"{f_vol}  (vol={round(last_volume,2)} vs SMA20×{TL_VOL_MULT}={round(vol_thresh,2) if vol_thresh else 'N/A'})"),
@@ -1010,6 +1039,7 @@ def check_and_trade(symbol, row, df, all_state):
                     ("🧱 lowerLvl",        round(lower_lvl, precision)),
                     ("🔺 lastPH",          round(last_ph, precision)),
                     ("🪜 TL anchor",       tl_anchor_str),
+                    ("👆 TL touches",      f"{touches_pre} prior touches (≥{MIN_TOUCHES_REQUIRED} required)"),
                     ("⏱ Bars armed",      f"{path_a_bars} of {PATH_A_MAX_WAIT_BARS}"),
                     ("📍 Retest high",     f"{round(last_high, precision)}  (floor {round(retest_floor, precision)}, tol ±{PATH_A_RETEST_TOLERANCE_PCT}%)"),
                     ("📉 Closed below TL", f"{round(last_close, precision)} &lt; {round(lower_lvl, precision)}"),
@@ -1022,6 +1052,7 @@ def check_and_trade(symbol, row, df, all_state):
                     ("🧱 lowerLvl",         round(lower_lvl, precision)),
                     ("🔺 lastPH",           round(last_ph, precision)),
                     ("🪜 TL anchor",        tl_anchor_str),
+                    ("👆 TL touches",       f"{touches_pre} prior touches (≥{MIN_TOUCHES_REQUIRED} required)"),
                     ("📊 Consec. below TL", f"{new_consec_b}  (≥ {PATH_B_ACCEPTANCE_BARS})"),
                     ("🕯 Bearish bar",      f"close {round(last_close, precision)} &lt; open {round(last_open, precision)}"),
                     ("🚫 Filters",          "skipped (Path B independent)"),
@@ -1114,6 +1145,7 @@ send_telegram(
     f"🎯 TP       : <code>entry × (1 − {TP_PCT_FIXED}%)</code>  (fixed)\n"
     f"🛑 SL       : <code>lowerLvl × (1 + {SL_BUFFER_TL_PCT}%)</code>  (all paths)\n"
     f"⏳ Cooldown : <code>{TL_COOLDOWN_BARS} × 4h bars (shared)</code>\n"
+    f"👆 TL gate  : <code>≥{MIN_TOUCHES_REQUIRED} prior touches (tol {TOUCH_TOLERANCE_PCT}%)</code>\n"
     f"💰 Capital  : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
 )
 
