@@ -400,26 +400,35 @@ def compute_trendline_state(candles, length=TL_LENGTH, mult=TL_SLOPE_MULT, metho
 
     # Pivot confirmations: ta.pivothigh(length, length) — pivot at bar (i-length)
     # is reported at bar i. We populate the *confirmation bar*.
+    #
+    # IMPORTANT: pivots are detected against BODY extremes, not wicks. A bar's
+    # candidate value is min(open, close) for a pivot low and max(open, close)
+    # for a pivot high. This prevents single-bar wick spikes from resetting the
+    # trendline anchor — the anchor only moves when an actual close-based swing
+    # forms.
+    body_highs = [max(opens[k], closes[k]) for k in range(n)]
+    body_lows  = [min(opens[k], closes[k]) for k in range(n)]
+
     ph_event = [None] * n
     pl_event = [None] * n
     for i in range(length, n - length):
         confirm = i + length
         if confirm >= n:
             break
-        h, l = highs[i], lows[i]
+        bh, bl = body_highs[i], body_lows[i]
         is_ph, is_pl = True, True
         for k in range(1, length + 1):
-            if highs[i-k] >= h or highs[i+k] >= h:
+            if body_highs[i-k] >= bh or body_highs[i+k] >= bh:
                 is_ph = False
                 break
         if is_ph:
-            ph_event[confirm] = h
+            ph_event[confirm] = bh
         for k in range(1, length + 1):
-            if lows[i-k] <= l or lows[i+k] <= l:
+            if body_lows[i-k] <= bl or body_lows[i+k] <= bl:
                 is_pl = False
                 break
         if is_pl:
-            pl_event[confirm] = l
+            pl_event[confirm] = bl
 
     upper = None
     lower = None
