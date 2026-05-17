@@ -663,12 +663,7 @@ def check_and_trade(symbol, row, df, all_state):
     today_str = datetime.utcnow().strftime("%Y-%m-%d")
     if st["current_day_str"] != today_str:
         print(f"[NEW DAY] {symbol} — PDH={pdh} PDL={pdl}  (resetting sweep state)")
-        send_telegram(
-            f"📅 <b>NEW DAY — {symbol}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"📈 PDH : <code>{pdh}</code>\n"
-            f"📉 PDL : <code>{pdl}</code>"
-        )
+
         # Keep position/last_entry; wipe everything else
         preserved = {k: st[k] for k in ("in_position", "direction", "entry_price",
                                           "tp_level", "sl_price", "last_entry_ts")}
@@ -723,13 +718,7 @@ def check_and_trade(symbol, row, df, all_state):
         if tp_hit:
             update_sheet_tp(row, "TP COMPLETED")
             print(f"[TP HIT] {symbol} — {hit_kind} {hit_price}  target={tp_stored}")
-            send_telegram(
-                f"🎯 <b>TP HIT ({hit_kind}) — {symbol}</b>\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"📍 {hit_kind.capitalize():8}: <code>{hit_price}</code>\n"
-                f"🎯 TP        : <code>{tp_stored}</code>\n"
-                f"✅ Marked <b>TP COMPLETED</b> — no further entries on this coin"
-            )
+
             prev_last = st.get("last_entry_ts", 0)
             all_state[symbol] = init_symbol_state()
             all_state[symbol]["last_entry_ts"] = prev_last
@@ -767,14 +756,7 @@ def check_and_trade(symbol, row, df, all_state):
 
     if st.get("in_position"):
         print(f"[POSITION CLOSED] {symbol} — cleaning up state")
-        send_telegram(
-            f"✅ <b>POSITION CLOSED — {symbol}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"🛤 Direction : <code>{st.get('direction')}</code>\n"
-            f"📍 Entry     : <code>{st.get('entry_price')}</code>\n"
-            f"🎯 TP was    : <code>{st.get('tp_level')}</code>\n"
-            f"🛑 SL was    : <code>{st.get('sl_price')}</code>"
-        )
+
         prev_last = st.get("last_entry_ts", 0)
         all_state[symbol] = init_symbol_state()
         all_state[symbol]["last_entry_ts"] = prev_last
@@ -831,15 +813,7 @@ def check_and_trade(symbol, row, df, all_state):
                 st["sweep_l"] = l; st["sweep_c"] = c
                 ext = round(pdl - l, precision)
                 print(f"[SWEEP-LONG]  {symbol} | low={l} < PDL={pdl} (ext={ext}) | ts={c_ts}")
-                send_telegram(
-                    f"🟡 <b>PDL SWEEP (LONG SETUP) — {symbol}</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"📉 PDL            : <code>{pdl}</code>\n"
-                    f"⬇️ Sweep low      : <code>{round(l, precision)}</code>  ({ext} below PDL)\n"
-                    f"🕯 Sweep candle   : O={round(o,precision)} H={round(h,precision)} "
-                    f"L={round(l,precision)} C={round(c,precision)}\n"
-                    f"⏳ Watching for first bullish 1m candle → confirm close above its high"
-                )
+
             elif h > pdh:                               # swept above PDH → short setup
                 st["sweep_direction"]   = "short"
                 st["sweep_ts"]          = c_ts
@@ -848,15 +822,7 @@ def check_and_trade(symbol, row, df, all_state):
                 st["sweep_l"] = l; st["sweep_c"] = c
                 ext = round(h - pdh, precision)
                 print(f"[SWEEP-SHORT] {symbol} | high={h} > PDH={pdh} (ext={ext}) | ts={c_ts}")
-                send_telegram(
-                    f"🟡 <b>PDH SWEEP (SHORT SETUP) — {symbol}</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━\n"
-                    f"📈 PDH            : <code>{pdh}</code>\n"
-                    f"⬆️ Sweep high     : <code>{round(h, precision)}</code>  ({ext} above PDH)\n"
-                    f"🕯 Sweep candle   : O={round(o,precision)} H={round(h,precision)} "
-                    f"L={round(l,precision)} C={round(c,precision)}\n"
-                    f"⏳ Watching for first bearish 1m candle → confirm close below its low"
-                )
+
 
         # ── B. Long sweep armed ───────────────────────────────────────────
         elif sweep_dir == "long":
@@ -867,10 +833,7 @@ def check_and_trade(symbol, row, df, all_state):
             bars_since_sweep = (c_ts - st["sweep_ts"]) // (CANDLE_SECONDS_1M * 1000)
             if bars_since_sweep > SWEEP_EXPIRY_BARS:
                 print(f"[SWEEP-EXPIRE] {symbol} — long sweep expired ({bars_since_sweep} bars)")
-                send_telegram(
-                    f"⌛ <b>PDL SWEEP EXPIRED — {symbol}</b>\n"
-                    f"⏳ {bars_since_sweep} 1m bars, no reversal confirmed"
-                )
+
                 _clear_sweep(st)
                 st["last_processed_1m_ts"] = c_ts
                 continue
@@ -930,10 +893,7 @@ def check_and_trade(symbol, row, df, all_state):
             bars_since_sweep = (c_ts - st["sweep_ts"]) // (CANDLE_SECONDS_1M * 1000)
             if bars_since_sweep > SWEEP_EXPIRY_BARS:
                 print(f"[SWEEP-EXPIRE] {symbol} — short sweep expired ({bars_since_sweep} bars)")
-                send_telegram(
-                    f"⌛ <b>PDH SWEEP EXPIRED — {symbol}</b>\n"
-                    f"⏳ {bars_since_sweep} 1m bars, no reversal confirmed"
-                )
+
                 _clear_sweep(st)
                 st["last_processed_1m_ts"] = c_ts
                 continue
