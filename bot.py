@@ -42,8 +42,6 @@ BASE_URL = "https://api.coindcx.com"
 TP_PCT               = 1.5    # fixed TP %
 
 SWEEP_EXPIRY_BARS    = 60     # 1m bars before an unresolved sweep expires (= 60 min)
-SIGNAL_EXPIRY_BARS   = 10     # 1m bars before first-signal candle is stale
-
 CANDLES_DAILY        = 5      # daily candles fetched  (only prev day needed)
 CANDLES_1M           = 300    # 1m candles fetched per scan  (~5 hours)
 
@@ -52,7 +50,7 @@ RESOLUTION_1M        = "1"
 CANDLE_SECONDS_DAILY = 86400
 CANDLE_SECONDS_1M    = 60
 
-SCAN_INTERVAL        = 15 * 60
+SCAN_INTERVAL        = 90
 REQUEST_TIMEOUT      = 15
 TELEGRAM_TIMEOUT     = 10
 GSHEET_REAUTH_INTERVAL = 45 * 60
@@ -169,10 +167,21 @@ def init_symbol_state():
         "recent_swing_low":     None,   # lowest low during/after sweep (long SL)
         "recent_swing_high":    None,   # highest high during/after sweep (short SL)
 
-        # 2-candle pattern state
-        "first_signal_high":    None,   # first bullish candle's high  (long)
-        "first_signal_low":     None,   # first bearish candle's low   (short)
+        # Sweep candle snapshot (for signal readout)
+        "sweep_o":              None,
+        "sweep_h":              None,
+        "sweep_l":              None,
+        "sweep_c":              None,
+
+        # 2-candle pattern state — NO reset once armed; expires only with the sweep
+        "first_signal_high":    None,   # first bullish candle high (long confirm level)
+        "first_signal_low":     None,   # first bearish candle low  (short confirm level)
         "first_signal_ts":      0,      # ms ts of first signal candle
+        "first_signal_o":       None,   # OHLC of first signal candle (for readout)
+        "first_signal_h":       None,
+        "first_signal_l":       None,
+        "first_signal_c":       None,
+        "bars_to_first_signal": None,   # how many 1m bars from sweep to first signal
 
         "last_processed_1m_ts": 0,
     }
@@ -224,9 +233,17 @@ def send_telegram(message):
             "text":       message,
             "parse_mode": "HTML",
         }
-        r = requests.post(url, data=data, timeout=TELEGRAM_TIMEOUT)
-        if r.status_code != 200:
-            print(f"[TELEGRAM] Non-200: {r.status_code} {r.text[:200]}")
+        for attempt in range(3):
+            r = requests.post(url, data=data, timeout=TELEGRAM_TIMEOUT)
+            if r.status_code == 200:
+                return
+            if r.status_code == 429:
+                retry_after = r.json().get("parameters", {}).get("retry_after", 10)
+                print(f"[TELEGRAM] Rate limited — waiting {retry_after}s (attempt {attempt + 1}/3)")
+                time.sleep(retry_after + 1)
+            else:
+                print(f"[TELEGRAM] Non-200: {r.status_code} {r.text[:200]}")
+                return
     except Exception as e:
         print(f"[TELEGRAM] Failed: {e}")
 
@@ -470,17 +487,32 @@ def place_long_order(symbol, entry_price, tp_price, sl_price, precision, signal_
     send_telegram(
         f"🟢 <b>NEW LONG (PDL SWEEP) — {symbol}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"📍 Entry        : <code>{entry}</code>\n"
-        f"🎯 TP           : <code>{tp}</code>  (+{tp_pct_display}%)\n"
-        f"🛑 SL           : <code>{sl}</code>  (-{sl_pct_display}%)\n"
-        f"📦 Qty          : <code>{qty}</code>\n"
-        f"💰 Margin       : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>\n"
+        f"📍 Entry          : <code>{entry}</code>\n"
+        f"🎯 TP             : <code>{tp}</code>  (+{tp_pct_display}%)\n"
+        f"🛑 SL             : <code>{sl}</code>  (-{sl_pct_display}%)\n"
+        f"📦 Qty            : <code>{qty}</code>\n"
+        f"💰 Margin         : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"<b>📊 Signal:</b>\n"
-        f"📅 PDL          : <code>{si.get('pdl')}</code>\n"
-        f"⬇️ Sweep low    : <code>{si.get('sweep_low')}</code>\n"
-        f"🕯 1st bull high: <code>{si.get('first_signal_high')}</code>\n"
-        f"✅ Confirm close: <code>{si.get('confirm_close')}</code>"
+        f"<b>📊 Why this trade:</b>\n"
+        f"📅 Prev day range : PDH <code>{si.get('pdh')}</code>  |  PDL <code>{si.get('pdl')}</code>\n"
+        f"⬇️ PDL swept by   : <code>{si.get('sweep_ext')}</code> pts "
+        f"→ low hit <code>{si.get('sweep_low')}</code>\n"
+        f"🕯 Sweep candle   : O=<code>{si.get('sweep_o')}</code> "
+        f"H=<code>{si.get('sweep_h')}</code> "
+        f"L=<code>{si.get('sweep_l')}</code> "
+        f"C=<code>{si.get('sweep_c')}</code>\n"
+        f"🟢 Signal candle  : O=<code>{si.get('sig_o')}</code> "
+        f"H=<code>{si.get('sig_h')}</code> "
+        f"L=<code>{si.get('sig_l')}</code> "
+        f"C=<code>{si.get('sig_c')}</code>  "
+        f"(bullish, {si.get('bars_to_sig')}b after sweep)\n"
+        f"✅ Confirm candle : O=<code>{si.get('confirm_o')}</code> "
+        f"H=<code>{si.get('confirm_h')}</code> "
+        f"L=<code>{si.get('confirm_l')}</code> "
+        f"C=<code>{si.get('confirm_c')}</code>  "
+        f"(closed above signal high, {si.get('bars_to_confirm')}b after sweep)\n"
+        f"📌 Trigger        : close <code>{si.get('confirm_c')}</code> "
+        f"&gt; signal high <code>{si.get('sig_h')}</code>"
     )
     return True
 
@@ -544,17 +576,32 @@ def place_short_order(symbol, entry_price, tp_price, sl_price, precision, signal
     send_telegram(
         f"🔴 <b>NEW SHORT (PDH SWEEP) — {symbol}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"📍 Entry        : <code>{entry}</code>\n"
-        f"🎯 TP           : <code>{tp}</code>  (-{tp_pct_display}%)\n"
-        f"🛑 SL           : <code>{sl}</code>  (+{sl_pct_display}%)\n"
-        f"📦 Qty          : <code>{qty}</code>\n"
-        f"💰 Margin       : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>\n"
+        f"📍 Entry          : <code>{entry}</code>\n"
+        f"🎯 TP             : <code>{tp}</code>  (-{tp_pct_display}%)\n"
+        f"🛑 SL             : <code>{sl}</code>  (+{sl_pct_display}%)\n"
+        f"📦 Qty            : <code>{qty}</code>\n"
+        f"💰 Margin         : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"<b>📊 Signal:</b>\n"
-        f"📅 PDH           : <code>{si.get('pdh')}</code>\n"
-        f"⬆️ Sweep high    : <code>{si.get('sweep_high')}</code>\n"
-        f"🕯 1st bear low  : <code>{si.get('first_signal_low')}</code>\n"
-        f"✅ Confirm close : <code>{si.get('confirm_close')}</code>"
+        f"<b>📊 Why this trade:</b>\n"
+        f"📅 Prev day range : PDH <code>{si.get('pdh')}</code>  |  PDL <code>{si.get('pdl')}</code>\n"
+        f"⬆️ PDH swept by   : <code>{si.get('sweep_ext')}</code> pts "
+        f"→ high hit <code>{si.get('sweep_high')}</code>\n"
+        f"🕯 Sweep candle   : O=<code>{si.get('sweep_o')}</code> "
+        f"H=<code>{si.get('sweep_h')}</code> "
+        f"L=<code>{si.get('sweep_l')}</code> "
+        f"C=<code>{si.get('sweep_c')}</code>\n"
+        f"🔴 Signal candle  : O=<code>{si.get('sig_o')}</code> "
+        f"H=<code>{si.get('sig_h')}</code> "
+        f"L=<code>{si.get('sig_l')}</code> "
+        f"C=<code>{si.get('sig_c')}</code>  "
+        f"(bearish, {si.get('bars_to_sig')}b after sweep)\n"
+        f"✅ Confirm candle : O=<code>{si.get('confirm_o')}</code> "
+        f"H=<code>{si.get('confirm_h')}</code> "
+        f"L=<code>{si.get('confirm_l')}</code> "
+        f"C=<code>{si.get('confirm_c')}</code>  "
+        f"(closed below signal low, {si.get('bars_to_confirm')}b after sweep)\n"
+        f"📌 Trigger        : close <code>{si.get('confirm_c')}</code> "
+        f"&lt; signal low <code>{si.get('sig_l')}</code>"
     )
     return True
 
@@ -565,13 +612,22 @@ def place_short_order(symbol, entry_price, tp_price, sl_price, precision, signal
 
 def _clear_sweep(st):
     """Reset sweep + pattern state without touching position state."""
-    st["sweep_direction"]   = None
-    st["sweep_ts"]          = 0
-    st["recent_swing_low"]  = None
-    st["recent_swing_high"] = None
-    st["first_signal_high"] = None
-    st["first_signal_low"]  = None
-    st["first_signal_ts"]   = 0
+    st["sweep_direction"]      = None
+    st["sweep_ts"]             = 0
+    st["recent_swing_low"]     = None
+    st["recent_swing_high"]    = None
+    st["sweep_o"]              = None
+    st["sweep_h"]              = None
+    st["sweep_l"]              = None
+    st["sweep_c"]              = None
+    st["first_signal_high"]    = None
+    st["first_signal_low"]     = None
+    st["first_signal_ts"]      = 0
+    st["first_signal_o"]       = None
+    st["first_signal_h"]       = None
+    st["first_signal_l"]       = None
+    st["first_signal_c"]       = None
+    st["bars_to_first_signal"] = None
 
 
 def check_and_trade(symbol, row, df, all_state):
@@ -770,25 +826,35 @@ def check_and_trade(symbol, row, df, all_state):
                 st["sweep_direction"]  = "long"
                 st["sweep_ts"]         = c_ts
                 st["recent_swing_low"] = l
-                print(f"[SWEEP-LONG]  {symbol} | low={l} < PDL={pdl} | ts={c_ts}")
+                st["sweep_o"] = o; st["sweep_h"] = h
+                st["sweep_l"] = l; st["sweep_c"] = c
+                ext = round(pdl - l, precision)
+                print(f"[SWEEP-LONG]  {symbol} | low={l} < PDL={pdl} (ext={ext}) | ts={c_ts}")
                 send_telegram(
                     f"🟡 <b>PDL SWEEP (LONG SETUP) — {symbol}</b>\n"
                     f"━━━━━━━━━━━━━━━━━━\n"
-                    f"📉 PDL       : <code>{pdl}</code>\n"
-                    f"⬇️ Sweep low : <code>{round(l, precision)}</code>\n"
-                    f"⏳ Watching for 2-candle bullish reversal on 1m"
+                    f"📉 PDL            : <code>{pdl}</code>\n"
+                    f"⬇️ Sweep low      : <code>{round(l, precision)}</code>  ({ext} below PDL)\n"
+                    f"🕯 Sweep candle   : O={round(o,precision)} H={round(h,precision)} "
+                    f"L={round(l,precision)} C={round(c,precision)}\n"
+                    f"⏳ Watching for first bullish 1m candle → confirm close above its high"
                 )
             elif h > pdh:                               # swept above PDH → short setup
                 st["sweep_direction"]   = "short"
                 st["sweep_ts"]          = c_ts
                 st["recent_swing_high"] = h
-                print(f"[SWEEP-SHORT] {symbol} | high={h} > PDH={pdh} | ts={c_ts}")
+                st["sweep_o"] = o; st["sweep_h"] = h
+                st["sweep_l"] = l; st["sweep_c"] = c
+                ext = round(h - pdh, precision)
+                print(f"[SWEEP-SHORT] {symbol} | high={h} > PDH={pdh} (ext={ext}) | ts={c_ts}")
                 send_telegram(
                     f"🟡 <b>PDH SWEEP (SHORT SETUP) — {symbol}</b>\n"
                     f"━━━━━━━━━━━━━━━━━━\n"
-                    f"📈 PDH        : <code>{pdh}</code>\n"
-                    f"⬆️ Sweep high : <code>{round(h, precision)}</code>\n"
-                    f"⏳ Watching for 2-candle bearish reversal on 1m"
+                    f"📈 PDH            : <code>{pdh}</code>\n"
+                    f"⬆️ Sweep high     : <code>{round(h, precision)}</code>  ({ext} above PDH)\n"
+                    f"🕯 Sweep candle   : O={round(o,precision)} H={round(h,precision)} "
+                    f"L={round(l,precision)} C={round(c,precision)}\n"
+                    f"⏳ Watching for first bearish 1m candle → confirm close below its low"
                 )
 
         # ── B. Long sweep armed ───────────────────────────────────────────
@@ -809,33 +875,48 @@ def check_and_trade(symbol, row, df, all_state):
                 continue
 
             if st["first_signal_high"] is None:
-                # Looking for first bullish 1m candle
+                # Looking for the FIRST bullish 1m candle after sweep — one shot only
                 if c > o:
-                    st["first_signal_high"] = h
-                    st["first_signal_ts"]   = c_ts
-                    print(f"[SIGNAL-1-LONG] {symbol} | bullish candle high={h}")
+                    bars_to_sig = (c_ts - st["sweep_ts"]) // (CANDLE_SECONDS_1M * 1000)
+                    st["first_signal_high"]    = h
+                    st["first_signal_ts"]      = c_ts
+                    st["first_signal_o"]       = o
+                    st["first_signal_h"]       = h
+                    st["first_signal_l"]       = l
+                    st["first_signal_c"]       = c
+                    st["bars_to_first_signal"] = bars_to_sig
+                    print(f"[SIGNAL-1-LONG] {symbol} | bullish candle high={h} | {bars_to_sig}b after sweep")
             else:
-                # First signal stale?
-                bars_since_signal = (c_ts - st["first_signal_ts"]) // (CANDLE_SECONDS_1M * 1000)
-                if bars_since_signal > SIGNAL_EXPIRY_BARS:
-                    print(f"[SIGNAL-RESET] {symbol} — first signal expired, resetting")
-                    st["first_signal_high"] = None
-                    st["first_signal_ts"]   = 0
-                elif c_ts > st["first_signal_ts"]:
-                    # Check confirmation: any candle (of different ts) closing above first_signal_high
-                    if c > st["first_signal_high"]:
-                        entry_price  = c
-                        sl_price_val = st["recent_swing_low"]
-                        tp_price_val = entry_price * (1 + TP_PCT / 100)
-                        entry_path   = "long_sweep"
-                        signal_info  = {
-                            "pdl":               round(pdl, precision),
-                            "sweep_low":         round(st["recent_swing_low"], precision),
-                            "first_signal_high": round(st["first_signal_high"], precision),
-                            "confirm_close":     round(c, precision),
-                        }
-                        st["last_processed_1m_ts"] = c_ts
-                        break
+                # Waiting for a candle to close above first_signal_high — no reset
+                if c_ts > st["first_signal_ts"] and c > st["first_signal_high"]:
+                    bars_to_confirm = (c_ts - st["sweep_ts"]) // (CANDLE_SECONDS_1M * 1000)
+                    entry_price  = c
+                    sl_price_val = st["recent_swing_low"]
+                    tp_price_val = entry_price * (1 + TP_PCT / 100)
+                    entry_path   = "long_sweep"
+                    signal_info  = {
+                        "direction":           "long",
+                        "pdh":                 round(pdh, precision),
+                        "pdl":                 round(pdl, precision),
+                        "sweep_ext":           round(pdl - st["recent_swing_low"], precision),
+                        "sweep_low":           round(st["recent_swing_low"], precision),
+                        "sweep_o":             round(st["sweep_o"], precision),
+                        "sweep_h":             round(st["sweep_h"], precision),
+                        "sweep_l":             round(st["sweep_l"], precision),
+                        "sweep_c":             round(st["sweep_c"], precision),
+                        "sig_o":               round(st["first_signal_o"], precision),
+                        "sig_h":               round(st["first_signal_h"], precision),
+                        "sig_l":               round(st["first_signal_l"], precision),
+                        "sig_c":               round(st["first_signal_c"], precision),
+                        "confirm_o":           round(o, precision),
+                        "confirm_h":           round(h, precision),
+                        "confirm_l":           round(l, precision),
+                        "confirm_c":           round(c, precision),
+                        "bars_to_sig":         st["bars_to_first_signal"],
+                        "bars_to_confirm":     bars_to_confirm,
+                    }
+                    st["last_processed_1m_ts"] = c_ts
+                    break
 
         # ── C. Short sweep armed ──────────────────────────────────────────
         elif sweep_dir == "short":
@@ -855,31 +936,48 @@ def check_and_trade(symbol, row, df, all_state):
                 continue
 
             if st["first_signal_low"] is None:
-                # Looking for first bearish 1m candle
+                # Looking for the FIRST bearish 1m candle after sweep — one shot only
                 if c < o:
-                    st["first_signal_low"] = l
-                    st["first_signal_ts"]  = c_ts
-                    print(f"[SIGNAL-1-SHORT] {symbol} | bearish candle low={l}")
+                    bars_to_sig = (c_ts - st["sweep_ts"]) // (CANDLE_SECONDS_1M * 1000)
+                    st["first_signal_low"]     = l
+                    st["first_signal_ts"]      = c_ts
+                    st["first_signal_o"]       = o
+                    st["first_signal_h"]       = h
+                    st["first_signal_l"]       = l
+                    st["first_signal_c"]       = c
+                    st["bars_to_first_signal"] = bars_to_sig
+                    print(f"[SIGNAL-1-SHORT] {symbol} | bearish candle low={l} | {bars_to_sig}b after sweep")
             else:
-                bars_since_signal = (c_ts - st["first_signal_ts"]) // (CANDLE_SECONDS_1M * 1000)
-                if bars_since_signal > SIGNAL_EXPIRY_BARS:
-                    print(f"[SIGNAL-RESET] {symbol} — first signal expired, resetting")
-                    st["first_signal_low"] = None
-                    st["first_signal_ts"]  = 0
-                elif c_ts > st["first_signal_ts"]:
-                    if c < st["first_signal_low"]:
-                        entry_price  = c
-                        sl_price_val = st["recent_swing_high"]
-                        tp_price_val = entry_price * (1 - TP_PCT / 100)
-                        entry_path   = "short_sweep"
-                        signal_info  = {
-                            "pdh":              round(pdh, precision),
-                            "sweep_high":       round(st["recent_swing_high"], precision),
-                            "first_signal_low": round(st["first_signal_low"], precision),
-                            "confirm_close":    round(c, precision),
-                        }
-                        st["last_processed_1m_ts"] = c_ts
-                        break
+                # Waiting for a candle to close below first_signal_low — no reset
+                if c_ts > st["first_signal_ts"] and c < st["first_signal_low"]:
+                    bars_to_confirm = (c_ts - st["sweep_ts"]) // (CANDLE_SECONDS_1M * 1000)
+                    entry_price  = c
+                    sl_price_val = st["recent_swing_high"]
+                    tp_price_val = entry_price * (1 - TP_PCT / 100)
+                    entry_path   = "short_sweep"
+                    signal_info  = {
+                        "direction":           "short",
+                        "pdh":                 round(pdh, precision),
+                        "pdl":                 round(pdl, precision),
+                        "sweep_ext":           round(st["recent_swing_high"] - pdh, precision),
+                        "sweep_high":          round(st["recent_swing_high"], precision),
+                        "sweep_o":             round(st["sweep_o"], precision),
+                        "sweep_h":             round(st["sweep_h"], precision),
+                        "sweep_l":             round(st["sweep_l"], precision),
+                        "sweep_c":             round(st["sweep_c"], precision),
+                        "sig_o":               round(st["first_signal_o"], precision),
+                        "sig_h":               round(st["first_signal_h"], precision),
+                        "sig_l":               round(st["first_signal_l"], precision),
+                        "sig_c":               round(st["first_signal_c"], precision),
+                        "confirm_o":           round(o, precision),
+                        "confirm_h":           round(h, precision),
+                        "confirm_l":           round(l, precision),
+                        "confirm_c":           round(c, precision),
+                        "bars_to_sig":         st["bars_to_first_signal"],
+                        "bars_to_confirm":     bars_to_confirm,
+                    }
+                    st["last_processed_1m_ts"] = c_ts
+                    break
 
         st["last_processed_1m_ts"] = c_ts
 
