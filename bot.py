@@ -40,6 +40,7 @@ BASE_URL = "https://api.coindcx.com"
 # =============================================================================
 
 TP_PCT               = 1.5    # fixed TP %
+MIN_SL_PCT           = 0.5    # minimum SL distance from entry (%)
 
 SWEEP_EXPIRY_BARS    = 60     # 1m bars before an unresolved sweep expires (= 60 min)
 CANDLES_DAILY        = 5      # daily candles fetched  (only prev day needed)
@@ -891,7 +892,9 @@ def check_and_trade(symbol, row, df, all_state):
                 if c_ts > st["first_signal_ts"] and c > st["first_signal_high"]:
                     bars_to_confirm = (c_ts - st["sweep_ts"]) // (CANDLE_SECONDS_1M * 1000)
                     entry_price  = c
-                    sl_price_val = st["recent_swing_low"]
+                    natural_sl   = st["recent_swing_low"]
+                    min_sl       = entry_price * (1 - MIN_SL_PCT / 100)
+                    sl_price_val = min(natural_sl, min_sl)   # further of the two
                     tp_price_val = entry_price * (1 + TP_PCT / 100)
                     entry_path   = "long_sweep"
                     signal_info  = {
@@ -952,7 +955,9 @@ def check_and_trade(symbol, row, df, all_state):
                 if c_ts > st["first_signal_ts"] and c < st["first_signal_low"]:
                     bars_to_confirm = (c_ts - st["sweep_ts"]) // (CANDLE_SECONDS_1M * 1000)
                     entry_price  = c
-                    sl_price_val = st["recent_swing_high"]
+                    natural_sl   = st["recent_swing_high"]
+                    min_sl       = entry_price * (1 + MIN_SL_PCT / 100)
+                    sl_price_val = max(natural_sl, min_sl)   # further of the two
                     tp_price_val = entry_price * (1 - TP_PCT / 100)
                     entry_path   = "short_sweep"
                     signal_info  = {
