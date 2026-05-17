@@ -48,8 +48,10 @@ CANDLES_1M           = 300    # 1m candles fetched per scan  (~5 hours)
 
 RESOLUTION_DAILY     = "1D"
 RESOLUTION_1M        = "1"
+RESOLUTION_1H        = "60"
 CANDLE_SECONDS_DAILY = 86400
 CANDLE_SECONDS_1M    = 60
+CANDLE_SECONDS_1H    = 3600
 
 SCAN_INTERVAL        = 90
 REQUEST_TIMEOUT      = 15
@@ -185,6 +187,10 @@ def init_symbol_state():
         "bars_to_first_signal": None,   # how many 1m bars from sweep to first signal
 
         "last_processed_1m_ts": 0,
+
+        # Already-swept guard (reset each new day)
+        "pdl_swept_today":      False,  # 1h candle already swept PDL today
+        "pdh_swept_today":      False,  # 1h candle already swept PDH today
     }
 
 
@@ -660,6 +666,7 @@ def check_and_trade(symbol, row, df, all_state):
             st[k] = v
 
     # ── 3. New-day reset (preserve position state, reset sweep) ───────────
+    # CoinDCX daily candle resets at 00:00 UTC (= 05:30 AM IST)
     today_str = datetime.utcnow().strftime("%Y-%m-%d")
     if st["current_day_str"] != today_str:
         print(f"[NEW DAY] {symbol} — PDH={pdh} PDL={pdl}  (resetting sweep state)")
@@ -767,7 +774,30 @@ def check_and_trade(symbol, row, df, all_state):
         print(f"[OPEN ORDER] {symbol} — unfilled entry order on book, skipping")
         return
 
-    # ── 6. Fetch 1m candles ───────────────────────────────────────────────
+    # ── 6. Check 1h candles — has this level already been swept today? ───
+    # Fetch today's 1h closed candles and see if any already swept PDH/PDL.
+    # If yes, skip this symbol for the rest of the day.
+    if not st.get("pdl_swept_today") or not st.get("pdh_swept_today"):
+        candles_1h = fetch_candles(symbol, 30, RESOLUTION_1H, CANDLE_SECONDS_1H)
+        # Keep only candles that opened today (UTC)
+        # Daily candle on CoinDCX starts at 00:00 UTC = 05:30 AM IST
+        # today_str is already derived from UTC, so this is correct
+        from datetime import timezone
+        today_start_ms = int(datetime.strptime(today_str, "%Y-%m-%d")
+                             .replace(tzinfo=timezone.utc).timestamp() * 1000)
+        todays_1h = [c for c in candles_1h if int(c["time"]) >= today_start_ms]
+        for c1h in todays_1h:
+            if float(c1h["low"])  < pdl:
+                st["pdl_swept_today"] = True
+            if float(c1h["high"]) > pdh:
+                st["pdh_swept_today"] = True
+
+    if st.get("pdl_swept_today") and st.get("pdh_swept_today"):
+        print(f"[SKIP] {symbol} — both PDH and PDL already swept today on 1h, no trade")
+        save_state(all_state)
+        return
+
+    # ── 7. Fetch 1m candles ───────────────────────────────────────────────
     candles_1m = fetch_candles(symbol, CANDLES_1M, RESOLUTION_1M, CANDLE_SECONDS_1M)
 
     # Drop in-progress 1m bar
@@ -787,7 +817,7 @@ def check_and_trade(symbol, row, df, all_state):
         save_state(all_state)
         return
 
-    # ── 7. Walk new 1m candles — sweep detection + 2-candle pattern ───────
+    # ── 8. Walk new 1m candles — sweep detection + 2-candle pattern ───────
     entry_path   = None
     entry_price  = None
     sl_price_val = None
@@ -805,7 +835,7 @@ def check_and_trade(symbol, row, df, all_state):
 
         # ── A. No sweep yet — detect one ──────────────────────────────────
         if sweep_dir is None:
-            if l < pdl:                                 # swept below PDL → long setup
+            if l < pdl and not st.get("pdl_swept_today"):  # swept below PDL → long setup
                 st["sweep_direction"]  = "long"
                 st["sweep_ts"]         = c_ts
                 st["recent_swing_low"] = l
@@ -814,7 +844,7 @@ def check_and_trade(symbol, row, df, all_state):
                 ext = round(pdl - l, precision)
                 print(f"[SWEEP-LONG]  {symbol} | low={l} < PDL={pdl} (ext={ext}) | ts={c_ts}")
 
-            elif h > pdh:                               # swept above PDH → short setup
+            elif h > pdh and not st.get("pdh_swept_today"):  # swept above PDH → short setup
                 st["sweep_direction"]   = "short"
                 st["sweep_ts"]          = c_ts
                 st["recent_swing_high"] = h
@@ -953,7 +983,7 @@ def check_and_trade(symbol, row, df, all_state):
         save_state(all_state)
         return
 
-    # ── 8. Validate SL / TP ───────────────────────────────────────────────
+    # ── 9. Validate SL / TP ───────────────────────────────────────────────
     if entry_path == "long_sweep" and sl_price_val >= entry_price:
         print(f"[SKIP] {symbol} — invalid SL for long (entry={entry_price} SL={sl_price_val})")
         save_state(all_state)
@@ -971,7 +1001,7 @@ def check_and_trade(symbol, row, df, all_state):
         print(f"[ABORT] {symbol} — order appeared just before placement")
         return
 
-    # ── 9. Place order ────────────────────────────────────────────────────
+    # ── 10. Place order ───────────────────────────────────────────────────
     if entry_path == "long_sweep":
         placed = place_long_order(symbol, entry_price, tp_price_val, sl_price_val, precision, signal_info)
     else:
