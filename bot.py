@@ -21,7 +21,7 @@ BASE_URL = "https://api.coindcx.com"
 #
 # LONG SETUP:
 #   1. A 1m candle's low  breaks below PDL           → sweep detected
-#   2. First full-body bullish 1m candle after sweep  → candle 1
+#   2. First strong-body bull (body≥70%)ish 1m candle after sweep  → candle 1
 #   3. IMMEDIATELY next 1m candle is also full-body
 #      bullish (no wick)                              → ENTER LONG at close
 #   SL = sweep low  (min MIN_SL_PCT% from entry)
@@ -29,13 +29,13 @@ BASE_URL = "https://api.coindcx.com"
 #
 # SHORT SETUP:
 #   1. A 1m candle's high breaks above PDH            → sweep detected
-#   2. First full-body bearish 1m candle after sweep  → candle 1
+#   2. First strong-body bear (body≥70%)ish 1m candle after sweep  → candle 1
 #   3. IMMEDIATELY next 1m candle is also full-body
 #      bearish (no wick)                              → ENTER SHORT at close
 #   SL = sweep high  (min MIN_SL_PCT% from entry)
 #   TP = entry × (1 − TP_PCT / 100)
 #
-# FULL-BODY = wick on each side ≤ MAX_WICK_RATIO × body size
+# STRONG BODY = body ≥ MIN_BODY_PCT% of total candle range AND C2 closes beyond C1
 # If candle 2 fails, reset candle 1 and look for a fresh pair.
 #
 # 1H GUARD:
@@ -46,7 +46,7 @@ BASE_URL = "https://api.coindcx.com"
 
 TP_PCT          = 1.5    # fixed TP %
 MIN_SL_PCT      = 0.5    # minimum SL distance from entry (%)
-MAX_WICK_RATIO  = 0.1    # wick ≤ 10% of body = "no wick" / full-body candle
+MIN_BODY_PCT    = 70     # body must be ≥ 70% of total candle range (high - low)
 SWEEP_EXPIRY_BARS = 60   # 1m bars before unresolved sweep expires (60 min)
 
 CANDLES_DAILY   = 5
@@ -266,28 +266,24 @@ def get_precision(raw_candle_close):
 # FULL-BODY CANDLE CHECKS
 # =====================================================
 
-def is_full_body_bullish(o, h, l, c):
-    """Bullish candle with wick ≤ MAX_WICK_RATIO × body on each side."""
+def is_strong_bullish(o, h, l, c):
+    """Bullish candle whose body is ≥ MIN_BODY_PCT% of total range."""
     if c <= o:
         return False
-    body = c - o
-    if body == 0:
+    rng = h - l
+    if rng == 0:
         return False
-    upper_wick = h - c   # wick above close
-    lower_wick = o - l   # wick below open
-    return upper_wick <= body * MAX_WICK_RATIO and lower_wick <= body * MAX_WICK_RATIO
+    return ((c - o) / rng * 100) >= MIN_BODY_PCT
 
 
-def is_full_body_bearish(o, h, l, c):
-    """Bearish candle with wick ≤ MAX_WICK_RATIO × body on each side."""
+def is_strong_bearish(o, h, l, c):
+    """Bearish candle whose body is ≥ MIN_BODY_PCT% of total range."""
     if c >= o:
         return False
-    body = o - c
-    if body == 0:
+    rng = h - l
+    if rng == 0:
         return False
-    upper_wick = h - o   # wick above open
-    lower_wick = c - l   # wick below close
-    return upper_wick <= body * MAX_WICK_RATIO and lower_wick <= body * MAX_WICK_RATIO
+    return ((o - c) / rng * 100) >= MIN_BODY_PCT
 
 
 # =====================================================
@@ -505,9 +501,9 @@ def place_long_order(symbol, entry_price, tp_price, sl_price, precision, si=None
         f"🕯 Sweep candle : O=<code>{si.get('s_o')}</code> H=<code>{si.get('s_h')}</code> "
         f"L=<code>{si.get('s_l')}</code> C=<code>{si.get('s_c')}</code>\n"
         f"🟢 Candle 1     : O=<code>{si.get('c1_o')}</code> H=<code>{si.get('c1_h')}</code> "
-        f"L=<code>{si.get('c1_l')}</code> C=<code>{si.get('c1_c')}</code>  (full-body bull)\n"
+        f"L=<code>{si.get('c1_l')}</code> C=<code>{si.get('c1_c')}</code>  (strong-body bull (body≥70%))\n"
         f"🟢 Candle 2     : O=<code>{si.get('c2_o')}</code> H=<code>{si.get('c2_h')}</code> "
-        f"L=<code>{si.get('c2_l')}</code> C=<code>{si.get('c2_c')}</code>  (full-body bull)\n"
+        f"L=<code>{si.get('c2_l')}</code> C=<code>{si.get('c2_c')}</code>  (strong-body bull (body≥70%))\n"
         f"📌 Entry at close of candle 2"
     )
     return True
@@ -574,9 +570,9 @@ def place_short_order(symbol, entry_price, tp_price, sl_price, precision, si=Non
         f"🕯 Sweep candle : O=<code>{si.get('s_o')}</code> H=<code>{si.get('s_h')}</code> "
         f"L=<code>{si.get('s_l')}</code> C=<code>{si.get('s_c')}</code>\n"
         f"🔴 Candle 1     : O=<code>{si.get('c1_o')}</code> H=<code>{si.get('c1_h')}</code> "
-        f"L=<code>{si.get('c1_l')}</code> C=<code>{si.get('c1_c')}</code>  (full-body bear)\n"
+        f"L=<code>{si.get('c1_l')}</code> C=<code>{si.get('c1_c')}</code>  (strong-body bear (body≥70%))\n"
         f"🔴 Candle 2     : O=<code>{si.get('c2_o')}</code> H=<code>{si.get('c2_h')}</code> "
-        f"L=<code>{si.get('c2_l')}</code> C=<code>{si.get('c2_c')}</code>  (full-body bear)\n"
+        f"L=<code>{si.get('c2_l')}</code> C=<code>{si.get('c2_c')}</code>  (strong-body bear (body≥70%))\n"
         f"📌 Entry at close of candle 2"
     )
     return True
@@ -832,20 +828,20 @@ def check_and_trade(symbol, row, df, all_state):
                 continue
 
             if st["candle1_ts"] == 0:
-                # Looking for FIRST full-body bullish candle
-                if is_full_body_bullish(o, h, l, c):
+                # Looking for FIRST strong-body bull (body≥70%)ish candle
+                if is_strong_bullish(o, h, l, c):
                     st["candle1_ts"] = c_ts
                     st["candle1_o"]  = o; st["candle1_h"] = h
                     st["candle1_l"]  = l; st["candle1_c"] = c
-                    print(f"  [{symbol}] CANDLE1-LONG full-body bull "
+                    print(f"  [{symbol}] CANDLE1-LONG strong-body bull (body≥70%) "
                           f"O={round(o,precision)} H={round(h,precision)} "
                           f"L={round(l,precision)} C={round(c,precision)}")
             else:
                 # Candle 2 MUST be the immediately next 1m bar
                 expected_ts = st["candle1_ts"] + CANDLE_SECONDS_1M * 1000
                 if c_ts == expected_ts:
-                    if is_full_body_bullish(o, h, l, c):
-                        # ✅ Two consecutive full-body bull candles — ENTER LONG
+                    if is_strong_bullish(o, h, l, c) and c > st["candle1_c"]:
+                        # ✅ Two consecutive strong-body bull candles, C2 closes above C1 — ENTER LONG
                         entry_price  = c
                         natural_sl   = st["recent_swing_low"]
                         min_sl       = entry_price * (1 - MIN_SL_PCT / 100)
@@ -874,10 +870,10 @@ def check_and_trade(symbol, row, df, all_state):
                         break
                     else:
                         # Candle 2 not full-body — reset candle1, try again
-                        print(f"  [{symbol}] CANDLE2-LONG failed (not full-body) — reset C1")
+                        print(f"  [{symbol}] CANDLE2-LONG failed (body<70% or close not above C1) — reset C1")
                         _reset_candle1(st)
                         # Check if this candle itself qualifies as a new candle1
-                        if is_full_body_bullish(o, h, l, c):
+                        if is_strong_bullish(o, h, l, c):
                             st["candle1_ts"] = c_ts
                             st["candle1_o"]  = o; st["candle1_h"] = h
                             st["candle1_l"]  = l; st["candle1_c"] = c
@@ -887,7 +883,7 @@ def check_and_trade(symbol, row, df, all_state):
                     # Gap between candle1 and this candle — candle1 is stale, reset
                     print(f"  [{symbol}] CANDLE1-LONG stale (gap) — reset C1")
                     _reset_candle1(st)
-                    if is_full_body_bullish(o, h, l, c):
+                    if is_strong_bullish(o, h, l, c):
                         st["candle1_ts"] = c_ts
                         st["candle1_o"]  = o; st["candle1_h"] = h
                         st["candle1_l"]  = l; st["candle1_c"] = c
@@ -908,19 +904,19 @@ def check_and_trade(symbol, row, df, all_state):
                 continue
 
             if st["candle1_ts"] == 0:
-                # Looking for FIRST full-body bearish candle
-                if is_full_body_bearish(o, h, l, c):
+                # Looking for FIRST strong-body bear (body≥70%)ish candle
+                if is_strong_bearish(o, h, l, c):
                     st["candle1_ts"] = c_ts
                     st["candle1_o"]  = o; st["candle1_h"] = h
                     st["candle1_l"]  = l; st["candle1_c"] = c
-                    print(f"  [{symbol}] CANDLE1-SHORT full-body bear "
+                    print(f"  [{symbol}] CANDLE1-SHORT strong-body bear (body≥70%) "
                           f"O={round(o,precision)} H={round(h,precision)} "
                           f"L={round(l,precision)} C={round(c,precision)}")
             else:
                 expected_ts = st["candle1_ts"] + CANDLE_SECONDS_1M * 1000
                 if c_ts == expected_ts:
-                    if is_full_body_bearish(o, h, l, c):
-                        # ✅ Two consecutive full-body bear candles — ENTER SHORT
+                    if is_strong_bearish(o, h, l, c) and c < st["candle1_c"]:
+                        # ✅ Two consecutive strong-body bear candles, C2 closes below C1 — ENTER SHORT
                         entry_price  = c
                         natural_sl   = st["recent_swing_high"]
                         min_sl       = entry_price * (1 + MIN_SL_PCT / 100)
@@ -948,9 +944,9 @@ def check_and_trade(symbol, row, df, all_state):
                         st["last_processed_1m_ts"] = c_ts
                         break
                     else:
-                        print(f"  [{symbol}] CANDLE2-SHORT failed (not full-body) — reset C1")
+                        print(f"  [{symbol}] CANDLE2-SHORT failed (body<70% or close not below C1) — reset C1")
                         _reset_candle1(st)
-                        if is_full_body_bearish(o, h, l, c):
+                        if is_strong_bearish(o, h, l, c):
                             st["candle1_ts"] = c_ts
                             st["candle1_o"]  = o; st["candle1_h"] = h
                             st["candle1_l"]  = l; st["candle1_c"] = c
@@ -959,7 +955,7 @@ def check_and_trade(symbol, row, df, all_state):
                 else:
                     print(f"  [{symbol}] CANDLE1-SHORT stale (gap) — reset C1")
                     _reset_candle1(st)
-                    if is_full_body_bearish(o, h, l, c):
+                    if is_strong_bearish(o, h, l, c):
                         st["candle1_ts"] = c_ts
                         st["candle1_o"]  = o; st["candle1_h"] = h
                         st["candle1_l"]  = l; st["candle1_c"] = c
@@ -1023,12 +1019,12 @@ send_telegram(
     f"✅ <b>PDH/PDL Sweep Bot Started</b>\n"
     f"━━━━━━━━━━━━━━━━━━\n"
     f"📐 Strategy  : <code>PDH/PDL Liquidity Sweep (Long + Short)</code>\n"
-    f"⚡ Entry     : <code>2 consecutive full-body 1m candles after sweep</code>\n"
+    f"⚡ Entry     : <code>2 consecutive 1m candles: body≥70%, C2 close beyond C1</code>\n"
     f"🔒 1h Guard  : <code>Skip if already swept on closed 1h today</code>\n"
     f"🔁 Scan      : <code>Every 90 seconds</code>\n"
     f"🎯 TP        : <code>entry ± {TP_PCT}%</code>\n"
     f"🛑 SL        : <code>sweep extreme (min {MIN_SL_PCT}% from entry)</code>\n"
-    f"📏 Full-body : <code>wick ≤ {int(MAX_WICK_RATIO*100)}% of body</code>\n"
+    f"📏 Body rule : <code>body ≥ {MIN_BODY_PCT}% of candle range + C2 closes beyond C1</code>\n"
     f"⏳ Sweep exp : <code>{SWEEP_EXPIRY_BARS} × 1m bars</code>\n"
     f"💰 Capital   : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
 )
