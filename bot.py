@@ -601,7 +601,7 @@ def place_short_order(symbol, entry_price, tp_price, sl_price, precision):
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📍 Entry : <code>{entry}</code>\n"
         f"🎯 TP    : <code>{tp}</code>  (-{tp_pct}%)\n"
-        f"🛑 SL    : <code>{sl}</code>  (+{sl_pct}%)  ← C1 high\n"
+        f"🛑 SL    : <code>{sl}</code>  (+" + f"{sl_pct}%)  ← C1 high\n"
         f"📦 Qty   : <code>{qty}</code>\n"
         f"💰 Margin: <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
     )
@@ -798,6 +798,11 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
         save_state(all_state)
         return
 
+    # Get the timestamp threshold for today start (00:00 UTC)
+    today_start_ms = int(datetime.strptime(today_str, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000)
+    # Get the absolute newest closed candle time in this batch
+    newest_candle_ts = int(candles_5m[-1]["time"])
+
     # ── 8. Walk 5m candles — 2-candle reversal based on Bias ──────────────
     entry_path   = None
     entry_price  = None
@@ -818,104 +823,116 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
         # ── A. Long Trend Setup — looking for C1 then C2 ────────────────────
         if active_bias == "long":
             if st["candle1_ts"] == 0:
-                # C1: must be a recognised bullish reversal pattern
-                c1_match, c1_pattern = is_bullish_reversal_c1(o, h, l, c, prev_o, prev_c_val)
-                if c1_match:
-                    st["candle1_ts"] = c_ts
-                    st["candle1_o"]  = o; st["candle1_h"] = h
-                    st["candle1_l"]  = l; st["candle1_c"] = c
-                    print(f"  [{symbol}] C1-LONG [{c1_pattern}] "
-                          f"O={round(o,precision)} H={round(h,precision)} "
-                          f"L={round(l,precision)} C={round(c,precision)}")
-            else:
-                expected_ts = st["candle1_ts"] + CANDLE_SECONDS_5M * 1000
-                if c_ts == expected_ts:
-                    body_pct = round((c - o) / (h - l) * 100, 1) if h != l else 0
-                    if is_strong_bullish(o, h, l, c) and c > st["candle1_c"]:
-                        # ✅ C2 confirmed — ENTER LONG
-                        entry_price  = c
-                        natural_sl   = st["candle1_l"]     # SL at C1 low
-                        min_sl       = entry_price * (1 - MIN_SL_PCT / 100)
-                        sl_price_val = min(natural_sl, min_sl)
-                        tp_price_val = entry_price * (1 + TP_PCT / 100)
-                        entry_path   = "long_trend"
-                        print(f"  [{symbol}] C2-LONG confirmed body={body_pct}% "
-                              f"C={round(c,precision)} > C1={round(st['candle1_c'],precision)}")
-                        st["last_processed_5m_ts"] = c_ts
-                        break
-                    else:
-                        print(f"  [{symbol}] C2-LONG failed "
-                              f"(body={body_pct}% or C={round(c,precision)} "
-                              f"not > C1={round(st['candle1_c'],precision)}) — reset C1")
-                        _reset_candle1(st)
-                        c1_match, c1_pattern = is_bullish_reversal_c1(o, h, l, c, prev_o, prev_c_val)
-                        if c1_match:
-                            st["candle1_ts"] = c_ts
-                            st["candle1_o"]  = o; st["candle1_h"] = h
-                            st["candle1_l"]  = l; st["candle1_c"] = c
-                            print(f"  [{symbol}] C1-LONG retry [{c1_pattern}] C={round(c,precision)}")
-                else:
-                    # Gap — C1 is stale, reset
-                    print(f"  [{symbol}] C1-LONG stale (gap) — reset C1")
-                    _reset_candle1(st)
+                # C1 validation: Must be within the current day timeline
+                if c_ts >= today_start_ms:
                     c1_match, c1_pattern = is_bullish_reversal_c1(o, h, l, c, prev_o, prev_c_val)
                     if c1_match:
                         st["candle1_ts"] = c_ts
                         st["candle1_o"]  = o; st["candle1_h"] = h
                         st["candle1_l"]  = l; st["candle1_c"] = c
-                        print(f"  [{symbol}] C1-LONG after-gap [{c1_pattern}] C={round(c,precision)}")
-
-        # ── B. Short Trend Setup — looking for C1 then C2 ───────────────────
-        elif active_bias == "short":
-            if st["candle1_ts"] == 0:
-                # C1: must be a recognised bearish reversal pattern
-                c1_match, c1_pattern = is_bearish_reversal_c1(o, h, l, c, prev_o, prev_c_val)
-                if c1_match:
-                    st["candle1_ts"] = c_ts
-                    st["candle1_o"]  = o; st["candle1_h"] = h
-                    st["candle1_l"]  = l; st["candle1_c"] = c
-                    print(f"  [{symbol}] C1-SHORT [{c1_pattern}] "
-                          f"O={round(o,precision)} H={round(h,precision)} "
-                          f"L={round(l,precision)} C={round(c,precision)}")
+                        print(f"  [{symbol}] C1-LONG [{c1_pattern}] "
+                              f"O={round(o,precision)} H={round(h,precision)} "
+                              f"L={round(l,precision)} C={round(c,precision)}")
             else:
                 expected_ts = st["candle1_ts"] + CANDLE_SECONDS_5M * 1000
                 if c_ts == expected_ts:
-                    body_pct = round((o - c) / (h - l) * 100, 1) if h != l else 0
-                    if is_strong_bearish(o, h, l, c) and c < st["candle1_c"]:
-                        # ✅ C2 confirmed — ENTER SHORT
-                        entry_price  = c
-                        natural_sl   = st["candle1_h"]     # SL at C1 high
-                        min_sl       = entry_price * (1 + MIN_SL_PCT / 100)
-                        sl_price_val = max(natural_sl, min_sl)
-                        tp_price_val = entry_price * (1 - TP_PCT / 100)
-                        entry_path   = "short_trend"
-                        print(f"  [{symbol}] C2-SHORT confirmed body={body_pct}% "
-                              f"C={round(c,precision)} < C1={round(st['candle1_c'],precision)}")
-                        st["last_processed_5m_ts"] = c_ts
-                        break
+                    body_pct = round((c - o) / (h - l) * 100, 1) if h != l else 0
+                    if is_strong_bullish(o, h, l, c) and c > st["candle1_c"]:
+                        # CRITICAL FIX: Only execute execution block if C2 matches the latest live completed bar
+                        if c_ts == newest_candle_ts:
+                            entry_price  = c
+                            natural_sl   = st["candle1_l"]     # SL at C1 low
+                            min_sl       = entry_price * (1 - MIN_SL_PCT / 100)
+                            sl_price_val = min(natural_sl, min_sl)
+                            tp_price_val = entry_price * (1 + TP_PCT / 100)
+                            entry_path   = "long_trend"
+                            print(f"  [{symbol}] C2-LONG confirmed body={body_pct}% "
+                                  f"C={round(c,precision)} > C1={round(st['candle1_c'],precision)}")
+                            st["last_processed_5m_ts"] = c_ts
+                            break
+                        else:
+                            # If it's a historical C2 confirmation, advance state without placing order
+                            _reset_candle1(st)
                     else:
-                        print(f"  [{symbol}] C2-SHORT failed "
+                        print(f"  [{symbol}] C2-LONG failed "
                               f"(body={body_pct}% or C={round(c,precision)} "
-                              f"not < C1={round(st['candle1_c'],precision)}) — reset C1")
+                              f"not > C1={round(st['candle1_c'],precision)}) — reset C1")
                         _reset_candle1(st)
-                        c1_match, c1_pattern = is_bearish_reversal_c1(o, h, l, c, prev_o, prev_c_val)
+                        if c_ts >= today_start_ms:
+                            c1_match, c1_pattern = is_bullish_reversal_c1(o, h, l, c, prev_o, prev_c_val)
+                            if c1_match:
+                                st["candle1_ts"] = c_ts
+                                st["candle1_o"]  = o; st["candle1_h"] = h
+                                st["candle1_l"]  = l; st["candle1_c"] = c
+                                print(f"  [{symbol}] C1-LONG retry [{c1_pattern}] C={round(c,precision)}")
+                else:
+                    print(f"  [{symbol}] C1-LONG stale (gap) — reset C1")
+                    _reset_candle1(st)
+                    if c_ts >= today_start_ms:
+                        c1_match, c1_pattern = is_bullish_reversal_c1(o, h, l, c, prev_o, prev_c_val)
                         if c1_match:
                             st["candle1_ts"] = c_ts
                             st["candle1_o"]  = o; st["candle1_h"] = h
                             st["candle1_l"]  = l; st["candle1_c"] = c
-                            print(f"  [{symbol}] C1-SHORT retry [{c1_pattern}] C={round(c,precision)}")
-                else:
-                    print(f"  [{symbol}] C1-SHORT stale (gap) — reset C1")
-                    _reset_candle1(st)
+                            print(f"  [{symbol}] C1-LONG after-gap [{c1_pattern}] C={round(c,precision)}")
+
+        # ── B. Short Trend Setup — looking for C1 then C2 ───────────────────
+        elif active_bias == "short":
+            if st["candle1_ts"] == 0:
+                # C1 validation: Must be within the current day timeline
+                if c_ts >= today_start_ms:
                     c1_match, c1_pattern = is_bearish_reversal_c1(o, h, l, c, prev_o, prev_c_val)
                     if c1_match:
                         st["candle1_ts"] = c_ts
                         st["candle1_o"]  = o; st["candle1_h"] = h
                         st["candle1_l"]  = l; st["candle1_c"] = c
-                        print(f"  [{symbol}] C1-SHORT after-gap [{c1_pattern}] C={round(c,precision)}")
+                        print(f"  [{symbol}] C1-SHORT [{c1_pattern}] "
+                              f"O={round(o,precision)} H={round(h,precision)} "
+                              f"L={round(l,precision)} C={round(c,precision)}")
+            else:
+                expected_ts = st["candle1_ts"] + CANDLE_SECONDS_5M * 1000
+                if c_ts == expected_ts:
+                    body_pct = round((o - c) / (h - l) * 100, 1) if h != l else 0
+                    if is_strong_bearish(o, h, l, c) and c < st["candle1_c"]:
+                        # CRITICAL FIX: Only execute execution block if C2 matches the latest live completed bar
+                        if c_ts == newest_candle_ts:
+                            entry_price  = c
+                            natural_sl   = st["candle1_h"]     # SL at C1 high
+                            min_sl       = entry_price * (1 + MIN_SL_PCT / 100)
+                            sl_price_val = max(natural_sl, min_sl)
+                            tp_price_val = entry_price * (1 - TP_PCT / 100)
+                            entry_path   = "short_trend"
+                            print(f"  [{symbol}] C2-SHORT confirmed body={body_pct}% "
+                                  f"C={round(c,precision)} < C1={round(st['candle1_c'],precision)}")
+                            st["last_processed_5m_ts"] = c_ts
+                            break
+                        else:
+                            # If it's a historical C2 confirmation, advance state without placing order
+                            _reset_candle1(st)
+                    else:
+                        print(f"  [{symbol}] C2-SHORT failed "
+                              f"(body={body_pct}% or C={round(c,precision)} "
+                              f"not < C1={round(st['candle1_c'],precision)}) — reset C1")
+                        _reset_candle1(st)
+                        if c_ts >= today_start_ms:
+                            c1_match, c1_pattern = is_bearish_reversal_c1(o, h, l, c, prev_o, prev_c_val)
+                            if c1_match:
+                                st["candle1_ts"] = c_ts
+                                st["candle1_o"]  = o; st["candle1_h"] = h
+                                st["candle1_l"]  = l; st["candle1_c"] = c
+                                print(f"  [{symbol}] C1-SHORT retry [{c1_pattern}] C={round(c,precision)}")
+                else:
+                    print(f"  [{symbol}] C1-SHORT stale (gap) — reset C1")
+                    _reset_candle1(st)
+                    if c_ts >= today_start_ms:
+                        c1_match, c1_pattern = is_bearish_reversal_c1(o, h, l, c, prev_o, prev_c_val)
+                        if c1_match:
+                            st["candle1_ts"] = c_ts
+                            st["candle1_o"]  = o; st["candle1_h"] = h
+                            st["candle1_l"]  = l; st["candle1_c"] = c
+                            print(f"  [{symbol}] C1-SHORT after-gap [{c1_pattern}] C={round(c,precision)}")
 
         st["last_processed_5m_ts"] = c_ts
-        # Keep this candle as "previous" for next iteration (engulfing detection)
         prev_o, prev_h, prev_l, prev_c_val = o, h, l, c
 
     # ── 9. No entry found ─────────────────────────────────────────────────
