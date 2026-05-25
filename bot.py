@@ -35,6 +35,11 @@ BASE_URL = "https://api.coindcx.com"
 TP_PCT            = 1.25   # fixed TP %
 MIN_SL_PCT        = 0.5    # minimum SL distance from entry (%)
 MIN_BODY_PCT      = 70     # C2 body must be ≥ 70% of total candle range (high - low)
+
+# C1 reversal pattern thresholds
+DOJI_BODY_RATIO   = 0.10   # body ≤ 10% of range  → Doji
+PIN_BODY_RATIO    = 0.35   # body ≤ 35% of range  → Pin Bar / Hammer / Shooting Star
+WICK_MIN_RATIO    = 0.60   # dominant wick ≥ 60% of range
 SWEEP_EXPIRY_BARS = 12     # 5m bars before unresolved sweep expires (12 × 5m = 60 min)
 
 CANDLES_DAILY     = 5
@@ -364,6 +369,80 @@ def is_strong_bearish(o, h, l, c):
 
 
 # ── Candle fetchers ───────────────────────────────────────────────────────────
+
+def is_bullish_reversal_c1(o, h, l, c, prev_o=None, prev_c=None):
+    """
+    Returns (matched, pattern_name) for bullish reversal patterns (C1 after PDL sweep).
+    Checks: Dragonfly Doji, Hammer/Pin Bar, Bullish Engulfing.
+    """
+    rng = h - l
+    if rng == 0:
+        return False, None
+    body        = abs(c - o)
+    body_ratio  = body / rng
+    lower_wick  = min(o, c) - l      # wick below body
+    upper_wick  = h - max(o, c)      # wick above body
+    lower_ratio = lower_wick / rng
+    upper_ratio = upper_wick / rng
+
+    # Dragonfly Doji: tiny body, long lower wick
+    if body_ratio <= DOJI_BODY_RATIO and lower_ratio >= WICK_MIN_RATIO:
+        return True, "Dragonfly Doji"
+
+    # Hammer / Pin Bar: small body, long lower wick, small upper wick, closes in upper half
+    if (body_ratio <= PIN_BODY_RATIO
+            and lower_ratio >= WICK_MIN_RATIO
+            and upper_ratio <= 0.15
+            and c >= (h + l) / 2):
+        return True, "Hammer/Pin Bar"
+
+    # Bullish Engulfing: prev candle bearish, current bullish body covers prev body
+    if (prev_o is not None and prev_c is not None
+            and prev_c < prev_o            # prev was bearish
+            and c > o                      # current is bullish
+            and o <= prev_c               # open at or below prev close
+            and c >= prev_o):              # close at or above prev open
+        return True, "Bullish Engulfing"
+
+    return False, None
+
+
+def is_bearish_reversal_c1(o, h, l, c, prev_o=None, prev_c=None):
+    """
+    Returns (matched, pattern_name) for bearish reversal patterns (C1 after PDH sweep).
+    Checks: Gravestone Doji, Shooting Star/Pin Bar, Bearish Engulfing.
+    """
+    rng = h - l
+    if rng == 0:
+        return False, None
+    body        = abs(c - o)
+    body_ratio  = body / rng
+    lower_wick  = min(o, c) - l
+    upper_wick  = h - max(o, c)
+    lower_ratio = lower_wick / rng
+    upper_ratio = upper_wick / rng
+
+    # Gravestone Doji: tiny body, long upper wick
+    if body_ratio <= DOJI_BODY_RATIO and upper_ratio >= WICK_MIN_RATIO:
+        return True, "Gravestone Doji"
+
+    # Shooting Star / Pin Bar: small body, long upper wick, small lower wick, closes in lower half
+    if (body_ratio <= PIN_BODY_RATIO
+            and upper_ratio >= WICK_MIN_RATIO
+            and lower_ratio <= 0.15
+            and c <= (h + l) / 2):
+        return True, "Shooting Star/Pin Bar"
+
+    # Bearish Engulfing: prev candle bullish, current bearish body covers prev body
+    if (prev_o is not None and prev_c is not None
+            and prev_c > prev_o            # prev was bullish
+            and c < o                      # current is bearish
+            and o >= prev_c               # open at or above prev close
+            and c <= prev_o):              # close at or below prev open
+        return True, "Bearish Engulfing"
+
+    return False, None
+
 
 def fetch_candles(symbol, num_candles, resolution_str, candle_seconds):
     pair_api = fut_pair(symbol)
@@ -745,6 +824,8 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
     sl_price_val = None
     tp_price_val = None
 
+    prev_o = prev_h = prev_l = prev_c_val = None  # tracks candle just before current
+
     for candle in new_candles:
         c_ts = int(candle["time"])
         o    = float(candle["open"])
@@ -787,12 +868,13 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
                 continue
 
             if st["candle1_ts"] == 0:
-                # C1: any bullish candle (rejection spike — no body rule)
-                if c > o:
+                # C1: must be a recognised bullish reversal pattern
+                c1_match, c1_pattern = is_bullish_reversal_c1(o, h, l, c, prev_o, prev_c_val)
+                if c1_match:
                     st["candle1_ts"] = c_ts
                     st["candle1_o"]  = o; st["candle1_h"] = h
                     st["candle1_l"]  = l; st["candle1_c"] = c
-                    print(f"  [{symbol}] C1-LONG spike "
+                    print(f"  [{symbol}] C1-LONG [{c1_pattern}] "
                           f"O={round(o,precision)} H={round(h,precision)} "
                           f"L={round(l,precision)} C={round(c,precision)}")
             else:
@@ -816,21 +898,22 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
                               f"(body={body_pct}% or C={round(c,precision)} "
                               f"not > C1={round(st['candle1_c'],precision)}) — reset C1")
                         _reset_candle1(st)
-                        # Check if this candle qualifies as new C1
-                        if c > o:
+                        c1_match, c1_pattern = is_bullish_reversal_c1(o, h, l, c, prev_o, prev_c_val)
+                        if c1_match:
                             st["candle1_ts"] = c_ts
                             st["candle1_o"]  = o; st["candle1_h"] = h
                             st["candle1_l"]  = l; st["candle1_c"] = c
-                            print(f"  [{symbol}] C1-LONG (retry) C={round(c,precision)}")
+                            print(f"  [{symbol}] C1-LONG retry [{c1_pattern}] C={round(c,precision)}")
                 else:
                     # Gap — C1 is stale, reset
                     print(f"  [{symbol}] C1-LONG stale (gap) — reset C1")
                     _reset_candle1(st)
-                    if c > o:
+                    c1_match, c1_pattern = is_bullish_reversal_c1(o, h, l, c, prev_o, prev_c_val)
+                    if c1_match:
                         st["candle1_ts"] = c_ts
                         st["candle1_o"]  = o; st["candle1_h"] = h
                         st["candle1_l"]  = l; st["candle1_c"] = c
-                        print(f"  [{symbol}] C1-LONG (after gap) C={round(c,precision)}")
+                        print(f"  [{symbol}] C1-LONG after-gap [{c1_pattern}] C={round(c,precision)}")
 
         # ── C. Short sweep — looking for C1 then C2 ───────────────────
         elif sweep_dir == "short":
@@ -845,12 +928,13 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
                 continue
 
             if st["candle1_ts"] == 0:
-                # C1: any bearish candle (rejection spike — no body rule)
-                if c < o:
+                # C1: must be a recognised bearish reversal pattern
+                c1_match, c1_pattern = is_bearish_reversal_c1(o, h, l, c, prev_o, prev_c_val)
+                if c1_match:
                     st["candle1_ts"] = c_ts
                     st["candle1_o"]  = o; st["candle1_h"] = h
                     st["candle1_l"]  = l; st["candle1_c"] = c
-                    print(f"  [{symbol}] C1-SHORT spike "
+                    print(f"  [{symbol}] C1-SHORT [{c1_pattern}] "
                           f"O={round(o,precision)} H={round(h,precision)} "
                           f"L={round(l,precision)} C={round(c,precision)}")
             else:
@@ -874,21 +958,25 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
                               f"(body={body_pct}% or C={round(c,precision)} "
                               f"not < C1={round(st['candle1_c'],precision)}) — reset C1")
                         _reset_candle1(st)
-                        if c < o:
+                        c1_match, c1_pattern = is_bearish_reversal_c1(o, h, l, c, prev_o, prev_c_val)
+                        if c1_match:
                             st["candle1_ts"] = c_ts
                             st["candle1_o"]  = o; st["candle1_h"] = h
                             st["candle1_l"]  = l; st["candle1_c"] = c
-                            print(f"  [{symbol}] C1-SHORT (retry) C={round(c,precision)}")
+                            print(f"  [{symbol}] C1-SHORT retry [{c1_pattern}] C={round(c,precision)}")
                 else:
                     print(f"  [{symbol}] C1-SHORT stale (gap) — reset C1")
                     _reset_candle1(st)
-                    if c < o:
+                    c1_match, c1_pattern = is_bearish_reversal_c1(o, h, l, c, prev_o, prev_c_val)
+                    if c1_match:
                         st["candle1_ts"] = c_ts
                         st["candle1_o"]  = o; st["candle1_h"] = h
                         st["candle1_l"]  = l; st["candle1_c"] = c
-                        print(f"  [{symbol}] C1-SHORT (after gap) C={round(c,precision)}")
+                        print(f"  [{symbol}] C1-SHORT after-gap [{c1_pattern}] C={round(c,precision)}")
 
         st["last_processed_5m_ts"] = c_ts
+        # Keep this candle as "previous" for next iteration (engulfing detection)
+        prev_o, prev_h, prev_l, prev_c_val = o, h, l, c
 
     # ── 9. No entry found ─────────────────────────────────────────────────
     if entry_path is None:
@@ -941,7 +1029,8 @@ send_telegram(
     f"📐 Strategy  : <code>PDH/PDL Liquidity Sweep (Long + Short)</code>\n"
     f"📅 Levels    : <code>Previous day high/low (daily candles)</code>\n"
     f"🔒 1h Guard  : <code>Skip if level already swept on closed 1h today</code>\n"
-    f"⚡ Entry     : <code>C1=5m spike (any direction), C2=5m body≥{MIN_BODY_PCT}% closing beyond C1</code>\n"
+    f"⚡ C1        : <code>Dragonfly/Gravestone Doji, Hammer/Pin Bar/Shooting Star, Engulfing</code>\n"
+    f"⚡ C2        : <code>5m body≥{MIN_BODY_PCT}% closing beyond C1 close</code>\n"
     f"⏳ Sweep exp : <code>{SWEEP_EXPIRY_BARS} × 5m bars = {SWEEP_EXPIRY_BARS * 5} min</code>\n"
     f"🔁 Scan      : <code>Every {SCAN_INTERVAL} seconds</code>\n"
     f"🎯 TP        : <code>entry ± {TP_PCT}%</code>\n"
