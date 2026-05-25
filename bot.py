@@ -37,7 +37,7 @@ MIN_SL_PCT        = 0.5    # minimum SL distance from entry (%)
 MIN_BODY_PCT      = 60     # C2 body must be ≥ 70% of total candle range (high - low)
 
 # C1 reversal pattern thresholds
-DOJI_BODY_RATIO   = 0.10   # body ≤ 10% of range  → Doji
+DOJI_BODY_RATIO   = 0.15   # body ≤ 10% of range  → Doji
 PIN_BODY_RATIO    = 0.35   # body ≤ 35% of range  → Pin Bar / Hammer / Shooting Star
 WICK_MIN_RATIO    = 0.60   # dominant wick ≥ 60% of range
 SWEEP_EXPIRY_BARS = 6     # 5m bars before unresolved sweep expires (6 × 5m = 30 min)
