@@ -20,32 +20,38 @@ BASE_URL = "https://api.coindcx.com"
 # STRATEGY PARAMETERS  (PDH/PDL Liquidity Sweep — LONG + SHORT)
 #
 # LONG SETUP:
-#   1. A 1m candle's low  breaks below PDL  →  sweep detected
-#   2. First bullish 1m candle after sweep   →  record its high
-#   3. Any subsequent 1m candle closes above that high  →  ENTER LONG
-#   SL = lowest low reached during/after sweep (min MIN_SL_PCT% from entry)
+#   1. A 1m candle's low  breaks below PDL           → sweep detected
+#   2. First full-body bullish 1m candle after sweep  → candle 1
+#   3. IMMEDIATELY next 1m candle is also full-body
+#      bullish (no wick)                              → ENTER LONG at close
+#   SL = sweep low  (min MIN_SL_PCT% from entry)
 #   TP = entry × (1 + TP_PCT / 100)
 #
 # SHORT SETUP:
-#   1. A 1m candle's high breaks above PDH  →  sweep detected
-#   2. First bearish 1m candle after sweep   →  record its low
-#   3. Any subsequent 1m candle closes below that low  →  ENTER SHORT
-#   SL = highest high reached during/after sweep (min MIN_SL_PCT% from entry)
+#   1. A 1m candle's high breaks above PDH            → sweep detected
+#   2. First full-body bearish 1m candle after sweep  → candle 1
+#   3. IMMEDIATELY next 1m candle is also full-body
+#      bearish (no wick)                              → ENTER SHORT at close
+#   SL = sweep high  (min MIN_SL_PCT% from entry)
 #   TP = entry × (1 − TP_PCT / 100)
 #
+# FULL-BODY = wick on each side ≤ MAX_WICK_RATIO × body size
+# If candle 2 fails, reset candle 1 and look for a fresh pair.
+#
 # 1H GUARD:
-#   Before arming any sweep, check today's 1h candles.
-#   If PDL already swept on 1h → skip long side.
-#   If PDH already swept on 1h → skip short side.
+#   Before arming any sweep, check today's CLOSED 1h candles.
+#   If PDL already swept on a closed 1h bar → skip long side.
+#   If PDH already swept on a closed 1h bar → skip short side.
 # =============================================================================
 
-TP_PCT             = 1.5    # fixed TP %
-MIN_SL_PCT         = 0.5    # minimum SL distance from entry (%)
-SWEEP_EXPIRY_BARS  = 60     # 1m bars before unresolved sweep expires (= 60 min)
+TP_PCT          = 1.5    # fixed TP %
+MIN_SL_PCT      = 0.5    # minimum SL distance from entry (%)
+MAX_WICK_RATIO  = 0.1    # wick ≤ 10% of body = "no wick" / full-body candle
+SWEEP_EXPIRY_BARS = 60   # 1m bars before unresolved sweep expires (60 min)
 
-CANDLES_DAILY      = 5      # daily candles to fetch
-CANDLES_1M         = 300    # 1m candles per scan (~5 hours)
-CANDLES_1H         = 30     # 1h candles for today's sweep guard
+CANDLES_DAILY   = 5
+CANDLES_1M      = 300    # ~5 hours of 1m candles per scan
+CANDLES_1H      = 30
 
 RESOLUTION_DAILY   = "1D"
 RESOLUTION_1M      = "1"
@@ -54,11 +60,11 @@ CANDLE_SECONDS_DAY = 86400
 CANDLE_SECONDS_1M  = 60
 CANDLE_SECONDS_1H  = 3600
 
-SCAN_INTERVAL         = 90       # seconds between scans
-REQUEST_TIMEOUT       = 15
-TELEGRAM_TIMEOUT      = 10
+SCAN_INTERVAL          = 90
+REQUEST_TIMEOUT        = 15
+TELEGRAM_TIMEOUT       = 10
 GSHEET_REAUTH_INTERVAL = 45 * 60
-STATE_FILE            = "pdh_pdl_state.json"
+STATE_FILE             = "pdh_pdl_state.json"
 
 
 # =====================================================
@@ -98,7 +104,6 @@ def get_sheet_data():
         if not data:
             return pd.DataFrame()
         df = pd.DataFrame(data)
-        # Ensure at least 3 columns
         while df.shape[1] < 3:
             df[df.shape[1]] = ""
         return df
@@ -154,43 +159,37 @@ def save_state(state):
 
 def init_symbol_state():
     return {
-        "in_position":          False,
-        "direction":            None,
-        "entry_price":          None,
-        "tp_level":             None,
-        "sl_price":             None,
-        "last_entry_ts":        0,
+        "in_position":   False,
+        "direction":     None,
+        "entry_price":   None,
+        "tp_level":      None,
+        "sl_price":      None,
+        "last_entry_ts": 0,
 
-        # Day tracking — resets sweep state at 00:00 UTC (05:30 IST)
-        "current_day_str":      None,
-        "pdh":                  None,
-        "pdl":                  None,
+        # Day tracking
+        "current_day_str": None,
+        "pdh":             None,
+        "pdl":             None,
 
         # 1h sweep guard (reset each new day)
-        "pdl_swept_1h":         False,
-        "pdh_swept_1h":         False,
+        "pdl_swept_1h": False,
+        "pdh_swept_1h": False,
 
         # Sweep state
-        "sweep_direction":      None,   # "long" or "short"
-        "sweep_ts":             0,
-        "recent_swing_low":     None,
-        "recent_swing_high":    None,
-        "sweep_o":              None,
-        "sweep_h":              None,
-        "sweep_l":              None,
-        "sweep_c":              None,
+        "sweep_direction":   None,   # "long" or "short"
+        "sweep_ts":          0,
+        "recent_swing_low":  None,   # lowest low during sweep (long SL)
+        "recent_swing_high": None,   # highest high during sweep (short SL)
+        "sweep_o": None, "sweep_h": None,
+        "sweep_l": None, "sweep_c": None,
 
-        # 2-candle pattern — no reset once first signal candle is found
-        "first_signal_high":    None,
-        "first_signal_low":     None,
-        "first_signal_ts":      0,
-        "first_signal_o":       None,
-        "first_signal_h":       None,
-        "first_signal_l":       None,
-        "first_signal_c":       None,
-        "bars_to_first_signal": None,
+        # 2-consecutive-full-body pattern
+        # candle1 = first qualifying full-body reversal candle after sweep
+        "candle1_ts": 0,
+        "candle1_o":  None, "candle1_h": None,
+        "candle1_l":  None, "candle1_c": None,
 
-        # 1m dedup — reset on new day so today's candles are always re-evaluated
+        # 1m dedup — reset to 0 on new day
         "last_processed_1m_ts": 0,
     }
 
@@ -201,7 +200,6 @@ def init_symbol_state():
 
 def normalize_symbol(raw):
     s = str(raw).upper().strip()
-    # Skip header rows or blank values
     if not s or s in ("SYMBOL", "PAIR", "COIN", "NAME"):
         return None
     if "USDT" in s:
@@ -265,6 +263,34 @@ def get_precision(raw_candle_close):
 
 
 # =====================================================
+# FULL-BODY CANDLE CHECKS
+# =====================================================
+
+def is_full_body_bullish(o, h, l, c):
+    """Bullish candle with wick ≤ MAX_WICK_RATIO × body on each side."""
+    if c <= o:
+        return False
+    body = c - o
+    if body == 0:
+        return False
+    upper_wick = h - c   # wick above close
+    lower_wick = o - l   # wick below open
+    return upper_wick <= body * MAX_WICK_RATIO and lower_wick <= body * MAX_WICK_RATIO
+
+
+def is_full_body_bearish(o, h, l, c):
+    """Bearish candle with wick ≤ MAX_WICK_RATIO × body on each side."""
+    if c >= o:
+        return False
+    body = o - c
+    if body == 0:
+        return False
+    upper_wick = h - o   # wick above open
+    lower_wick = c - l   # wick below close
+    return upper_wick <= body * MAX_WICK_RATIO and lower_wick <= body * MAX_WICK_RATIO
+
+
+# =====================================================
 # CANDLE FETCH
 # =====================================================
 
@@ -293,12 +319,11 @@ def fetch_candles(symbol, num_candles, resolution_str, candle_seconds):
 
 def get_recent_high(symbol):
     try:
-        pair_api = fut_pair(symbol)
-        now      = int(time.time())
-        params   = {"pair": pair_api, "from": now - SCAN_INTERVAL,
-                    "to": now, "resolution": "1", "pcode": "f"}
-        candles  = requests.get("https://public.coindcx.com/market_data/candlesticks",
-                                params=params, timeout=REQUEST_TIMEOUT).json().get("data", [])
+        now    = int(time.time())
+        params = {"pair": fut_pair(symbol), "from": now - SCAN_INTERVAL,
+                  "to": now, "resolution": "1", "pcode": "f"}
+        candles = requests.get("https://public.coindcx.com/market_data/candlesticks",
+                               params=params, timeout=REQUEST_TIMEOUT).json().get("data", [])
         return max(float(c["high"]) for c in candles) if candles else None
     except Exception as e:
         print(f"[RECENT HIGH] {symbol} error: {e}")
@@ -307,12 +332,11 @@ def get_recent_high(symbol):
 
 def get_recent_low(symbol):
     try:
-        pair_api = fut_pair(symbol)
-        now      = int(time.time())
-        params   = {"pair": pair_api, "from": now - SCAN_INTERVAL,
-                    "to": now, "resolution": "1", "pcode": "f"}
-        candles  = requests.get("https://public.coindcx.com/market_data/candlesticks",
-                                params=params, timeout=REQUEST_TIMEOUT).json().get("data", [])
+        now    = int(time.time())
+        params = {"pair": fut_pair(symbol), "from": now - SCAN_INTERVAL,
+                  "to": now, "resolution": "1", "pcode": "f"}
+        candles = requests.get("https://public.coindcx.com/market_data/candlesticks",
+                               params=params, timeout=REQUEST_TIMEOUT).json().get("data", [])
         return min(float(c["low"]) for c in candles) if candles else None
     except Exception as e:
         print(f"[RECENT LOW] {symbol} error: {e}")
@@ -411,7 +435,7 @@ def get_quantity_step(symbol):
 
 
 def compute_qty(entry_price, symbol):
-    step    = get_quantity_step(symbol)
+    step     = get_quantity_step(symbol)
     exposure = Decimal(str(CAPITAL_USDT)) * Decimal(str(LEVERAGE))
     raw_qty  = exposure / Decimal(str(entry_price))
     qty      = (raw_qty / step).quantize(Decimal("1")) * step
@@ -424,7 +448,7 @@ def compute_qty(entry_price, symbol):
 # PLACE LONG ORDER
 # =====================================================
 
-def place_long_order(symbol, entry_price, tp_price, sl_price, precision, signal_info=None):
+def place_long_order(symbol, entry_price, tp_price, sl_price, precision, si=None):
     entry = round(entry_price, precision)
     tp    = round(tp_price,    precision)
     sl    = round(sl_price,    precision)
@@ -433,7 +457,7 @@ def place_long_order(symbol, entry_price, tp_price, sl_price, precision, signal_
     tp_pct = round(((tp - entry) / entry) * 100, 2)
     sl_pct = round(((entry - sl) / entry) * 100, 2)
 
-    print(f"[LONG] {symbol} | Entry={entry} TP={tp}(+{tp_pct}%) SL={sl}(-{sl_pct}%) Qty={qty}")
+    print(f"  [LONG] Entry={entry} TP={tp}(+{tp_pct}%) SL={sl}(-{sl_pct}%) Qty={qty}")
 
     body = {
         "timestamp": int(time.time() * 1000),
@@ -451,13 +475,13 @@ def place_long_order(symbol, entry_price, tp_price, sl_price, precision, signal_
             data=payload, headers=headers, timeout=REQUEST_TIMEOUT,
         ).json()
     except Exception as e:
-        print(f"[ERROR] {symbol} order failed: {e}")
+        print(f"  [ERROR] order request failed: {e}")
         return False
 
-    print(f"[API] {symbol} response: {result}")
+    print(f"  [API] {symbol} response: {result}")
 
     if "order" not in result and not isinstance(result, list):
-        print(f"[ERROR] {symbol} long rejected: {result}")
+        print(f"  [ERROR] long rejected: {result}")
         send_telegram(
             f"❌ <b>LONG REJECTED — {symbol}</b>\n"
             f"Entry <code>{entry}</code> | TP <code>{tp}</code> | SL <code>{sl}</code>\n"
@@ -465,28 +489,26 @@ def place_long_order(symbol, entry_price, tp_price, sl_price, precision, signal_
         )
         return False
 
-    si = signal_info or {}
+    si = si or {}
     send_telegram(
         f"🟢 <b>NEW LONG (PDL SWEEP) — {symbol}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"📍 Entry          : <code>{entry}</code>\n"
-        f"🎯 TP             : <code>{tp}</code>  (+{tp_pct}%)\n"
-        f"🛑 SL             : <code>{sl}</code>  (-{sl_pct}%)\n"
-        f"📦 Qty            : <code>{qty}</code>\n"
-        f"💰 Margin         : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>\n"
+        f"📍 Entry        : <code>{entry}</code>\n"
+        f"🎯 TP           : <code>{tp}</code>  (+{tp_pct}%)\n"
+        f"🛑 SL           : <code>{sl}</code>  (-{sl_pct}%)\n"
+        f"📦 Qty          : <code>{qty}</code>\n"
+        f"💰 Margin       : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"<b>📊 Why this trade:</b>\n"
-        f"📅 Prev day       : PDH <code>{si.get('pdh')}</code>  |  PDL <code>{si.get('pdl')}</code>\n"
-        f"⬇️ PDL swept by   : <code>{si.get('sweep_ext')}</code> pts → low <code>{si.get('sweep_low')}</code>\n"
-        f"🕯 Sweep candle   : O=<code>{si.get('sweep_o')}</code> H=<code>{si.get('sweep_h')}</code> "
-        f"L=<code>{si.get('sweep_l')}</code> C=<code>{si.get('sweep_c')}</code>\n"
-        f"🟢 Signal candle  : O=<code>{si.get('sig_o')}</code> H=<code>{si.get('sig_h')}</code> "
-        f"L=<code>{si.get('sig_l')}</code> C=<code>{si.get('sig_c')}</code> "
-        f"({si.get('bars_to_sig')}b after sweep)\n"
-        f"✅ Confirm candle : O=<code>{si.get('confirm_o')}</code> H=<code>{si.get('confirm_h')}</code> "
-        f"L=<code>{si.get('confirm_l')}</code> C=<code>{si.get('confirm_c')}</code> "
-        f"({si.get('bars_to_confirm')}b after sweep)\n"
-        f"📌 Trigger        : close <code>{si.get('confirm_c')}</code> &gt; signal high <code>{si.get('sig_h')}</code>"
+        f"📅 PDH <code>{si.get('pdh')}</code>  |  PDL <code>{si.get('pdl')}</code>\n"
+        f"⬇️ PDL swept by <code>{si.get('sweep_ext')}</code> pts → low <code>{si.get('sweep_low')}</code>\n"
+        f"🕯 Sweep candle : O=<code>{si.get('s_o')}</code> H=<code>{si.get('s_h')}</code> "
+        f"L=<code>{si.get('s_l')}</code> C=<code>{si.get('s_c')}</code>\n"
+        f"🟢 Candle 1     : O=<code>{si.get('c1_o')}</code> H=<code>{si.get('c1_h')}</code> "
+        f"L=<code>{si.get('c1_l')}</code> C=<code>{si.get('c1_c')}</code>  (full-body bull)\n"
+        f"🟢 Candle 2     : O=<code>{si.get('c2_o')}</code> H=<code>{si.get('c2_h')}</code> "
+        f"L=<code>{si.get('c2_l')}</code> C=<code>{si.get('c2_c')}</code>  (full-body bull)\n"
+        f"📌 Entry at close of candle 2"
     )
     return True
 
@@ -495,7 +517,7 @@ def place_long_order(symbol, entry_price, tp_price, sl_price, precision, signal_
 # PLACE SHORT ORDER
 # =====================================================
 
-def place_short_order(symbol, entry_price, tp_price, sl_price, precision, signal_info=None):
+def place_short_order(symbol, entry_price, tp_price, sl_price, precision, si=None):
     entry = round(entry_price, precision)
     tp    = round(tp_price,    precision)
     sl    = round(sl_price,    precision)
@@ -504,7 +526,7 @@ def place_short_order(symbol, entry_price, tp_price, sl_price, precision, signal
     tp_pct = round(((entry - tp) / entry) * 100, 2)
     sl_pct = round(((sl - entry) / entry) * 100, 2)
 
-    print(f"[SHORT] {symbol} | Entry={entry} TP={tp}(-{tp_pct}%) SL={sl}(+{sl_pct}%) Qty={qty}")
+    print(f"  [SHORT] Entry={entry} TP={tp}(-{tp_pct}%) SL={sl}(+{sl_pct}%) Qty={qty}")
 
     body = {
         "timestamp": int(time.time() * 1000),
@@ -522,13 +544,13 @@ def place_short_order(symbol, entry_price, tp_price, sl_price, precision, signal
             data=payload, headers=headers, timeout=REQUEST_TIMEOUT,
         ).json()
     except Exception as e:
-        print(f"[ERROR] {symbol} order failed: {e}")
+        print(f"  [ERROR] order request failed: {e}")
         return False
 
-    print(f"[API] {symbol} response: {result}")
+    print(f"  [API] {symbol} response: {result}")
 
     if "order" not in result and not isinstance(result, list):
-        print(f"[ERROR] {symbol} short rejected: {result}")
+        print(f"  [ERROR] short rejected: {result}")
         send_telegram(
             f"❌ <b>SHORT REJECTED — {symbol}</b>\n"
             f"Entry <code>{entry}</code> | TP <code>{tp}</code> | SL <code>{sl}</code>\n"
@@ -536,28 +558,26 @@ def place_short_order(symbol, entry_price, tp_price, sl_price, precision, signal
         )
         return False
 
-    si = signal_info or {}
+    si = si or {}
     send_telegram(
         f"🔴 <b>NEW SHORT (PDH SWEEP) — {symbol}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"📍 Entry          : <code>{entry}</code>\n"
-        f"🎯 TP             : <code>{tp}</code>  (-{tp_pct}%)\n"
-        f"🛑 SL             : <code>{sl}</code>  (+{sl_pct}%)\n"
-        f"📦 Qty            : <code>{qty}</code>\n"
-        f"💰 Margin         : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>\n"
+        f"📍 Entry        : <code>{entry}</code>\n"
+        f"🎯 TP           : <code>{tp}</code>  (-{tp_pct}%)\n"
+        f"🛑 SL           : <code>{sl}</code>  (+{sl_pct}%)\n"
+        f"📦 Qty          : <code>{qty}</code>\n"
+        f"💰 Margin       : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"<b>📊 Why this trade:</b>\n"
-        f"📅 Prev day       : PDH <code>{si.get('pdh')}</code>  |  PDL <code>{si.get('pdl')}</code>\n"
-        f"⬆️ PDH swept by   : <code>{si.get('sweep_ext')}</code> pts → high <code>{si.get('sweep_high')}</code>\n"
-        f"🕯 Sweep candle   : O=<code>{si.get('sweep_o')}</code> H=<code>{si.get('sweep_h')}</code> "
-        f"L=<code>{si.get('sweep_l')}</code> C=<code>{si.get('sweep_c')}</code>\n"
-        f"🔴 Signal candle  : O=<code>{si.get('sig_o')}</code> H=<code>{si.get('sig_h')}</code> "
-        f"L=<code>{si.get('sig_l')}</code> C=<code>{si.get('sig_c')}</code> "
-        f"({si.get('bars_to_sig')}b after sweep)\n"
-        f"✅ Confirm candle : O=<code>{si.get('confirm_o')}</code> H=<code>{si.get('confirm_h')}</code> "
-        f"L=<code>{si.get('confirm_l')}</code> C=<code>{si.get('confirm_c')}</code> "
-        f"({si.get('bars_to_confirm')}b after sweep)\n"
-        f"📌 Trigger        : close <code>{si.get('confirm_c')}</code> &lt; signal low <code>{si.get('sig_l')}</code>"
+        f"📅 PDH <code>{si.get('pdh')}</code>  |  PDL <code>{si.get('pdl')}</code>\n"
+        f"⬆️ PDH swept by <code>{si.get('sweep_ext')}</code> pts → high <code>{si.get('sweep_high')}</code>\n"
+        f"🕯 Sweep candle : O=<code>{si.get('s_o')}</code> H=<code>{si.get('s_h')}</code> "
+        f"L=<code>{si.get('s_l')}</code> C=<code>{si.get('s_c')}</code>\n"
+        f"🔴 Candle 1     : O=<code>{si.get('c1_o')}</code> H=<code>{si.get('c1_h')}</code> "
+        f"L=<code>{si.get('c1_l')}</code> C=<code>{si.get('c1_c')}</code>  (full-body bear)\n"
+        f"🔴 Candle 2     : O=<code>{si.get('c2_o')}</code> H=<code>{si.get('c2_h')}</code> "
+        f"L=<code>{si.get('c2_l')}</code> C=<code>{si.get('c2_c')}</code>  (full-body bear)\n"
+        f"📌 Entry at close of candle 2"
     )
     return True
 
@@ -567,22 +587,22 @@ def place_short_order(symbol, entry_price, tp_price, sl_price, precision, signal
 # =====================================================
 
 def _clear_sweep(st):
-    st["sweep_direction"]      = None
-    st["sweep_ts"]             = 0
-    st["recent_swing_low"]     = None
-    st["recent_swing_high"]    = None
-    st["sweep_o"]              = None
-    st["sweep_h"]              = None
-    st["sweep_l"]              = None
-    st["sweep_c"]              = None
-    st["first_signal_high"]    = None
-    st["first_signal_low"]     = None
-    st["first_signal_ts"]      = 0
-    st["first_signal_o"]       = None
-    st["first_signal_h"]       = None
-    st["first_signal_l"]       = None
-    st["first_signal_c"]       = None
-    st["bars_to_first_signal"] = None
+    st["sweep_direction"]   = None
+    st["sweep_ts"]          = 0
+    st["recent_swing_low"]  = None
+    st["recent_swing_high"] = None
+    st["sweep_o"] = None; st["sweep_h"] = None
+    st["sweep_l"] = None; st["sweep_c"] = None
+    st["candle1_ts"] = 0
+    st["candle1_o"]  = None; st["candle1_h"] = None
+    st["candle1_l"]  = None; st["candle1_c"] = None
+
+
+def _reset_candle1(st):
+    """Reset only candle1 — keep sweep state intact."""
+    st["candle1_ts"] = 0
+    st["candle1_o"]  = None; st["candle1_h"] = None
+    st["candle1_l"]  = None; st["candle1_c"] = None
 
 
 # =====================================================
@@ -594,8 +614,6 @@ def check_and_trade(symbol, row, df, all_state):
 
     # ── 1. Daily candles → PDH / PDL ─────────────────────────────────────
     daily = fetch_candles(symbol, CANDLES_DAILY, RESOLUTION_DAILY, CANDLE_SECONDS_DAY)
-
-    # Drop in-progress daily bar
     if daily and (now_ms - int(daily[-1]["time"])) < CANDLE_SECONDS_DAY * 1000:
         daily = daily[:-1]
 
@@ -627,7 +645,6 @@ def check_and_trade(symbol, row, df, all_state):
                       "tp_level", "sl_price", "last_entry_ts")}
         st = init_symbol_state()
         st.update(preserved)
-        # last_processed_1m_ts resets to 0 so today's candles are re-evaluated
         all_state[symbol] = st
 
     st["current_day_str"] = today_str
@@ -636,7 +653,6 @@ def check_and_trade(symbol, row, df, all_state):
 
     # ── 4. TP COMPLETED check ─────────────────────────────────────────────
     tp_raw = str(df.iloc[row, 1]).strip() if df.shape[1] > 1 else ""
-
     if tp_raw.upper() == "TP COMPLETED":
         print(f"  [{symbol}] SKIP — TP COMPLETED in sheet")
         save_state(all_state)
@@ -652,11 +668,9 @@ def check_and_trade(symbol, row, df, all_state):
         tp_hit     = False
         hit_kind   = None
         hit_price  = None
-
         last_1m    = fetch_candles(symbol, 2, RESOLUTION_1M, CANDLE_SECONDS_1M)
         last_close = float(last_1m[-1]["close"]) if last_1m else None
-
-        is_long = direction == "long" or (direction is None and last_close and tp_stored > last_close)
+        is_long    = direction == "long" or (direction is None and last_close and tp_stored > last_close)
 
         if is_long:
             if last_close and last_close >= tp_stored:
@@ -689,11 +703,10 @@ def check_and_trade(symbol, row, df, all_state):
         if not st.get("in_position"):
             entry_px  = float(position.get("avg_price") or position.get("entry_price") or 0)
             active    = float(position.get("active_pos", 0))
-            direction = "long" if active > 0 else "short"
             st["in_position"] = True
-            st["direction"]   = direction
+            st["direction"]   = "long" if active > 0 else "short"
             st["entry_price"] = entry_px
-            print(f"  [{symbol}] RECONCILE — {direction} position found on exchange")
+            print(f"  [{symbol}] RECONCILE — {st['direction']} found on exchange")
 
         tp_pos, sl_pos = extract_tp_sl(position)
         if st.get("tp_level") is None and tp_pos:
@@ -723,37 +736,31 @@ def check_and_trade(symbol, row, df, all_state):
         print(f"  [{symbol}] SKIP — open order on book")
         return
 
-    # ── 6. 1h sweep guard — skip direction if already swept today ─────────
-    if not st.get("pdl_swept_1h") or not st.get("pdh_swept_1h"):
-        candles_1h     = fetch_candles(symbol, CANDLES_1H, RESOLUTION_1H, CANDLE_SECONDS_1H)
-
-        # Drop in-progress 1h candle — only check fully CLOSED 1h bars
+    # ── 6. 1h sweep guard — only closed 1h bars ───────────────────────────
+    if not st["pdl_swept_1h"] or not st["pdh_swept_1h"]:
+        candles_1h = fetch_candles(symbol, CANDLES_1H, RESOLUTION_1H, CANDLE_SECONDS_1H)
+        # Drop in-progress 1h bar
         if candles_1h and (now_ms - int(candles_1h[-1]["time"])) < CANDLE_SECONDS_1H * 1000:
             candles_1h = candles_1h[:-1]
-
         today_start_ms = int(datetime.strptime(today_str, "%Y-%m-%d")
                              .replace(tzinfo=timezone.utc).timestamp() * 1000)
-
-        # Only closed 1h candles that OPENED on or after today's daily reset (00:00 UTC)
         todays_1h = [c for c in candles_1h if int(c["time"]) >= today_start_ms]
 
         for c1h in todays_1h:
             if float(c1h["low"])  < pdl and not st["pdl_swept_1h"]:
                 st["pdl_swept_1h"] = True
-                print(f"  [{symbol}] 1H GUARD — PDL swept on closed 1h (low={c1h['low']} < PDL={pdl})")
+                print(f"  [{symbol}] 1H GUARD — PDL swept (low={c1h['low']} < PDL={pdl})")
             if float(c1h["high"]) > pdh and not st["pdh_swept_1h"]:
                 st["pdh_swept_1h"] = True
-                print(f"  [{symbol}] 1H GUARD — PDH swept on closed 1h (high={c1h['high']} > PDH={pdh})")
+                print(f"  [{symbol}] 1H GUARD — PDH swept (high={c1h['high']} > PDH={pdh})")
 
     if st["pdl_swept_1h"] and st["pdh_swept_1h"]:
-        print(f"  [{symbol}] SKIP — both PDH & PDL already swept on 1h today")
+        print(f"  [{symbol}] SKIP — both sides already swept on 1h today")
         save_state(all_state)
         return
 
     # ── 7. Fetch 1m candles ───────────────────────────────────────────────
     candles_1m = fetch_candles(symbol, CANDLES_1M, RESOLUTION_1M, CANDLE_SECONDS_1M)
-
-    # Drop in-progress 1m bar
     if candles_1m and (now_ms - int(candles_1m[-1]["time"])) < CANDLE_SECONDS_1M * 1000:
         candles_1m = candles_1m[:-1]
 
@@ -765,9 +772,9 @@ def check_and_trade(symbol, row, df, all_state):
     last_processed = st.get("last_processed_1m_ts", 0)
     new_candles    = [c for c in candles_1m if int(c["time"]) > last_processed]
 
-    sweep_status = (f"sweep={st['sweep_direction'] or 'none'} "
-                    f"sig={'armed' if (st['first_signal_high'] or st['first_signal_low']) else 'waiting'}")
-    print(f"  [{symbol}] PDH={pdh} PDL={pdl} | {sweep_status} | "
+    c1_armed = st["candle1_ts"] > 0
+    print(f"  [{symbol}] PDH={pdh} PDL={pdl} | sweep={st['sweep_direction'] or 'none'} "
+          f"c1={'armed' if c1_armed else 'waiting'} | "
           f"1h_guard pdl={st['pdl_swept_1h']} pdh={st['pdh_swept_1h']} | "
           f"new_1m={len(new_candles)}")
 
@@ -775,7 +782,7 @@ def check_and_trade(symbol, row, df, all_state):
         save_state(all_state)
         return
 
-    # ── 8. Walk 1m candles — sweep detection + 2-candle reversal ──────────
+    # ── 8. Walk 1m candles — sweep + 2 consecutive full-body candles ──────
     entry_path   = None
     entry_price  = None
     sl_price_val = None
@@ -783,12 +790,15 @@ def check_and_trade(symbol, row, df, all_state):
     signal_info  = None
 
     for candle in new_candles:
-        c_ts      = int(candle["time"])
-        o, h, l, c = (float(candle["open"]), float(candle["high"]),
-                      float(candle["low"]),  float(candle["close"]))
+        c_ts = int(candle["time"])
+        o    = float(candle["open"])
+        h    = float(candle["high"])
+        l    = float(candle["low"])
+        c    = float(candle["close"])
+
         sweep_dir = st["sweep_direction"]
 
-        # ── A. No sweep — detect one ───────────────────────────────────
+        # ── A. No sweep yet ────────────────────────────────────────────
         if sweep_dir is None:
             if l < pdl and not st["pdl_swept_1h"]:
                 st["sweep_direction"]  = "long"
@@ -796,8 +806,8 @@ def check_and_trade(symbol, row, df, all_state):
                 st["recent_swing_low"] = l
                 st["sweep_o"] = o; st["sweep_h"] = h
                 st["sweep_l"] = l; st["sweep_c"] = c
-                ext = round(pdl - l, precision)
-                print(f"  [{symbol}] SWEEP-LONG  low={l} < PDL={pdl} ext={ext}")
+                print(f"  [{symbol}] SWEEP-LONG  low={l} < PDL={pdl} "
+                      f"(ext={round(pdl-l, precision)})")
 
             elif h > pdh and not st["pdh_swept_1h"]:
                 st["sweep_direction"]   = "short"
@@ -805,118 +815,156 @@ def check_and_trade(symbol, row, df, all_state):
                 st["recent_swing_high"] = h
                 st["sweep_o"] = o; st["sweep_h"] = h
                 st["sweep_l"] = l; st["sweep_c"] = c
-                ext = round(h - pdh, precision)
-                print(f"  [{symbol}] SWEEP-SHORT high={h} > PDH={pdh} ext={ext}")
+                print(f"  [{symbol}] SWEEP-SHORT high={h} > PDH={pdh} "
+                      f"(ext={round(h-pdh, precision)})")
 
         # ── B. Long sweep armed ────────────────────────────────────────
         elif sweep_dir == "long":
+            # Track lowest low during sweep
             if l < st["recent_swing_low"]:
                 st["recent_swing_low"] = l
 
             bars_since = (c_ts - st["sweep_ts"]) // (CANDLE_SECONDS_1M * 1000)
             if bars_since > SWEEP_EXPIRY_BARS:
-                print(f"  [{symbol}] SWEEP-EXPIRE long ({bars_since}b)")
+                print(f"  [{symbol}] SWEEP-EXPIRE long ({bars_since}b) — resetting")
                 _clear_sweep(st)
                 st["last_processed_1m_ts"] = c_ts
                 continue
 
-            if st["first_signal_high"] is None:
-                if c > o:   # first bullish candle — one shot only
-                    bts = (c_ts - st["sweep_ts"]) // (CANDLE_SECONDS_1M * 1000)
-                    st["first_signal_high"]    = h
-                    st["first_signal_ts"]      = c_ts
-                    st["first_signal_o"]       = o
-                    st["first_signal_h"]       = h
-                    st["first_signal_l"]       = l
-                    st["first_signal_c"]       = c
-                    st["bars_to_first_signal"] = bts
-                    print(f"  [{symbol}] SIGNAL-1-LONG bullish high={h} ({bts}b after sweep)")
+            if st["candle1_ts"] == 0:
+                # Looking for FIRST full-body bullish candle
+                if is_full_body_bullish(o, h, l, c):
+                    st["candle1_ts"] = c_ts
+                    st["candle1_o"]  = o; st["candle1_h"] = h
+                    st["candle1_l"]  = l; st["candle1_c"] = c
+                    print(f"  [{symbol}] CANDLE1-LONG full-body bull "
+                          f"O={round(o,precision)} H={round(h,precision)} "
+                          f"L={round(l,precision)} C={round(c,precision)}")
             else:
-                if c_ts > st["first_signal_ts"] and c > st["first_signal_high"]:
-                    btc          = (c_ts - st["sweep_ts"]) // (CANDLE_SECONDS_1M * 1000)
-                    entry_price  = c
-                    natural_sl   = st["recent_swing_low"]
-                    min_sl       = entry_price * (1 - MIN_SL_PCT / 100)
-                    sl_price_val = min(natural_sl, min_sl)
-                    tp_price_val = entry_price * (1 + TP_PCT / 100)
-                    entry_path   = "long_sweep"
-                    signal_info  = {
-                        "pdh":           round(pdh, precision),
-                        "pdl":           round(pdl, precision),
-                        "sweep_ext":     round(pdl - st["recent_swing_low"], precision),
-                        "sweep_low":     round(st["recent_swing_low"], precision),
-                        "sweep_o":       round(st["sweep_o"], precision),
-                        "sweep_h":       round(st["sweep_h"], precision),
-                        "sweep_l":       round(st["sweep_l"], precision),
-                        "sweep_c":       round(st["sweep_c"], precision),
-                        "sig_o":         round(st["first_signal_o"], precision),
-                        "sig_h":         round(st["first_signal_h"], precision),
-                        "sig_l":         round(st["first_signal_l"], precision),
-                        "sig_c":         round(st["first_signal_c"], precision),
-                        "confirm_o":     round(o, precision),
-                        "confirm_h":     round(h, precision),
-                        "confirm_l":     round(l, precision),
-                        "confirm_c":     round(c, precision),
-                        "bars_to_sig":   st["bars_to_first_signal"],
-                        "bars_to_confirm": btc,
-                    }
-                    st["last_processed_1m_ts"] = c_ts
-                    break
+                # Candle 2 MUST be the immediately next 1m bar
+                expected_ts = st["candle1_ts"] + CANDLE_SECONDS_1M * 1000
+                if c_ts == expected_ts:
+                    if is_full_body_bullish(o, h, l, c):
+                        # ✅ Two consecutive full-body bull candles — ENTER LONG
+                        entry_price  = c
+                        natural_sl   = st["recent_swing_low"]
+                        min_sl       = entry_price * (1 - MIN_SL_PCT / 100)
+                        sl_price_val = min(natural_sl, min_sl)
+                        tp_price_val = entry_price * (1 + TP_PCT / 100)
+                        entry_path   = "long_sweep"
+                        signal_info  = {
+                            "pdh":        round(pdh, precision),
+                            "pdl":        round(pdl, precision),
+                            "sweep_ext":  round(pdl - st["recent_swing_low"], precision),
+                            "sweep_low":  round(st["recent_swing_low"], precision),
+                            "s_o": round(st["sweep_o"], precision),
+                            "s_h": round(st["sweep_h"], precision),
+                            "s_l": round(st["sweep_l"], precision),
+                            "s_c": round(st["sweep_c"], precision),
+                            "c1_o": round(st["candle1_o"], precision),
+                            "c1_h": round(st["candle1_h"], precision),
+                            "c1_l": round(st["candle1_l"], precision),
+                            "c1_c": round(st["candle1_c"], precision),
+                            "c2_o": round(o, precision),
+                            "c2_h": round(h, precision),
+                            "c2_l": round(l, precision),
+                            "c2_c": round(c, precision),
+                        }
+                        st["last_processed_1m_ts"] = c_ts
+                        break
+                    else:
+                        # Candle 2 not full-body — reset candle1, try again
+                        print(f"  [{symbol}] CANDLE2-LONG failed (not full-body) — reset C1")
+                        _reset_candle1(st)
+                        # Check if this candle itself qualifies as a new candle1
+                        if is_full_body_bullish(o, h, l, c):
+                            st["candle1_ts"] = c_ts
+                            st["candle1_o"]  = o; st["candle1_h"] = h
+                            st["candle1_l"]  = l; st["candle1_c"] = c
+                            print(f"  [{symbol}] CANDLE1-LONG (retry) "
+                                  f"O={round(o,precision)} C={round(c,precision)}")
+                else:
+                    # Gap between candle1 and this candle — candle1 is stale, reset
+                    print(f"  [{symbol}] CANDLE1-LONG stale (gap) — reset C1")
+                    _reset_candle1(st)
+                    if is_full_body_bullish(o, h, l, c):
+                        st["candle1_ts"] = c_ts
+                        st["candle1_o"]  = o; st["candle1_h"] = h
+                        st["candle1_l"]  = l; st["candle1_c"] = c
+                        print(f"  [{symbol}] CANDLE1-LONG (after gap) "
+                              f"O={round(o,precision)} C={round(c,precision)}")
 
         # ── C. Short sweep armed ───────────────────────────────────────
         elif sweep_dir == "short":
+            # Track highest high during sweep
             if h > st["recent_swing_high"]:
                 st["recent_swing_high"] = h
 
             bars_since = (c_ts - st["sweep_ts"]) // (CANDLE_SECONDS_1M * 1000)
             if bars_since > SWEEP_EXPIRY_BARS:
-                print(f"  [{symbol}] SWEEP-EXPIRE short ({bars_since}b)")
+                print(f"  [{symbol}] SWEEP-EXPIRE short ({bars_since}b) — resetting")
                 _clear_sweep(st)
                 st["last_processed_1m_ts"] = c_ts
                 continue
 
-            if st["first_signal_low"] is None:
-                if c < o:   # first bearish candle — one shot only
-                    bts = (c_ts - st["sweep_ts"]) // (CANDLE_SECONDS_1M * 1000)
-                    st["first_signal_low"]     = l
-                    st["first_signal_ts"]      = c_ts
-                    st["first_signal_o"]       = o
-                    st["first_signal_h"]       = h
-                    st["first_signal_l"]       = l
-                    st["first_signal_c"]       = c
-                    st["bars_to_first_signal"] = bts
-                    print(f"  [{symbol}] SIGNAL-1-SHORT bearish low={l} ({bts}b after sweep)")
+            if st["candle1_ts"] == 0:
+                # Looking for FIRST full-body bearish candle
+                if is_full_body_bearish(o, h, l, c):
+                    st["candle1_ts"] = c_ts
+                    st["candle1_o"]  = o; st["candle1_h"] = h
+                    st["candle1_l"]  = l; st["candle1_c"] = c
+                    print(f"  [{symbol}] CANDLE1-SHORT full-body bear "
+                          f"O={round(o,precision)} H={round(h,precision)} "
+                          f"L={round(l,precision)} C={round(c,precision)}")
             else:
-                if c_ts > st["first_signal_ts"] and c < st["first_signal_low"]:
-                    btc          = (c_ts - st["sweep_ts"]) // (CANDLE_SECONDS_1M * 1000)
-                    entry_price  = c
-                    natural_sl   = st["recent_swing_high"]
-                    min_sl       = entry_price * (1 + MIN_SL_PCT / 100)
-                    sl_price_val = max(natural_sl, min_sl)
-                    tp_price_val = entry_price * (1 - TP_PCT / 100)
-                    entry_path   = "short_sweep"
-                    signal_info  = {
-                        "pdh":           round(pdh, precision),
-                        "pdl":           round(pdl, precision),
-                        "sweep_ext":     round(st["recent_swing_high"] - pdh, precision),
-                        "sweep_high":    round(st["recent_swing_high"], precision),
-                        "sweep_o":       round(st["sweep_o"], precision),
-                        "sweep_h":       round(st["sweep_h"], precision),
-                        "sweep_l":       round(st["sweep_l"], precision),
-                        "sweep_c":       round(st["sweep_c"], precision),
-                        "sig_o":         round(st["first_signal_o"], precision),
-                        "sig_h":         round(st["first_signal_h"], precision),
-                        "sig_l":         round(st["first_signal_l"], precision),
-                        "sig_c":         round(st["first_signal_c"], precision),
-                        "confirm_o":     round(o, precision),
-                        "confirm_h":     round(h, precision),
-                        "confirm_l":     round(l, precision),
-                        "confirm_c":     round(c, precision),
-                        "bars_to_sig":   st["bars_to_first_signal"],
-                        "bars_to_confirm": btc,
-                    }
-                    st["last_processed_1m_ts"] = c_ts
-                    break
+                expected_ts = st["candle1_ts"] + CANDLE_SECONDS_1M * 1000
+                if c_ts == expected_ts:
+                    if is_full_body_bearish(o, h, l, c):
+                        # ✅ Two consecutive full-body bear candles — ENTER SHORT
+                        entry_price  = c
+                        natural_sl   = st["recent_swing_high"]
+                        min_sl       = entry_price * (1 + MIN_SL_PCT / 100)
+                        sl_price_val = max(natural_sl, min_sl)
+                        tp_price_val = entry_price * (1 - TP_PCT / 100)
+                        entry_path   = "short_sweep"
+                        signal_info  = {
+                            "pdh":        round(pdh, precision),
+                            "pdl":        round(pdl, precision),
+                            "sweep_ext":  round(st["recent_swing_high"] - pdh, precision),
+                            "sweep_high": round(st["recent_swing_high"], precision),
+                            "s_o": round(st["sweep_o"], precision),
+                            "s_h": round(st["sweep_h"], precision),
+                            "s_l": round(st["sweep_l"], precision),
+                            "s_c": round(st["sweep_c"], precision),
+                            "c1_o": round(st["candle1_o"], precision),
+                            "c1_h": round(st["candle1_h"], precision),
+                            "c1_l": round(st["candle1_l"], precision),
+                            "c1_c": round(st["candle1_c"], precision),
+                            "c2_o": round(o, precision),
+                            "c2_h": round(h, precision),
+                            "c2_l": round(l, precision),
+                            "c2_c": round(c, precision),
+                        }
+                        st["last_processed_1m_ts"] = c_ts
+                        break
+                    else:
+                        print(f"  [{symbol}] CANDLE2-SHORT failed (not full-body) — reset C1")
+                        _reset_candle1(st)
+                        if is_full_body_bearish(o, h, l, c):
+                            st["candle1_ts"] = c_ts
+                            st["candle1_o"]  = o; st["candle1_h"] = h
+                            st["candle1_l"]  = l; st["candle1_c"] = c
+                            print(f"  [{symbol}] CANDLE1-SHORT (retry) "
+                                  f"O={round(o,precision)} C={round(c,precision)}")
+                else:
+                    print(f"  [{symbol}] CANDLE1-SHORT stale (gap) — reset C1")
+                    _reset_candle1(st)
+                    if is_full_body_bearish(o, h, l, c):
+                        st["candle1_ts"] = c_ts
+                        st["candle1_o"]  = o; st["candle1_h"] = h
+                        st["candle1_l"]  = l; st["candle1_c"] = c
+                        print(f"  [{symbol}] CANDLE1-SHORT (after gap) "
+                              f"O={round(o,precision)} C={round(c,precision)}")
 
         st["last_processed_1m_ts"] = c_ts
 
@@ -936,7 +984,6 @@ def check_and_trade(symbol, row, df, all_state):
         save_state(all_state)
         return
 
-    # Last-second guards
     if get_position_by_pair(symbol) is not None:
         print(f"  [{symbol}] ABORT — position appeared just before placement")
         return
@@ -951,12 +998,12 @@ def check_and_trade(symbol, row, df, all_state):
         placed = place_short_order(symbol, entry_price, tp_price_val, sl_price_val, precision, signal_info)
 
     if placed:
-        st["in_position"]       = True
-        st["direction"]         = "long" if entry_path == "long_sweep" else "short"
-        st["entry_price"]       = round(entry_price,  precision)
-        st["tp_level"]          = round(tp_price_val, precision)
-        st["sl_price"]          = round(sl_price_val, precision)
-        st["last_entry_ts"]     = st["last_processed_1m_ts"]
+        st["in_position"]   = True
+        st["direction"]     = "long" if entry_path == "long_sweep" else "short"
+        st["entry_price"]   = round(entry_price,  precision)
+        st["tp_level"]      = round(tp_price_val, precision)
+        st["sl_price"]      = round(sl_price_val, precision)
+        st["last_entry_ts"] = st["last_processed_1m_ts"]
         _clear_sweep(st)
         update_sheet_tp(row, st["tp_level"])
         update_sheet_sl(row, st["sl_price"])
@@ -976,12 +1023,12 @@ send_telegram(
     f"✅ <b>PDH/PDL Sweep Bot Started</b>\n"
     f"━━━━━━━━━━━━━━━━━━\n"
     f"📐 Strategy  : <code>PDH/PDL Liquidity Sweep (Long + Short)</code>\n"
-    f"📅 Levels    : <code>Previous day high/low (daily candles)</code>\n"
-    f"⚡ Entry     : <code>2-candle reversal on 1m after sweep</code>\n"
-    f"🔒 1h Guard  : <code>Skip direction if already swept on 1h today</code>\n"
+    f"⚡ Entry     : <code>2 consecutive full-body 1m candles after sweep</code>\n"
+    f"🔒 1h Guard  : <code>Skip if already swept on closed 1h today</code>\n"
     f"🔁 Scan      : <code>Every 90 seconds</code>\n"
     f"🎯 TP        : <code>entry ± {TP_PCT}%</code>\n"
     f"🛑 SL        : <code>sweep extreme (min {MIN_SL_PCT}% from entry)</code>\n"
+    f"📏 Full-body : <code>wick ≤ {int(MAX_WICK_RATIO*100)}% of body</code>\n"
     f"⏳ Sweep exp : <code>{SWEEP_EXPIRY_BARS} × 1m bars</code>\n"
     f"💰 Capital   : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
 )
@@ -1003,8 +1050,7 @@ while True:
 
         symbols_checked = 0
         for row in range(len(df)):
-            raw_pair = df.iloc[row, 0]
-            symbol   = normalize_symbol(raw_pair)
+            symbol = normalize_symbol(df.iloc[row, 0])
             if not symbol:
                 continue
             symbols_checked += 1
@@ -1012,17 +1058,16 @@ while True:
             try:
                 check_and_trade(symbol, row, df, state)
             except Exception as e:
-                print(f"  [{symbol}] ERROR in check_and_trade: {e}")
+                print(f"  [{symbol}] ERROR: {e}")
                 continue
 
-        print(f"===== CYCLE {cycle} DONE — {symbols_checked} symbols checked =====")
+        print(f"===== CYCLE {cycle} DONE — {symbols_checked} symbols =====")
         save_state(state)
         time.sleep(SCAN_INTERVAL)
 
     except Exception as e:
         consecutive_errors += 1
         print(f"BOT ERROR ({consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}): {e}")
-
         if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
             send_telegram(
                 f"🚨 <b>Bot Crashed</b>\n"
@@ -1030,5 +1075,4 @@ while True:
                 f"🔁 {consecutive_errors} consecutive errors"
             )
             raise SystemExit(1)
-
         time.sleep(60)
