@@ -20,7 +20,7 @@ BASE_URL = "https://api.coindcx.com"
 # STRATEGY PARAMETERS  (PDH/PDL Liquidity Sweep — LONG + SHORT)
 # =============================================================================
 
-TP_PCT          = 1.5    # fixed TP %
+TP_PCT          = 1.25    # fixed TP %
 MIN_SL_PCT      = 0.5    # minimum SL distance from entry (%)
 MIN_BODY_PCT    = 70     # body must be >= 70% of total candle range (high - low) for C2
 SWEEP_EXPIRY_BARS = 6   # 5m bars before unresolved sweep expires (12 * 5m = 60 min)
