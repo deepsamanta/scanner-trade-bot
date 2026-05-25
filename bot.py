@@ -726,17 +726,24 @@ def check_and_trade(symbol, row, df, all_state):
     # ── 6. 1h sweep guard — skip direction if already swept today ─────────
     if not st.get("pdl_swept_1h") or not st.get("pdh_swept_1h"):
         candles_1h     = fetch_candles(symbol, CANDLES_1H, RESOLUTION_1H, CANDLE_SECONDS_1H)
+
+        # Drop in-progress 1h candle — only check fully CLOSED 1h bars
+        if candles_1h and (now_ms - int(candles_1h[-1]["time"])) < CANDLE_SECONDS_1H * 1000:
+            candles_1h = candles_1h[:-1]
+
         today_start_ms = int(datetime.strptime(today_str, "%Y-%m-%d")
                              .replace(tzinfo=timezone.utc).timestamp() * 1000)
-        todays_1h      = [c for c in candles_1h if int(c["time"]) >= today_start_ms]
+
+        # Only closed 1h candles that OPENED on or after today's daily reset (00:00 UTC)
+        todays_1h = [c for c in candles_1h if int(c["time"]) >= today_start_ms]
 
         for c1h in todays_1h:
             if float(c1h["low"])  < pdl and not st["pdl_swept_1h"]:
                 st["pdl_swept_1h"] = True
-                print(f"  [{symbol}] 1H GUARD — PDL already swept on 1h (low={c1h['low']} < PDL={pdl})")
+                print(f"  [{symbol}] 1H GUARD — PDL swept on closed 1h (low={c1h['low']} < PDL={pdl})")
             if float(c1h["high"]) > pdh and not st["pdh_swept_1h"]:
                 st["pdh_swept_1h"] = True
-                print(f"  [{symbol}] 1H GUARD — PDH already swept on 1h (high={c1h['high']} > PDH={pdh})")
+                print(f"  [{symbol}] 1H GUARD — PDH swept on closed 1h (high={c1h['high']} > PDH={pdh})")
 
     if st["pdl_swept_1h"] and st["pdh_swept_1h"]:
         print(f"  [{symbol}] SKIP — both PDH & PDL already swept on 1h today")
