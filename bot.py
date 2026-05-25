@@ -20,33 +20,33 @@ BASE_URL = "https://api.coindcx.com"
 # STRATEGY PARAMETERS  (PDH/PDL Liquidity Sweep — LONG + SHORT)
 #
 # LONG SETUP:
-#   1. A 1m candle's low  breaks below PDL           → sweep detected
-#   2. First strong-body bull (body≥70%)ish 1m candle after sweep  → candle 1
-#   3. IMMEDIATELY next 1m candle is also full-body
-#      bullish (no wick)                              → ENTER LONG at close
+#   1. A 1m candle's low  breaks below PDL            -> sweep detected
+#   2. First bullish candle (c > o) after sweep       -> candle 1 (reversal/spike)
+#   3. IMMEDIATELY next 1m candle is full-body
+#      bullish (body>=70%) closing above C1           -> ENTER LONG at close
 #   SL = sweep low  (min MIN_SL_PCT% from entry)
-#   TP = entry × (1 + TP_PCT / 100)
+#   TP = entry * (1 + TP_PCT / 100)
 #
 # SHORT SETUP:
-#   1. A 1m candle's high breaks above PDH            → sweep detected
-#   2. First strong-body bear (body≥70%)ish 1m candle after sweep  → candle 1
-#   3. IMMEDIATELY next 1m candle is also full-body
-#      bearish (no wick)                              → ENTER SHORT at close
+#   1. A 1m candle's high breaks above PDH            -> sweep detected
+#   2. First bearish candle (c < o) after sweep       -> candle 1 (reversal/spike)
+#   3. IMMEDIATELY next 1m candle is full-body
+#      bearish (body>=70%) closing below C1           -> ENTER SHORT at close
 #   SL = sweep high  (min MIN_SL_PCT% from entry)
-#   TP = entry × (1 − TP_PCT / 100)
+#   TP = entry * (1 - TP_PCT / 100)
 #
-# STRONG BODY = body ≥ MIN_BODY_PCT% of total candle range AND C2 closes beyond C1
+# STRONG BODY = body >= MIN_BODY_PCT% of total candle range AND C2 closes beyond C1
 # If candle 2 fails, reset candle 1 and look for a fresh pair.
 #
 # 1H GUARD:
 #   Before arming any sweep, check today's CLOSED 1h candles.
-#   If PDL already swept on a closed 1h bar → skip long side.
-#   If PDH already swept on a closed 1h bar → skip short side.
+#   If PDL already swept on a closed 1h bar -> skip long side.
+#   If PDH already swept on a closed 1h bar -> skip short side.
 # =============================================================================
 
 TP_PCT          = 1.5    # fixed TP %
 MIN_SL_PCT      = 0.5    # minimum SL distance from entry (%)
-MIN_BODY_PCT    = 70     # body must be ≥ 70% of total candle range (high - low)
+MIN_BODY_PCT    = 70     # body must be >= 70% of total candle range (high - low) for C2
 SWEEP_EXPIRY_BARS = 60   # 1m bars before unresolved sweep expires (60 min)
 
 CANDLES_DAILY   = 5
@@ -183,8 +183,8 @@ def init_symbol_state():
         "sweep_o": None, "sweep_h": None,
         "sweep_l": None, "sweep_c": None,
 
-        # 2-consecutive-full-body pattern
-        # candle1 = first qualifying full-body reversal candle after sweep
+        # 2-consecutive pattern
+        # candle1 = first qualifying reversal candle (spike) after sweep
         "candle1_ts": 0,
         "candle1_o":  None, "candle1_h": None,
         "candle1_l":  None, "candle1_c": None,
@@ -263,11 +263,11 @@ def get_precision(raw_candle_close):
 
 
 # =====================================================
-# FULL-BODY CANDLE CHECKS
+# FULL-BODY CANDLE CHECKS (USED FOR CANDLE 2)
 # =====================================================
 
 def is_strong_bullish(o, h, l, c):
-    """Bullish candle whose body is ≥ MIN_BODY_PCT% of total range."""
+    """Bullish candle whose body is >= MIN_BODY_PCT% of total range."""
     if c <= o:
         return False
     rng = h - l
@@ -277,7 +277,7 @@ def is_strong_bullish(o, h, l, c):
 
 
 def is_strong_bearish(o, h, l, c):
-    """Bearish candle whose body is ≥ MIN_BODY_PCT% of total range."""
+    """Bearish candle whose body is >= MIN_BODY_PCT% of total range."""
     if c >= o:
         return False
     rng = h - l
@@ -365,7 +365,7 @@ def get_position_by_pair(symbol):
     for p in get_open_positions():
         if p.get("pair") == pair:
             return p
-    return None
+        return None
 
 
 def has_open_order(symbol):
@@ -501,7 +501,7 @@ def place_long_order(symbol, entry_price, tp_price, sl_price, precision, si=None
         f"🕯 Sweep candle : O=<code>{si.get('s_o')}</code> H=<code>{si.get('s_h')}</code> "
         f"L=<code>{si.get('s_l')}</code> C=<code>{si.get('s_c')}</code>\n"
         f"🟢 Candle 1     : O=<code>{si.get('c1_o')}</code> H=<code>{si.get('c1_h')}</code> "
-        f"L=<code>{si.get('c1_l')}</code> C=<code>{si.get('c1_c')}</code>  (strong-body bull (body≥70%))\n"
+        f"L=<code>{si.get('c1_l')}</code> C=<code>{si.get('c1_c')}</code>  (bullish spike/reversal)\n"
         f"🟢 Candle 2     : O=<code>{si.get('c2_o')}</code> H=<code>{si.get('c2_h')}</code> "
         f"L=<code>{si.get('c2_l')}</code> C=<code>{si.get('c2_c')}</code>  (strong-body bull (body≥70%))\n"
         f"📌 Entry at close of candle 2"
@@ -570,7 +570,7 @@ def place_short_order(symbol, entry_price, tp_price, sl_price, precision, si=Non
         f"🕯 Sweep candle : O=<code>{si.get('s_o')}</code> H=<code>{si.get('s_h')}</code> "
         f"L=<code>{si.get('s_l')}</code> C=<code>{si.get('s_c')}</code>\n"
         f"🔴 Candle 1     : O=<code>{si.get('c1_o')}</code> H=<code>{si.get('c1_h')}</code> "
-        f"L=<code>{si.get('c1_l')}</code> C=<code>{si.get('c1_c')}</code>  (strong-body bear (body≥70%))\n"
+        f"L=<code>{si.get('c1_l')}</code> C=<code>{si.get('c1_c')}</code>  (bearish spike/reversal)\n"
         f"🔴 Candle 2     : O=<code>{si.get('c2_o')}</code> H=<code>{si.get('c2_h')}</code> "
         f"L=<code>{si.get('c2_l')}</code> C=<code>{si.get('c2_c')}</code>  (strong-body bear (body≥70%))\n"
         f"📌 Entry at close of candle 2"
@@ -778,7 +778,7 @@ def check_and_trade(symbol, row, df, all_state):
         save_state(all_state)
         return
 
-    # ── 8. Walk 1m candles — sweep + 2 consecutive full-body candles ──────
+    # ── 8. Walk 1m candles — sweep + spike + strong-body confirmation ──────
     entry_path   = None
     entry_price  = None
     sl_price_val = None
@@ -828,12 +828,12 @@ def check_and_trade(symbol, row, df, all_state):
                 continue
 
             if st["candle1_ts"] == 0:
-                # Looking for FIRST strong-body bull (body≥70%)ish candle
-                if is_strong_bullish(o, h, l, c):
+                # Looking for FIRST bullish reversal candle (spike)
+                if c > o:
                     st["candle1_ts"] = c_ts
                     st["candle1_o"]  = o; st["candle1_h"] = h
                     st["candle1_l"]  = l; st["candle1_c"] = c
-                    print(f"  [{symbol}] CANDLE1-LONG strong-body bull (body≥70%) "
+                    print(f"  [{symbol}] CANDLE1-LONG bullish spike "
                           f"O={round(o,precision)} H={round(h,precision)} "
                           f"L={round(l,precision)} C={round(c,precision)}")
             else:
@@ -841,7 +841,7 @@ def check_and_trade(symbol, row, df, all_state):
                 expected_ts = st["candle1_ts"] + CANDLE_SECONDS_1M * 1000
                 if c_ts == expected_ts:
                     if is_strong_bullish(o, h, l, c) and c > st["candle1_c"]:
-                        # ✅ Two consecutive strong-body bull candles, C2 closes above C1 — ENTER LONG
+                        # ✅ Spike + strong-body bull candle, C2 closes above C1 — ENTER LONG
                         entry_price  = c
                         natural_sl   = st["recent_swing_low"]
                         min_sl       = entry_price * (1 - MIN_SL_PCT / 100)
@@ -872,22 +872,22 @@ def check_and_trade(symbol, row, df, all_state):
                         # Candle 2 not full-body — reset candle1, try again
                         print(f"  [{symbol}] CANDLE2-LONG failed (body<70% or close not above C1) — reset C1")
                         _reset_candle1(st)
-                        # Check if this candle itself qualifies as a new candle1
-                        if is_strong_bullish(o, h, l, c):
+                        # Check if this candle itself qualifies as new candle1 (spike)
+                        if c > o:
                             st["candle1_ts"] = c_ts
                             st["candle1_o"]  = o; st["candle1_h"] = h
                             st["candle1_l"]  = l; st["candle1_c"] = c
-                            print(f"  [{symbol}] CANDLE1-LONG (retry) "
+                            print(f"  [{symbol}] CANDLE1-LONG (retry spike) "
                                   f"O={round(o,precision)} C={round(c,precision)}")
                 else:
                     # Gap between candle1 and this candle — candle1 is stale, reset
                     print(f"  [{symbol}] CANDLE1-LONG stale (gap) — reset C1")
                     _reset_candle1(st)
-                    if is_strong_bullish(o, h, l, c):
+                    if c > o:
                         st["candle1_ts"] = c_ts
                         st["candle1_o"]  = o; st["candle1_h"] = h
                         st["candle1_l"]  = l; st["candle1_c"] = c
-                        print(f"  [{symbol}] CANDLE1-LONG (after gap) "
+                        print(f"  [{symbol}] CANDLE1-LONG (after gap spike) "
                               f"O={round(o,precision)} C={round(c,precision)}")
 
         # ── C. Short sweep armed ───────────────────────────────────────
@@ -904,19 +904,19 @@ def check_and_trade(symbol, row, df, all_state):
                 continue
 
             if st["candle1_ts"] == 0:
-                # Looking for FIRST strong-body bear (body≥70%)ish candle
-                if is_strong_bearish(o, h, l, c):
+                # Looking for FIRST bearish reversal candle (spike)
+                if c < o:
                     st["candle1_ts"] = c_ts
                     st["candle1_o"]  = o; st["candle1_h"] = h
                     st["candle1_l"]  = l; st["candle1_c"] = c
-                    print(f"  [{symbol}] CANDLE1-SHORT strong-body bear (body≥70%) "
+                    print(f"  [{symbol}] CANDLE1-SHORT bearish spike "
                           f"O={round(o,precision)} H={round(h,precision)} "
                           f"L={round(l,precision)} C={round(c,precision)}")
             else:
                 expected_ts = st["candle1_ts"] + CANDLE_SECONDS_1M * 1000
                 if c_ts == expected_ts:
                     if is_strong_bearish(o, h, l, c) and c < st["candle1_c"]:
-                        # ✅ Two consecutive strong-body bear candles, C2 closes below C1 — ENTER SHORT
+                        # ✅ Spike + strong-body bear candle, C2 closes below C1 — ENTER SHORT
                         entry_price  = c
                         natural_sl   = st["recent_swing_high"]
                         min_sl       = entry_price * (1 + MIN_SL_PCT / 100)
@@ -946,20 +946,20 @@ def check_and_trade(symbol, row, df, all_state):
                     else:
                         print(f"  [{symbol}] CANDLE2-SHORT failed (body<70% or close not below C1) — reset C1")
                         _reset_candle1(st)
-                        if is_strong_bearish(o, h, l, c):
+                        if c < o:
                             st["candle1_ts"] = c_ts
                             st["candle1_o"]  = o; st["candle1_h"] = h
                             st["candle1_l"]  = l; st["candle1_c"] = c
-                            print(f"  [{symbol}] CANDLE1-SHORT (retry) "
+                            print(f"  [{symbol}] CANDLE1-SHORT (retry spike) "
                                   f"O={round(o,precision)} C={round(c,precision)}")
                 else:
                     print(f"  [{symbol}] CANDLE1-SHORT stale (gap) — reset C1")
                     _reset_candle1(st)
-                    if is_strong_bearish(o, h, l, c):
+                    if c < o:
                         st["candle1_ts"] = c_ts
                         st["candle1_o"]  = o; st["candle1_h"] = h
                         st["candle1_l"]  = l; st["candle1_c"] = c
-                        print(f"  [{symbol}] CANDLE1-SHORT (after gap) "
+                        print(f"  [{symbol}] CANDLE1-SHORT (after gap spike) "
                               f"O={round(o,precision)} C={round(c,precision)}")
 
         st["last_processed_1m_ts"] = c_ts
@@ -1019,12 +1019,12 @@ send_telegram(
     f"✅ <b>PDH/PDL Sweep Bot Started</b>\n"
     f"━━━━━━━━━━━━━━━━━━\n"
     f"📐 Strategy  : <code>PDH/PDL Liquidity Sweep (Long + Short)</code>\n"
-    f"⚡ Entry     : <code>2 consecutive 1m candles: body≥70%, C2 close beyond C1</code>\n"
+    f"⚡ Entry     : <code>C1=any reversal spike, C2=body≥70% closing beyond C1</code>\n"
     f"🔒 1h Guard  : <code>Skip if already swept on closed 1h today</code>\n"
     f"🔁 Scan      : <code>Every 90 seconds</code>\n"
     f"🎯 TP        : <code>entry ± {TP_PCT}%</code>\n"
     f"🛑 SL        : <code>sweep extreme (min {MIN_SL_PCT}% from entry)</code>\n"
-    f"📏 Body rule : <code>body ≥ {MIN_BODY_PCT}% of candle range + C2 closes beyond C1</code>\n"
+    f"📏 Body rule : <code>C2 body ≥ {MIN_BODY_PCT}% of candle range + closes beyond C1</code>\n"
     f"⏳ Sweep exp : <code>{SWEEP_EXPIRY_BARS} × 1m bars</code>\n"
     f"💰 Capital   : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
 )
