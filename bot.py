@@ -17,16 +17,21 @@ getcontext().prec = 28
 BASE_URL = "https://api.coindcx.com"
 
 # =============================================================================
-# STRATEGY PARAMETERS  (PDH/PDL Liquidity Sweep — LONG + SHORT)
+# STRATEGY PARAMETERS  (Daily Trend/Engulfing — LONG + SHORT)
 #
 # TIMEFRAMES:
-#   - PDH/PDL levels  : daily candles
-#   - Sweep guard     : 1h closed candles (skip if already swept today)
-#   - Entry logic     : 5m candles  (sweep + 2-candle reversal)
+#   - Daily Trend     : 2 completed daily candles
+#   - Entry logic     : 5m candles  (2-candle reversal based on daily bias)
 #   - TP wick detect  : 1m candles
 #
-# ENTRY:
-#   C1 = any directional 5m candle after sweep (rejection spike, no body rule)
+# BIAS LOGIC (Last 2 completed daily candles):
+#   - Red + Red     → Bias LONG
+#   - Green + Green → Bias SHORT
+#   - Red + Green (Bullish Engulfing) → Bias LONG
+#   - Green + Red (Bearish Engulfing) → Bias SHORT
+#
+# ENTRY (Current Day 5m TF):
+#   C1 = any directional 5m candle (rejection spike, no body rule) matching bias
 #   C2 = immediately next 5m candle, body ≥ 70% of range, closes beyond C1 close
 #   SL  = C1 low (long) / C1 high (short), min MIN_SL_PCT% from entry
 #   TP  = entry ± TP_PCT%
@@ -34,34 +39,30 @@ BASE_URL = "https://api.coindcx.com"
 
 TP_PCT            = 1.25   # fixed TP %
 MIN_SL_PCT        = 0.5    # minimum SL distance from entry (%)
-MIN_BODY_PCT      = 60     # C2 body must be ≥ 70% of total candle range (high - low)
+MIN_BODY_PCT      = 70     # C2 body must be ≥ 70% of total candle range (high - low)
 
 # C1 reversal pattern thresholds
-DOJI_BODY_RATIO   = 0.15   # body ≤ 10% of range  → Doji
+DOJI_BODY_RATIO   = 0.10   # body ≤ 10% of range  → Doji
 PIN_BODY_RATIO    = 0.35   # body ≤ 35% of range  → Pin Bar / Hammer / Shooting Star
 WICK_MIN_RATIO    = 0.60   # dominant wick ≥ 60% of range
-SWEEP_EXPIRY_BARS = 6     # 5m bars before unresolved sweep expires (6 × 5m = 30 min)
 
 CANDLES_DAILY     = 5
 CANDLES_5M        = 100    # ~8.3 hours of 5m candles per scan
 CANDLES_1M        = 5      # used only for TP wick detection (last few minutes)
-CANDLES_1H        = 30
 
 RESOLUTION_DAILY  = "1D"
 RESOLUTION_5M     = "5"
 RESOLUTION_1M     = "1"
-RESOLUTION_1H     = "60"
 
 CANDLE_SECONDS_DAY = 86400
 CANDLE_SECONDS_5M  = 300
 CANDLE_SECONDS_1M  = 60
-CANDLE_SECONDS_1H  = 3600
 
 SCAN_INTERVAL          = 120      # seconds between scans
 REQUEST_TIMEOUT        = 15
 TELEGRAM_TIMEOUT       = 10
 GSHEET_REAUTH_INTERVAL = 45 * 60
-STATE_FILE             = "pdh_pdl_state.json"
+STATE_FILE             = "daily_trend_state.json"
 
 
 # =====================================================
@@ -165,24 +166,9 @@ def init_symbol_state():
 
         # Day tracking — resets at 00:00 UTC (05:30 IST)
         "current_day_str": None,
-        "pdh":             None,
-        "pdl":             None,
+        "daily_bias":      None, # Will hold "long" or "short" based on last 2 days
 
-        # 1h sweep guard — reset each new day
-        "pdl_swept_1h": False,
-        "pdh_swept_1h": False,
-
-        # Sweep state
-        "sweep_direction":   None,
-        "sweep_ts":          0,
-        "recent_swing_low":  None,
-        "recent_swing_high": None,
-        "sweep_o": None, "sweep_h": None,
-        "sweep_l": None, "sweep_c": None,
-
-        # 2-candle pattern
-        # C1 = any directional candle (rejection spike)
-        # C2 = immediately next, body ≥ 70%, closes beyond C1
+        # 2-candle pattern state
         "candle1_ts": 0,
         "candle1_o":  None, "candle1_h": None,
         "candle1_l":  None, "candle1_c": None,
@@ -372,7 +358,7 @@ def is_strong_bearish(o, h, l, c):
 
 def is_bullish_reversal_c1(o, h, l, c, prev_o=None, prev_c=None):
     """
-    Returns (matched, pattern_name) for bullish reversal patterns (C1 after PDL sweep).
+    Returns (matched, pattern_name) for bullish reversal patterns (C1).
     Checks: Dragonfly Doji, Hammer/Pin Bar, Bullish Engulfing.
     """
     rng = h - l
@@ -409,7 +395,7 @@ def is_bullish_reversal_c1(o, h, l, c, prev_o=None, prev_c=None):
 
 def is_bearish_reversal_c1(o, h, l, c, prev_o=None, prev_c=None):
     """
-    Returns (matched, pattern_name) for bearish reversal patterns (C1 after PDH sweep).
+    Returns (matched, pattern_name) for bearish reversal patterns (C1).
     Checks: Gravestone Doji, Shooting Star/Pin Bar, Bearish Engulfing.
     """
     rng = h - l
@@ -560,7 +546,7 @@ def place_long_order(symbol, entry_price, tp_price, sl_price, precision):
         return False
 
     send_telegram(
-        f"🟢 <b>NEW LONG (PDL SWEEP) — {symbol}</b>\n"
+        f"🟢 <b>NEW LONG (DAILY TREND) — {symbol}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📍 Entry : <code>{entry}</code>\n"
         f"🎯 TP    : <code>{tp}</code>  (+{tp_pct}%)\n"
@@ -611,7 +597,7 @@ def place_short_order(symbol, entry_price, tp_price, sl_price, precision):
         return False
 
     send_telegram(
-        f"🔴 <b>NEW SHORT (PDH SWEEP) — {symbol}</b>\n"
+        f"🔴 <b>NEW SHORT (DAILY TREND) — {symbol}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📍 Entry : <code>{entry}</code>\n"
         f"🎯 TP    : <code>{tp}</code>  (-{tp_pct}%)\n"
@@ -623,18 +609,8 @@ def place_short_order(symbol, entry_price, tp_price, sl_price, precision):
 
 
 # =====================================================
-# SWEEP STATE HELPERS
+# STATE RESET HELPER
 # =====================================================
-
-def _clear_sweep(st):
-    st["sweep_direction"]   = None
-    st["sweep_ts"]          = 0
-    st["recent_swing_low"]  = None
-    st["recent_swing_high"] = None
-    st["sweep_o"] = None; st["sweep_h"] = None
-    st["sweep_l"] = None; st["sweep_c"] = None
-    _reset_candle1(st)
-
 
 def _reset_candle1(st):
     st["candle1_ts"] = 0
@@ -650,18 +626,40 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
     now_ms    = int(time.time() * 1000)
     pair_name = fut_pair(symbol)
 
-    # ── 1. Daily candles → PDH / PDL ─────────────────────────────────────
+    # ── 1. Daily candles → Trend Bias Analysis ───────────────────────────
     daily = fetch_candles(symbol, CANDLES_DAILY, RESOLUTION_DAILY, CANDLE_SECONDS_DAY)
+    
+    # Drop in-progress daily bar
     if daily and (now_ms - int(daily[-1]["time"])) < CANDLE_SECONDS_DAY * 1000:
         daily = daily[:-1]
-    if not daily:
-        print(f"  [{symbol}] SKIP — no completed daily candles")
+        
+    if len(daily) < 2:
+        print(f"  [{symbol}] SKIP — not enough completed daily candles")
         return
 
-    prev_day  = daily[-1]
-    pdh       = float(prev_day["high"])
-    pdl       = float(prev_day["low"])
-    precision = get_precision(prev_day["close"])
+    # Extract last two completed days
+    d1 = daily[-2]  # Older day
+    d2 = daily[-1]  # Most recent completed day
+    
+    d1_o, d1_c = float(d1["open"]), float(d1["close"])
+    d2_o, d2_c = float(d2["open"]), float(d2["close"])
+    
+    d1_red   = d1_c < d1_o
+    d1_green = d1_c > d1_o
+    d2_red   = d2_c < d2_o
+    d2_green = d2_c > d2_o
+    
+    precision = get_precision(d2_c)
+
+    bias = None
+    if d1_red and d2_red:
+        bias = "long"
+    elif d1_green and d2_green:
+        bias = "short"
+    elif d1_red and d2_green and d2_c >= d1_o and d2_o <= d1_c:
+        bias = "long"   # Bullish Engulfing
+    elif d1_green and d2_red and d2_c <= d1_o and d2_o >= d1_c:
+        bias = "short"  # Bearish Engulfing
 
     # ── 2. State init / backfill ──────────────────────────────────────────
     st = all_state.setdefault(symbol, init_symbol_state())
@@ -672,7 +670,7 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
     # ── 3. New-day reset (00:00 UTC = 05:30 IST) ─────────────────────────
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if st["current_day_str"] != today_str:
-        print(f"  [{symbol}] NEW DAY — PDH={pdh} PDL={pdl}")
+        print(f"  [{symbol}] NEW DAY — Bias Calculated: {bias or 'NONE'}")
         preserved = {k: st[k] for k in
                      ("in_position", "direction", "entry_price",
                       "tp_level", "sl_price", "last_entry_ts")}
@@ -681,8 +679,7 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
         all_state[symbol] = st
 
     st["current_day_str"] = today_str
-    st["pdh"]             = pdh
-    st["pdl"]             = pdl
+    st["daily_bias"]      = bias
 
     # ── 4. TP COMPLETED check ─────────────────────────────────────────────
     tp_raw = str(df.iloc[row, 1]).strip() if df.shape[1] > 1 else ""
@@ -772,30 +769,15 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
         print(f"  [{symbol}] SKIP — open order on book")
         return
 
-    # ── 6. 1h sweep guard — only closed 1h bars ───────────────────────────
-    if not st["pdl_swept_1h"] or not st["pdh_swept_1h"]:
-        candles_1h = fetch_candles(symbol, CANDLES_1H, RESOLUTION_1H, CANDLE_SECONDS_1H)
-        # Drop in-progress 1h bar
-        if candles_1h and (now_ms - int(candles_1h[-1]["time"])) < CANDLE_SECONDS_1H * 1000:
-            candles_1h = candles_1h[:-1]
-        today_start_ms = int(datetime.strptime(today_str, "%Y-%m-%d")
-                             .replace(tzinfo=timezone.utc).timestamp() * 1000)
-        todays_1h = [c for c in candles_1h if int(c["time"]) >= today_start_ms]
-        for c1h in todays_1h:
-            if float(c1h["low"])  < pdl and not st["pdl_swept_1h"]:
-                st["pdl_swept_1h"] = True
-                print(f"  [{symbol}] 1H GUARD — PDL swept (low={c1h['low']} < PDL={pdl})")
-            if float(c1h["high"]) > pdh and not st["pdh_swept_1h"]:
-                st["pdh_swept_1h"] = True
-                print(f"  [{symbol}] 1H GUARD — PDH swept (high={c1h['high']} > PDH={pdh})")
-
-    if st["pdl_swept_1h"] and st["pdh_swept_1h"]:
-        print(f"  [{symbol}] SKIP — both sides already swept on 1h today")
+    # ── 6. Bias Check ─────────────────────────────────────────────────────
+    if not st["daily_bias"]:
+        print(f"  [{symbol}] SKIP — No daily trend or engulfing setup")
         save_state(all_state)
         return
 
     # ── 7. Fetch 5m candles ───────────────────────────────────────────────
     candles_5m = fetch_candles(symbol, CANDLES_5M, RESOLUTION_5M, CANDLE_SECONDS_5M)
+    
     # Drop in-progress 5m bar
     if candles_5m and (now_ms - int(candles_5m[-1]["time"])) < CANDLE_SECONDS_5M * 1000:
         candles_5m = candles_5m[:-1]
@@ -808,17 +790,15 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
     last_processed = st.get("last_processed_5m_ts", 0)
     new_candles    = [c for c in candles_5m if int(c["time"]) > last_processed]
 
-    print(f"  [{symbol}] PDH={pdh} PDL={pdl} | "
-          f"sweep={st['sweep_direction'] or 'none'} "
+    print(f"  [{symbol}] Daily Bias={st['daily_bias'].upper()} | "
           f"c1={'armed @' + str(st['candle1_ts']) if st['candle1_ts'] > 0 else 'waiting'} | "
-          f"1h_guard pdl={st['pdl_swept_1h']} pdh={st['pdh_swept_1h']} | "
           f"new_5m={len(new_candles)}")
 
     if not new_candles:
         save_state(all_state)
         return
 
-    # ── 8. Walk 5m candles — sweep + 2-candle reversal ────────────────────
+    # ── 8. Walk 5m candles — 2-candle reversal based on Bias ──────────────
     entry_path   = None
     entry_price  = None
     sl_price_val = None
@@ -833,40 +813,10 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
         l    = float(candle["low"])
         c    = float(candle["close"])
 
-        sweep_dir = st["sweep_direction"]
+        active_bias = st["daily_bias"]
 
-        # ── A. No sweep yet — detect one ──────────────────────────────
-        if sweep_dir is None:
-            if l < pdl and not st["pdl_swept_1h"]:
-                st["sweep_direction"]  = "long"
-                st["sweep_ts"]         = c_ts
-                st["recent_swing_low"] = l
-                st["sweep_o"] = o; st["sweep_h"] = h
-                st["sweep_l"] = l; st["sweep_c"] = c
-                print(f"  [{symbol}] SWEEP-LONG  5m low={round(l,precision)} < PDL={pdl} "
-                      f"(ext={round(pdl-l, precision)})")
-
-            elif h > pdh and not st["pdh_swept_1h"]:
-                st["sweep_direction"]   = "short"
-                st["sweep_ts"]          = c_ts
-                st["recent_swing_high"] = h
-                st["sweep_o"] = o; st["sweep_h"] = h
-                st["sweep_l"] = l; st["sweep_c"] = c
-                print(f"  [{symbol}] SWEEP-SHORT 5m high={round(h,precision)} > PDH={pdh} "
-                      f"(ext={round(h-pdh, precision)})")
-
-        # ── B. Long sweep — looking for C1 then C2 ────────────────────
-        elif sweep_dir == "long":
-            if l < st["recent_swing_low"]:
-                st["recent_swing_low"] = l
-
-            bars_since = (c_ts - st["sweep_ts"]) // (CANDLE_SECONDS_5M * 1000)
-            if bars_since > SWEEP_EXPIRY_BARS:
-                print(f"  [{symbol}] SWEEP-EXPIRE long ({bars_since}×5m) — resetting")
-                _clear_sweep(st)
-                st["last_processed_5m_ts"] = c_ts
-                continue
-
+        # ── A. Long Trend Setup — looking for C1 then C2 ────────────────────
+        if active_bias == "long":
             if st["candle1_ts"] == 0:
                 # C1: must be a recognised bullish reversal pattern
                 c1_match, c1_pattern = is_bullish_reversal_c1(o, h, l, c, prev_o, prev_c_val)
@@ -888,7 +838,7 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
                         min_sl       = entry_price * (1 - MIN_SL_PCT / 100)
                         sl_price_val = min(natural_sl, min_sl)
                         tp_price_val = entry_price * (1 + TP_PCT / 100)
-                        entry_path   = "long_sweep"
+                        entry_path   = "long_trend"
                         print(f"  [{symbol}] C2-LONG confirmed body={body_pct}% "
                               f"C={round(c,precision)} > C1={round(st['candle1_c'],precision)}")
                         st["last_processed_5m_ts"] = c_ts
@@ -915,18 +865,8 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
                         st["candle1_l"]  = l; st["candle1_c"] = c
                         print(f"  [{symbol}] C1-LONG after-gap [{c1_pattern}] C={round(c,precision)}")
 
-        # ── C. Short sweep — looking for C1 then C2 ───────────────────
-        elif sweep_dir == "short":
-            if h > st["recent_swing_high"]:
-                st["recent_swing_high"] = h
-
-            bars_since = (c_ts - st["sweep_ts"]) // (CANDLE_SECONDS_5M * 1000)
-            if bars_since > SWEEP_EXPIRY_BARS:
-                print(f"  [{symbol}] SWEEP-EXPIRE short ({bars_since}×5m) — resetting")
-                _clear_sweep(st)
-                st["last_processed_5m_ts"] = c_ts
-                continue
-
+        # ── B. Short Trend Setup — looking for C1 then C2 ───────────────────
+        elif active_bias == "short":
             if st["candle1_ts"] == 0:
                 # C1: must be a recognised bearish reversal pattern
                 c1_match, c1_pattern = is_bearish_reversal_c1(o, h, l, c, prev_o, prev_c_val)
@@ -948,7 +888,7 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
                         min_sl       = entry_price * (1 + MIN_SL_PCT / 100)
                         sl_price_val = max(natural_sl, min_sl)
                         tp_price_val = entry_price * (1 - TP_PCT / 100)
-                        entry_path   = "short_sweep"
+                        entry_path   = "short_trend"
                         print(f"  [{symbol}] C2-SHORT confirmed body={body_pct}% "
                               f"C={round(c,precision)} < C1={round(st['candle1_c'],precision)}")
                         st["last_processed_5m_ts"] = c_ts
@@ -986,29 +926,29 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
         return
 
     # ── 10. Validate SL ───────────────────────────────────────────────────
-    if entry_path == "long_sweep" and sl_price_val >= entry_price:
+    if entry_path == "long_trend" and sl_price_val >= entry_price:
         print(f"  [{symbol}] SKIP — invalid long SL (entry={entry_price} SL={sl_price_val})")
         save_state(all_state)
         return
-    if entry_path == "short_sweep" and sl_price_val <= entry_price:
+    if entry_path == "short_trend" and sl_price_val <= entry_price:
         print(f"  [{symbol}] SKIP — invalid short SL (entry={entry_price} SL={sl_price_val})")
         save_state(all_state)
         return
 
     # ── 11. Place order ───────────────────────────────────────────────────
-    if entry_path == "long_sweep":
+    if entry_path == "long_trend":
         placed = place_long_order(symbol, entry_price, tp_price_val, sl_price_val, precision)
     else:
         placed = place_short_order(symbol, entry_price, tp_price_val, sl_price_val, precision)
 
     if placed:
         st["in_position"]   = True
-        st["direction"]     = "long" if entry_path == "long_sweep" else "short"
+        st["direction"]     = "long" if entry_path == "long_trend" else "short"
         st["entry_price"]   = round(entry_price,  precision)
         st["tp_level"]      = round(tp_price_val, precision)
         st["sl_price"]      = round(sl_price_val, precision)
         st["last_entry_ts"] = st["last_processed_5m_ts"]
-        _clear_sweep(st)
+        _reset_candle1(st)
         update_sheet_tp(row, st["tp_level"])
         update_sheet_sl(row, st["sl_price"])
 
@@ -1024,14 +964,13 @@ consecutive_errors = 0
 MAX_CONSECUTIVE_ERRORS = 10
 
 send_telegram(
-    f"✅ <b>PDH/PDL Sweep Bot Started</b>\n"
+    f"✅ <b>Daily Trend / Engulfing Bot Started</b>\n"
     f"━━━━━━━━━━━━━━━━━━\n"
-    f"📐 Strategy  : <code>PDH/PDL Liquidity Sweep (Long + Short)</code>\n"
-    f"📅 Levels    : <code>Previous day high/low (daily candles)</code>\n"
-    f"🔒 1h Guard  : <code>Skip if level already swept on closed 1h today</code>\n"
+    f"📐 Strategy  : <code>Daily Bias + 5m Reversal Setup</code>\n"
+    f"📅 Bias Rule : <code>2x Falling OR Bullish Engulfing → LONG Setup</code>\n"
+    f"📅 Bias Rule : <code>2x Rising OR Bearish Engulfing → SHORT Setup</code>\n"
     f"⚡ C1        : <code>Dragonfly/Gravestone Doji, Hammer/Pin Bar/Shooting Star, Engulfing</code>\n"
     f"⚡ C2        : <code>5m body≥{MIN_BODY_PCT}% closing beyond C1 close</code>\n"
-    f"⏳ Sweep exp : <code>{SWEEP_EXPIRY_BARS} × 5m bars = {SWEEP_EXPIRY_BARS * 5} min</code>\n"
     f"🔁 Scan      : <code>Every {SCAN_INTERVAL} seconds</code>\n"
     f"🎯 TP        : <code>entry ± {TP_PCT}%</code>\n"
     f"🛑 SL        : <code>C1 low (long) / C1 high (short), min {MIN_SL_PCT}% from entry</code>\n"
