@@ -24,14 +24,18 @@ BASE_URL = "https://api.coindcx.com"
 #   - Entry logic     : 5m candles  (2-candle reversal based on daily bias)
 #   - TP wick detect  : 1m candles
 #
-# BIAS LOGIC (Last 2 completed daily candles):
-#   - Red + Red     → Bias LONG
-#   - Green + Green → Bias SHORT
-#   - Red + Green (Bullish Engulfing) → Bias LONG
-#   - Green + Red (Bearish Engulfing) → Bias SHORT
+# DAILY BIAS (Last 2 completed daily candles) — priority ordered:
+#
+#   LONG  → Bullish Engulfing, Piercing Line, Bullish Harami,
+#            Hammer, Dragonfly Doji (after bearish/doji D1),
+#            Two Red Days
+#
+#   SHORT → Bearish Engulfing, Dark Cloud Cover, Bearish Harami,
+#            Shooting Star, Gravestone Doji (after bullish/doji D1),
+#            Two Green Days
 #
 # ENTRY (Current Day 5m TF):
-#   C1 = any directional 5m candle (rejection spike, no body rule) matching bias
+#   C1 = reversal candle matching bias (Doji, Hammer/Star, Engulfing)
 #   C2 = immediately next 5m candle, body ≥ 70% of range, closes beyond C1 close
 #   SL  = C1 low (long) / C1 high (short), min MIN_SL_PCT% from entry
 #   TP  = entry ± TP_PCT%
@@ -41,10 +45,13 @@ TP_PCT            = 1.25   # fixed TP %
 MIN_SL_PCT        = 0.5    # minimum SL distance from entry (%)
 MIN_BODY_PCT      = 70     # C2 body must be ≥ 70% of total candle range (high - low)
 
-# C1 reversal pattern thresholds
+# C1 reversal pattern thresholds (5m candles)
 DOJI_BODY_RATIO   = 0.10   # body ≤ 10% of range  → Doji
 PIN_BODY_RATIO    = 0.35   # body ≤ 35% of range  → Pin Bar / Hammer / Shooting Star
 WICK_MIN_RATIO    = 0.60   # dominant wick ≥ 60% of range
+
+# Daily bias pattern thresholds
+HARAMI_MAX_BODY_RATIO = 0.40   # D2 body ≤ 40% of D1 body for Harami
 
 CANDLES_DAILY     = 5
 CANDLES_5M        = 100    # ~8.3 hours of 5m candles per scan
@@ -165,8 +172,9 @@ def init_symbol_state():
         "last_entry_ts": 0,
 
         # Day tracking — resets at 00:00 UTC (05:30 IST)
-        "current_day_str": None,
-        "daily_bias":      None, # Will hold "long" or "short" based on last 2 days
+        "current_day_str":   None,
+        "daily_bias":        None,   # "long" or "short"
+        "daily_bias_pattern": None,  # human-readable pattern name
 
         # 2-candle pattern state
         "candle1_ts": 0,
@@ -354,7 +362,133 @@ def is_strong_bearish(o, h, l, c):
     return ((o - c) / rng * 100) >= MIN_BODY_PCT
 
 
-# ── Candle fetchers ───────────────────────────────────────────────────────────
+# =====================================================
+# DAILY BIAS — 10-PATTERN ANALYSIS
+# Priority ordered: strongest signal wins.
+# =====================================================
+
+def get_daily_bias(d1, d2):
+    """
+    Analyse last 2 completed daily candles.
+    Returns (bias, pattern_name) where bias = 'long' | 'short' | None.
+
+    Priority (highest → lowest):
+      LONG : Bullish Engulfing, Piercing Line, Bullish Harami,
+             Hammer, Dragonfly Doji, Two Red Days
+      SHORT: Bearish Engulfing, Dark Cloud Cover, Bearish Harami,
+             Shooting Star, Gravestone Doji, Two Green Days
+    """
+    d1_o = float(d1["open"]);  d1_h = float(d1["high"])
+    d1_l = float(d1["low"]);   d1_c = float(d1["close"])
+    d2_o = float(d2["open"]);  d2_h = float(d2["high"])
+    d2_l = float(d2["low"]);   d2_c = float(d2["close"])
+
+    d1_rng  = d1_h - d1_l if d1_h != d1_l else 1e-10
+    d2_rng  = d2_h - d2_l if d2_h != d2_l else 1e-10
+    d1_body = abs(d1_c - d1_o)
+    d2_body = abs(d2_c - d2_o)
+
+    d1_bearish = d1_c < d1_o
+    d1_bullish = d1_c > d1_o
+    d2_bearish = d2_c < d2_o
+    d2_bullish = d2_c > d2_o
+
+    # D1 body midpoint (used for Piercing Line / Dark Cloud Cover)
+    d1_body_mid = (d1_o + d1_c) / 2
+
+    # D2 wick / body ratios
+    d2_upper_wick  = d2_h - max(d2_o, d2_c)
+    d2_lower_wick  = min(d2_o, d2_c) - d2_l
+    d2_body_ratio  = d2_body / d2_rng
+    d2_upper_ratio = d2_upper_wick / d2_rng
+    d2_lower_ratio = d2_lower_wick / d2_rng
+
+    # ── LONG patterns (priority order) ────────────────────────────────────
+
+    # 1. Bullish Engulfing: D1 bearish, D2 bullish body fully covers D1 body
+    #    D2 body ≥ 80% of D1 body to avoid micro-engulfs
+    if (d1_bearish and d2_bullish
+            and d2_o <= d1_c
+            and d2_c >= d1_o
+            and d2_body >= d1_body * 0.80):
+        return "long", "Bullish Engulfing"
+
+    # 2. Piercing Line: D1 bearish, D2 opens at/below D1 close,
+    #    D2 closes above D1 body midpoint but below D1 open (not a full engulf)
+    if (d1_bearish and d2_bullish
+            and d2_o <= d1_c
+            and d2_c > d1_body_mid
+            and d2_c < d1_o):
+        return "long", "Piercing Line"
+
+    # 3. Bullish Harami: D1 bearish, D2 bullish body entirely inside D1 body,
+    #    D2 body ≤ 40% of D1 body (confirms indecision / pause in selling)
+    if (d1_bearish and d2_bullish
+            and d1_c <= d2_o <= d1_o   # D2 open inside D1 body
+            and d1_c <= d2_c <= d1_o   # D2 close inside D1 body
+            and d2_body <= d1_body * HARAMI_MAX_BODY_RATIO):
+        return "long", "Bullish Harami"
+
+    # 4. Hammer / Dragonfly Doji on D2 — only valid after a bearish or doji D1
+    if not d1_bullish:
+        # Dragonfly Doji: tiny body, long lower wick ≥ 60%
+        if d2_body_ratio <= DOJI_BODY_RATIO and d2_lower_ratio >= WICK_MIN_RATIO:
+            return "long", "Dragonfly Doji"
+        # Hammer / Pin Bar: small body, long lower wick, tiny upper wick, closes upper half
+        if (d2_body_ratio <= PIN_BODY_RATIO
+                and d2_lower_ratio >= WICK_MIN_RATIO
+                and d2_upper_ratio <= 0.15
+                and d2_c >= (d2_h + d2_l) / 2):
+            return "long", "Hammer"
+
+    # 5. Two Red Days: both bearish — momentum exhaustion / mean-reversion setup
+    if d1_bearish and d2_bearish:
+        return "long", "Two Red Days"
+
+    # ── SHORT patterns (priority order) ───────────────────────────────────
+
+    # 6. Bearish Engulfing: D1 bullish, D2 bearish body fully covers D1 body
+    if (d1_bullish and d2_bearish
+            and d2_o >= d1_c
+            and d2_c <= d1_o
+            and d2_body >= d1_body * 0.80):
+        return "short", "Bearish Engulfing"
+
+    # 7. Dark Cloud Cover: D1 bullish, D2 opens at/above D1 close,
+    #    D2 closes below D1 body midpoint but above D1 open (not a full engulf)
+    if (d1_bullish and d2_bearish
+            and d2_o >= d1_c
+            and d2_c < d1_body_mid
+            and d2_c > d1_o):
+        return "short", "Dark Cloud Cover"
+
+    # 8. Bearish Harami: D1 bullish, D2 bearish body entirely inside D1 body
+    if (d1_bullish and d2_bearish
+            and d1_o <= d2_c <= d1_c   # D2 close inside D1 body
+            and d1_o <= d2_o <= d1_c   # D2 open inside D1 body
+            and d2_body <= d1_body * HARAMI_MAX_BODY_RATIO):
+        return "short", "Bearish Harami"
+
+    # 9. Shooting Star / Gravestone Doji on D2 — only valid after a bullish or doji D1
+    if not d1_bearish:
+        # Gravestone Doji: tiny body, long upper wick ≥ 60%
+        if d2_body_ratio <= DOJI_BODY_RATIO and d2_upper_ratio >= WICK_MIN_RATIO:
+            return "short", "Gravestone Doji"
+        # Shooting Star: small body, long upper wick, tiny lower wick, closes lower half
+        if (d2_body_ratio <= PIN_BODY_RATIO
+                and d2_upper_ratio >= WICK_MIN_RATIO
+                and d2_lower_ratio <= 0.15
+                and d2_c <= (d2_h + d2_l) / 2):
+            return "short", "Shooting Star"
+
+    # 10. Two Green Days: both bullish — momentum exhaustion / mean-reversion setup
+    if d1_bullish and d2_bullish:
+        return "short", "Two Green Days"
+
+    return None, None
+
+
+# ── 5m C1 reversal checks ─────────────────────────────────────────────────────
 
 def is_bullish_reversal_c1(o, h, l, c, prev_o=None, prev_c=None):
     """
@@ -366,8 +500,8 @@ def is_bullish_reversal_c1(o, h, l, c, prev_o=None, prev_c=None):
         return False, None
     body        = abs(c - o)
     body_ratio  = body / rng
-    lower_wick  = min(o, c) - l      # wick below body
-    upper_wick  = h - max(o, c)      # wick above body
+    lower_wick  = min(o, c) - l
+    upper_wick  = h - max(o, c)
     lower_ratio = lower_wick / rng
     upper_ratio = upper_wick / rng
 
@@ -626,40 +760,22 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
     now_ms    = int(time.time() * 1000)
     pair_name = fut_pair(symbol)
 
-    # ── 1. Daily candles → Trend Bias Analysis ───────────────────────────
+    # ── 1. Daily candles → Bias via 10-pattern analysis ──────────────────
     daily = fetch_candles(symbol, CANDLES_DAILY, RESOLUTION_DAILY, CANDLE_SECONDS_DAY)
-    
+
     # Drop in-progress daily bar
     if daily and (now_ms - int(daily[-1]["time"])) < CANDLE_SECONDS_DAY * 1000:
         daily = daily[:-1]
-        
+
     if len(daily) < 2:
         print(f"  [{symbol}] SKIP — not enough completed daily candles")
         return
 
-    # Extract last two completed days
-    d1 = daily[-2]  # Older day
-    d2 = daily[-1]  # Most recent completed day
-    
-    d1_o, d1_c = float(d1["open"]), float(d1["close"])
-    d2_o, d2_c = float(d2["open"]), float(d2["close"])
-    
-    d1_red   = d1_c < d1_o
-    d1_green = d1_c > d1_o
-    d2_red   = d2_c < d2_o
-    d2_green = d2_c > d2_o
-    
-    precision = get_precision(d2_c)
+    d1 = daily[-2]   # Older completed day
+    d2 = daily[-1]   # Most recent completed day
 
-    bias = None
-    if d1_red and d2_red:
-        bias = "long"
-    elif d1_green and d2_green:
-        bias = "short"
-    elif d1_red and d2_green and d2_c >= d1_o and d2_o <= d1_c:
-        bias = "long"   # Bullish Engulfing
-    elif d1_green and d2_red and d2_c <= d1_o and d2_o >= d1_c:
-        bias = "short"  # Bearish Engulfing
+    precision    = get_precision(float(d2["close"]))
+    bias, bias_pattern = get_daily_bias(d1, d2)
 
     # ── 2. State init / backfill ──────────────────────────────────────────
     st = all_state.setdefault(symbol, init_symbol_state())
@@ -670,7 +786,7 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
     # ── 3. New-day reset (00:00 UTC = 05:30 IST) ─────────────────────────
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if st["current_day_str"] != today_str:
-        print(f"  [{symbol}] NEW DAY — Bias Calculated: {bias or 'NONE'}")
+        print(f"  [{symbol}] NEW DAY — Bias: {bias or 'NONE'} ({bias_pattern or '-'})")
         preserved = {k: st[k] for k in
                      ("in_position", "direction", "entry_price",
                       "tp_level", "sl_price", "last_entry_ts")}
@@ -678,8 +794,9 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
         st.update(preserved)
         all_state[symbol] = st
 
-    st["current_day_str"] = today_str
-    st["daily_bias"]      = bias
+    st["current_day_str"]    = today_str
+    st["daily_bias"]         = bias
+    st["daily_bias_pattern"] = bias_pattern
 
     # ── 4. TP COMPLETED check ─────────────────────────────────────────────
     tp_raw = str(df.iloc[row, 1]).strip() if df.shape[1] > 1 else ""
@@ -769,15 +886,15 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
         print(f"  [{symbol}] SKIP — open order on book")
         return
 
-    # ── 6. Bias Check ─────────────────────────────────────────────────────
+    # ── 6. Bias check ─────────────────────────────────────────────────────
     if not st["daily_bias"]:
-        print(f"  [{symbol}] SKIP — No daily trend or engulfing setup")
+        print(f"  [{symbol}] SKIP — no daily bias pattern detected")
         save_state(all_state)
         return
 
     # ── 7. Fetch 5m candles ───────────────────────────────────────────────
     candles_5m = fetch_candles(symbol, CANDLES_5M, RESOLUTION_5M, CANDLE_SECONDS_5M)
-    
+
     # Drop in-progress 5m bar
     if candles_5m and (now_ms - int(candles_5m[-1]["time"])) < CANDLE_SECONDS_5M * 1000:
         candles_5m = candles_5m[:-1]
@@ -790,7 +907,7 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
     last_processed = st.get("last_processed_5m_ts", 0)
     new_candles    = [c for c in candles_5m if int(c["time"]) > last_processed]
 
-    print(f"  [{symbol}] Daily Bias={st['daily_bias'].upper()} | "
+    print(f"  [{symbol}] Bias={st['daily_bias'].upper()} ({st['daily_bias_pattern']}) | "
           f"c1={'armed @' + str(st['candle1_ts']) if st['candle1_ts'] > 0 else 'waiting'} | "
           f"new_5m={len(new_candles)}")
 
@@ -798,18 +915,16 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
         save_state(all_state)
         return
 
-    # Get the timestamp threshold for today start (00:00 UTC)
-    today_start_ms = int(datetime.strptime(today_str, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000)
-    # Get the absolute newest closed candle time in this batch
+    today_start_ms   = int(datetime.strptime(today_str, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000)
     newest_candle_ts = int(candles_5m[-1]["time"])
 
-    # ── 8. Walk 5m candles — 2-candle reversal based on Bias ──────────────
+    # ── 8. Walk 5m candles — 2-candle reversal based on bias ─────────────
     entry_path   = None
     entry_price  = None
     sl_price_val = None
     tp_price_val = None
 
-    prev_o = prev_h = prev_l = prev_c_val = None  # tracks candle just before current
+    prev_o = prev_h = prev_l = prev_c_val = None
 
     for candle in new_candles:
         c_ts = int(candle["time"])
@@ -820,10 +935,9 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
 
         active_bias = st["daily_bias"]
 
-        # ── A. Long Trend Setup — looking for C1 then C2 ────────────────────
+        # ── A. Long Trend Setup ──────────────────────────────────────────
         if active_bias == "long":
             if st["candle1_ts"] == 0:
-                # C1 validation: Must be within the current day timeline
                 if c_ts >= today_start_ms:
                     c1_match, c1_pattern = is_bullish_reversal_c1(o, h, l, c, prev_o, prev_c_val)
                     if c1_match:
@@ -838,10 +952,9 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
                 if c_ts == expected_ts:
                     body_pct = round((c - o) / (h - l) * 100, 1) if h != l else 0
                     if is_strong_bullish(o, h, l, c) and c > st["candle1_c"]:
-                        # CRITICAL FIX: Only execute execution block if C2 matches the latest live completed bar
                         if c_ts == newest_candle_ts:
                             entry_price  = c
-                            natural_sl   = st["candle1_l"]     # SL at C1 low
+                            natural_sl   = st["candle1_l"]
                             min_sl       = entry_price * (1 - MIN_SL_PCT / 100)
                             sl_price_val = min(natural_sl, min_sl)
                             tp_price_val = entry_price * (1 + TP_PCT / 100)
@@ -851,7 +964,6 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
                             st["last_processed_5m_ts"] = c_ts
                             break
                         else:
-                            # If it's a historical C2 confirmation, advance state without placing order
                             _reset_candle1(st)
                     else:
                         print(f"  [{symbol}] C2-LONG failed "
@@ -876,10 +988,9 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
                             st["candle1_l"]  = l; st["candle1_c"] = c
                             print(f"  [{symbol}] C1-LONG after-gap [{c1_pattern}] C={round(c,precision)}")
 
-        # ── B. Short Trend Setup — looking for C1 then C2 ───────────────────
+        # ── B. Short Trend Setup ─────────────────────────────────────────
         elif active_bias == "short":
             if st["candle1_ts"] == 0:
-                # C1 validation: Must be within the current day timeline
                 if c_ts >= today_start_ms:
                     c1_match, c1_pattern = is_bearish_reversal_c1(o, h, l, c, prev_o, prev_c_val)
                     if c1_match:
@@ -894,10 +1005,9 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
                 if c_ts == expected_ts:
                     body_pct = round((o - c) / (h - l) * 100, 1) if h != l else 0
                     if is_strong_bearish(o, h, l, c) and c < st["candle1_c"]:
-                        # CRITICAL FIX: Only execute execution block if C2 matches the latest live completed bar
                         if c_ts == newest_candle_ts:
                             entry_price  = c
-                            natural_sl   = st["candle1_h"]     # SL at C1 high
+                            natural_sl   = st["candle1_h"]
                             min_sl       = entry_price * (1 + MIN_SL_PCT / 100)
                             sl_price_val = max(natural_sl, min_sl)
                             tp_price_val = entry_price * (1 - TP_PCT / 100)
@@ -907,7 +1017,6 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
                             st["last_processed_5m_ts"] = c_ts
                             break
                         else:
-                            # If it's a historical C2 confirmation, advance state without placing order
                             _reset_candle1(st)
                     else:
                         print(f"  [{symbol}] C2-SHORT failed "
@@ -981,18 +1090,30 @@ consecutive_errors = 0
 MAX_CONSECUTIVE_ERRORS = 10
 
 send_telegram(
-    f"✅ <b>Daily Trend / Engulfing Bot Started</b>\n"
+    f"✅ <b>Daily Trend Bot Started</b>\n"
     f"━━━━━━━━━━━━━━━━━━\n"
-    f"📐 Strategy  : <code>Daily Bias + 5m Reversal Setup</code>\n"
-    f"📅 Bias Rule : <code>2x Falling OR Bullish Engulfing → LONG Setup</code>\n"
-    f"📅 Bias Rule : <code>2x Rising OR Bearish Engulfing → SHORT Setup</code>\n"
-    f"⚡ C1        : <code>Dragonfly/Gravestone Doji, Hammer/Pin Bar/Shooting Star, Engulfing</code>\n"
-    f"⚡ C2        : <code>5m body≥{MIN_BODY_PCT}% closing beyond C1 close</code>\n"
-    f"🔁 Scan      : <code>Every {SCAN_INTERVAL} seconds</code>\n"
-    f"🎯 TP        : <code>entry ± {TP_PCT}%</code>\n"
-    f"🛑 SL        : <code>C1 low (long) / C1 high (short), min {MIN_SL_PCT}% from entry</code>\n"
-    f"🔒 API       : <code>Global batch fetch (rate-limit safe)</code>\n"
-    f"💰 Capital   : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
+    f"📐 Strategy   : <code>Daily 2-Candle Bias + 5m C1/C2 Reversal</code>\n"
+    f"\n"
+    f"📈 LONG Bias  :\n"
+    f"  <code>① Bullish Engulfing</code>\n"
+    f"  <code>② Piercing Line</code>\n"
+    f"  <code>③ Bullish Harami</code>\n"
+    f"  <code>④ Hammer / Dragonfly Doji (after red D1)</code>\n"
+    f"  <code>⑤ Two Red Days</code>\n"
+    f"\n"
+    f"📉 SHORT Bias :\n"
+    f"  <code>① Bearish Engulfing</code>\n"
+    f"  <code>② Dark Cloud Cover</code>\n"
+    f"  <code>③ Bearish Harami</code>\n"
+    f"  <code>④ Shooting Star / Gravestone Doji (after green D1)</code>\n"
+    f"  <code>⑤ Two Green Days</code>\n"
+    f"\n"
+    f"⚡ C1 (5m)    : <code>Dragonfly/Gravestone Doji, Hammer/Pin Bar/Shooting Star, Engulfing</code>\n"
+    f"⚡ C2 (5m)    : <code>body ≥ {MIN_BODY_PCT}%, closes beyond C1 close</code>\n"
+    f"🔁 Scan       : <code>Every {SCAN_INTERVAL}s</code>\n"
+    f"🎯 TP         : <code>entry ± {TP_PCT}%</code>\n"
+    f"🛑 SL         : <code>C1 low/high, min {MIN_SL_PCT}% from entry</code>\n"
+    f"💰 Capital    : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
 )
 
 while True:
@@ -1003,7 +1124,6 @@ while True:
             time.sleep(SCAN_INTERVAL)
             continue
 
-        # Fetch positions + orders ONCE per cycle (rate-limit safe)
         global_positions = get_all_positions()
         global_orders    = get_all_open_orders()
 
