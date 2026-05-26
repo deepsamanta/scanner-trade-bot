@@ -17,47 +17,70 @@ getcontext().prec = 28
 BASE_URL = "https://api.coindcx.com"
 
 # =============================================================================
-# STRATEGY PARAMETERS  (Daily Trend/Engulfing — LONG + SHORT)
+# STRATEGY PARAMETERS
 #
-# TIMEFRAMES:
-#   - Daily Trend     : 2 completed daily candles
-#   - Entry logic     : 5m candles  (last 2 completed candles only)
-#   - TP wick detect  : 1m candles
+# DAILY BIAS  : Last 4 completed daily candles → pattern detection
+# ENTRY       : 15m candles — C1 reversal + C2 confirmation
+# TP          : Fixed +3% from entry
+# SL          : Fixed -1.5% from entry
 #
-# DAILY BIAS (Last 2 completed daily candles) — priority ordered:
-#   LONG  → Bullish Engulfing, Piercing Line, Bullish Harami,
-#            Hammer, Dragonfly Doji (after bearish/doji D1),
-#            Two Red Days
-#   SHORT → Bearish Engulfing, Dark Cloud Cover, Bearish Harami,
-#            Shooting Star, Gravestone Doji (after bullish/doji D1),
-#            Two Green Days
+# DEPLOYMENT GUARD: No trades on the day the bot is first started.
+#                   Trading begins from the NEXT calendar day (00:00 UTC).
 #
-# ENTRY (5m):
-#   C1 = candles_5m[-2] — reversal candle matching bias
-#   C2 = candles_5m[-1] — body ≥ 70% of range, closes beyond C1 close
-#   SL  = C1 low (long) / C1 high (short), min MIN_SL_PCT% from entry
-#   TP  = entry ± TP_PCT%
+# DAILY BIAS PATTERNS (d1=oldest, d2, d3, d4=most recent completed)
+#
+#   LONG  (priority order):
+#     1. Morning Star        — d2 solid bearish, d3 small-body star, d4 bullish > d2 midpoint
+#     2. Three Down + Hammer — d2+d3 bearish, d4 is Hammer or Dragonfly Doji
+#     3. Bullish Engulfing   — d3 bearish, d4 bullish body ≥ 80% of d3
+#     4. Piercing Line       — d3 bearish, d4 opens ≤ d3 close, closes above d3 midpoint
+#     5. Bullish Harami      — d3 bearish, d4 small bullish body inside d3 body
+#     6. Hammer / Doji on d4 — after 2+ consecutive red days (d2+d3 both bearish)
+#     7. Three Black Crows   — d2+d3+d4 all bearish (exhaustion)
+#     8. Four Red Days       — d1+d2+d3+d4 all bearish (extreme exhaustion)
+#
+#   SHORT (priority order):
+#     1. Evening Star         — d2 solid bullish, d3 small-body star, d4 bearish < d2 midpoint
+#     2. Three Up + Shoot     — d2+d3 bullish, d4 is Shooting Star or Gravestone Doji
+#     3. Bearish Engulfing    — d3 bullish, d4 bearish body ≥ 80% of d3
+#     4. Dark Cloud Cover     — d3 bullish, d4 opens ≥ d3 close, closes below d3 midpoint
+#     5. Bearish Harami       — d3 bullish, d4 small bearish body inside d3 body
+#     6. Shooting Star / Doji — after 2+ consecutive green days (d2+d3 both bullish)
+#     7. Three White Soldiers — d2+d3+d4 all bullish (exhaustion)
+#     8. Four Green Days      — d1+d2+d3+d4 all bullish (extreme exhaustion)
+#
+# ENTRY (15m):
+#   C1 = 15m[-2] — reversal candle matching bias (Doji, Hammer, Shooting Star, Engulfing)
+#   C2 = 15m[-1] — body ≥ 70% of range, closes beyond C1 close
+#   Entry = limit order at C2 close
+#   TP    = entry ± 3%  |  SL = entry ∓ 1.5%
 # =============================================================================
 
-TP_PCT            = 1.25
-MIN_SL_PCT        = 0.5
-MIN_BODY_PCT      = 70
+TP_PCT         = 3.0
+SL_PCT         = 1.5
+MIN_BODY_PCT   = 70      # C2 body must be ≥ 70% of range
 
-DOJI_BODY_RATIO   = 0.10
-PIN_BODY_RATIO    = 0.35
-WICK_MIN_RATIO    = 0.60
-HARAMI_MAX_BODY_RATIO = 0.40
+# Daily pattern thresholds
+STAR_BODY_RATIO   = 0.30   # d3 body ≤ 30% of range → qualifies as "star"
+SOLID_BODY_RATIO  = 0.40   # d2 body ≥ 40% of range → qualifies as "solid" candle
+HARAMI_MAX_RATIO  = 0.40   # d4 body ≤ 40% of d3 body for Harami
+ENGULF_MIN_RATIO  = 0.80   # d4 body ≥ 80% of d3 body for Engulfing
 
-CANDLES_DAILY     = 5
-CANDLES_5M        = 10     # only need last few completed 5m candles
-CANDLES_1M        = 5
+# 15m C1 thresholds
+DOJI_BODY_RATIO  = 0.10
+PIN_BODY_RATIO   = 0.35
+WICK_MIN_RATIO   = 0.60
 
-RESOLUTION_DAILY  = "1D"
-RESOLUTION_5M     = "5"
-RESOLUTION_1M     = "1"
+CANDLES_DAILY    = 8    # fetch 8, use last 4 completed
+CANDLES_15M      = 10
+CANDLES_1M       = 5
+
+RESOLUTION_DAILY = "1D"
+RESOLUTION_15M   = "15"
+RESOLUTION_1M    = "1"
 
 CANDLE_SECONDS_DAY = 86400
-CANDLE_SECONDS_5M  = 300
+CANDLE_SECONDS_15M = 900
 CANDLE_SECONDS_1M  = 60
 
 SCAN_INTERVAL          = 120
@@ -168,7 +191,7 @@ def init_symbol_state():
         "current_day_str":    None,
         "daily_bias":         None,
         "daily_bias_pattern": None,
-        "last_c2_ts":         0,    # ts of last C2 candle we acted on (dedup)
+        "last_c2_ts":         0,
     }
 
 
@@ -322,8 +345,6 @@ def extract_tp_sl(obj):
     return _pick(tp_keys), _pick(sl_keys)
 
 
-# ── Candle body checks ────────────────────────────────────────────────────────
-
 def is_strong_bullish(o, h, l, c):
     if c <= o:
         return False
@@ -343,97 +364,167 @@ def is_strong_bearish(o, h, l, c):
 
 
 # =====================================================
-# DAILY BIAS — 10-PATTERN ANALYSIS
+# DAILY BIAS — 4-CANDLE PATTERN ANALYSIS
+# d1=oldest, d2, d3, d4=most recent completed daily candle
 # =====================================================
 
-def get_daily_bias(d1, d2):
-    d1_o = float(d1["open"]);  d1_h = float(d1["high"])
-    d1_l = float(d1["low"]);   d1_c = float(d1["close"])
-    d2_o = float(d2["open"]);  d2_h = float(d2["high"])
-    d2_l = float(d2["low"]);   d2_c = float(d2["close"])
+def get_daily_bias(d1, d2, d3, d4):
+    """
+    Analyse last 4 completed daily candles.
+    Returns (bias, pattern_name): bias = 'long' | 'short' | None
+    """
+    def _parse(d):
+        o = float(d["open"]); h = float(d["high"])
+        l = float(d["low"]);  c = float(d["close"])
+        rng  = h - l if h != l else 1e-10
+        body = abs(c - o)
+        return o, h, l, c, rng, body, c < o, c > o   # bearish, bullish flags
 
-    d1_rng  = d1_h - d1_l if d1_h != d1_l else 1e-10
-    d2_rng  = d2_h - d2_l if d2_h != d2_l else 1e-10
-    d1_body = abs(d1_c - d1_o)
-    d2_body = abs(d2_c - d2_o)
+    d1_o, d1_h, d1_l, d1_c, d1_rng, d1_body, d1_bear, d1_bull = _parse(d1)
+    d2_o, d2_h, d2_l, d2_c, d2_rng, d2_body, d2_bear, d2_bull = _parse(d2)
+    d3_o, d3_h, d3_l, d3_c, d3_rng, d3_body, d3_bear, d3_bull = _parse(d3)
+    d4_o, d4_h, d4_l, d4_c, d4_rng, d4_body, d4_bear, d4_bull = _parse(d4)
 
-    d1_bearish = d1_c < d1_o
-    d1_bullish = d1_c > d1_o
-    d2_bearish = d2_c < d2_o
-    d2_bullish = d2_c > d2_o
+    d3_body_mid = (d3_o + d3_c) / 2
+    d2_body_mid = (d2_o + d2_c) / 2
 
-    d1_body_mid = (d1_o + d1_c) / 2
+    d4_upper_wick  = d4_h - max(d4_o, d4_c)
+    d4_lower_wick  = min(d4_o, d4_c) - d4_l
+    d4_body_ratio  = d4_body / d4_rng
+    d4_upper_ratio = d4_upper_wick / d4_rng
+    d4_lower_ratio = d4_lower_wick / d4_rng
 
-    d2_upper_wick  = d2_h - max(d2_o, d2_c)
-    d2_lower_wick  = min(d2_o, d2_c) - d2_l
+    d3_body_ratio  = d3_body / d3_rng
     d2_body_ratio  = d2_body / d2_rng
-    d2_upper_ratio = d2_upper_wick / d2_rng
-    d2_lower_ratio = d2_lower_wick / d2_rng
 
-    # ── LONG ──────────────────────────────────────────────────────────────
-    if (d1_bearish and d2_bullish
-            and d2_o <= d1_c and d2_c >= d1_o
-            and d2_body >= d1_body * 0.80):
+    # ── LONG patterns (priority order) ────────────────────────────────────
+
+    # 1. Morning Star (3-candle):
+    #    d2 solid bearish → d3 small-body star (indecision) → d4 bullish closing above d2 midpoint
+    if (d2_bear and d2_body_ratio >= SOLID_BODY_RATIO
+            and d3_body_ratio <= STAR_BODY_RATIO
+            and d4_bull and d4_c > d2_body_mid):
+        return "long", "Morning Star"
+
+    # 2. Three Down + Hammer/Doji on d4:
+    #    d2+d3 both bearish, d4 shows bullish reversal wick pattern
+    if d2_bear and d3_bear:
+        # Dragonfly Doji on d4
+        if d4_body_ratio <= DOJI_BODY_RATIO and d4_lower_ratio >= WICK_MIN_RATIO:
+            return "long", "Three Down + Dragonfly Doji"
+        # Hammer on d4
+        if (d4_body_ratio <= PIN_BODY_RATIO
+                and d4_lower_ratio >= WICK_MIN_RATIO
+                and d4_upper_ratio <= 0.15
+                and d4_c >= (d4_h + d4_l) / 2):
+            return "long", "Three Down + Hammer"
+
+    # 3. Bullish Engulfing (d3+d4):
+    #    d3 bearish, d4 bullish body engulfs d3 body (≥ 80%)
+    if (d3_bear and d4_bull
+            and d4_o <= d3_c and d4_c >= d3_o
+            and d4_body >= d3_body * ENGULF_MIN_RATIO):
         return "long", "Bullish Engulfing"
 
-    if (d1_bearish and d2_bullish
-            and d2_o <= d1_c
-            and d2_c > d1_body_mid
-            and d2_c < d1_o):
+    # 4. Piercing Line (d3+d4):
+    #    d3 bearish, d4 opens at/below d3 close, closes above d3 body midpoint (not full engulf)
+    if (d3_bear and d4_bull
+            and d4_o <= d3_c
+            and d4_c > d3_body_mid
+            and d4_c < d3_o):
         return "long", "Piercing Line"
 
-    if (d1_bearish and d2_bullish
-            and d1_c <= d2_o <= d1_o
-            and d1_c <= d2_c <= d1_o
-            and d2_body <= d1_body * HARAMI_MAX_BODY_RATIO):
+    # 5. Bullish Harami (d3+d4):
+    #    d3 bearish, d4 small bullish body inside d3 body
+    if (d3_bear and d4_bull
+            and d3_c <= d4_o <= d3_o
+            and d3_c <= d4_c <= d3_o
+            and d4_body <= d3_body * HARAMI_MAX_RATIO):
         return "long", "Bullish Harami"
 
-    if not d1_bullish:
-        if d2_body_ratio <= DOJI_BODY_RATIO and d2_lower_ratio >= WICK_MIN_RATIO:
-            return "long", "Dragonfly Doji"
-        if (d2_body_ratio <= PIN_BODY_RATIO
-                and d2_lower_ratio >= WICK_MIN_RATIO
-                and d2_upper_ratio <= 0.15
-                and d2_c >= (d2_h + d2_l) / 2):
-            return "long", "Hammer"
+    # 6. Hammer / Dragonfly Doji on d4 after 2 consecutive red days
+    if d2_bear and d3_bear and not d2_bull:
+        if d4_body_ratio <= DOJI_BODY_RATIO and d4_lower_ratio >= WICK_MIN_RATIO:
+            return "long", "Two Red + Dragonfly Doji"
+        if (d4_body_ratio <= PIN_BODY_RATIO
+                and d4_lower_ratio >= WICK_MIN_RATIO
+                and d4_upper_ratio <= 0.15
+                and d4_c >= (d4_h + d4_l) / 2):
+            return "long", "Two Red + Hammer"
 
-    if d1_bearish and d2_bearish:
-        return "long", "Two Red Days"
+    # 7. Three Black Crows (d2+d3+d4 all bearish) — exhaustion, mean-reversion long
+    if d2_bear and d3_bear and d4_bear:
+        return "long", "Three Black Crows"
 
-    # ── SHORT ─────────────────────────────────────────────────────────────
-    if (d1_bullish and d2_bearish
-            and d2_o >= d1_c and d2_c <= d1_o
-            and d2_body >= d1_body * 0.80):
+    # 8. Four Red Days (d1+d2+d3+d4 all bearish) — extreme exhaustion
+    if d1_bear and d2_bear and d3_bear and d4_bear:
+        return "long", "Four Red Days"
+
+    # ── SHORT patterns (priority order) ───────────────────────────────────
+
+    # 1. Evening Star (3-candle):
+    #    d2 solid bullish → d3 small-body star → d4 bearish closing below d2 midpoint
+    if (d2_bull and d2_body_ratio >= SOLID_BODY_RATIO
+            and d3_body_ratio <= STAR_BODY_RATIO
+            and d4_bear and d4_c < d2_body_mid):
+        return "short", "Evening Star"
+
+    # 2. Three Up + Shooting Star / Gravestone Doji on d4
+    if d2_bull and d3_bull:
+        # Gravestone Doji on d4
+        if d4_body_ratio <= DOJI_BODY_RATIO and d4_upper_ratio >= WICK_MIN_RATIO:
+            return "short", "Three Up + Gravestone Doji"
+        # Shooting Star on d4
+        if (d4_body_ratio <= PIN_BODY_RATIO
+                and d4_upper_ratio >= WICK_MIN_RATIO
+                and d4_lower_ratio <= 0.15
+                and d4_c <= (d4_h + d4_l) / 2):
+            return "short", "Three Up + Shooting Star"
+
+    # 3. Bearish Engulfing (d3+d4)
+    if (d3_bull and d4_bear
+            and d4_o >= d3_c and d4_c <= d3_o
+            and d4_body >= d3_body * ENGULF_MIN_RATIO):
         return "short", "Bearish Engulfing"
 
-    if (d1_bullish and d2_bearish
-            and d2_o >= d1_c
-            and d2_c < d1_body_mid
-            and d2_c > d1_o):
+    # 4. Dark Cloud Cover (d3+d4)
+    if (d3_bull and d4_bear
+            and d4_o >= d3_c
+            and d4_c < d3_body_mid
+            and d4_c > d3_o):
         return "short", "Dark Cloud Cover"
 
-    if (d1_bullish and d2_bearish
-            and d1_o <= d2_c <= d1_c
-            and d1_o <= d2_o <= d1_c
-            and d2_body <= d1_body * HARAMI_MAX_BODY_RATIO):
+    # 5. Bearish Harami (d3+d4)
+    if (d3_bull and d4_bear
+            and d3_o <= d4_c <= d3_c
+            and d3_o <= d4_o <= d3_c
+            and d4_body <= d3_body * HARAMI_MAX_RATIO):
         return "short", "Bearish Harami"
 
-    if not d1_bearish:
-        if d2_body_ratio <= DOJI_BODY_RATIO and d2_upper_ratio >= WICK_MIN_RATIO:
-            return "short", "Gravestone Doji"
-        if (d2_body_ratio <= PIN_BODY_RATIO
-                and d2_upper_ratio >= WICK_MIN_RATIO
-                and d2_lower_ratio <= 0.15
-                and d2_c <= (d2_h + d2_l) / 2):
-            return "short", "Shooting Star"
+    # 6. Shooting Star / Gravestone Doji on d4 after 2 consecutive green days
+    if d2_bull and d3_bull and not d2_bear:
+        if d4_body_ratio <= DOJI_BODY_RATIO and d4_upper_ratio >= WICK_MIN_RATIO:
+            return "short", "Two Green + Gravestone Doji"
+        if (d4_body_ratio <= PIN_BODY_RATIO
+                and d4_upper_ratio >= WICK_MIN_RATIO
+                and d4_lower_ratio <= 0.15
+                and d4_c <= (d4_h + d4_l) / 2):
+            return "short", "Two Green + Shooting Star"
 
-    if d1_bullish and d2_bullish:
-        return "short", "Two Green Days"
+    # 7. Three White Soldiers (d2+d3+d4 all bullish) — exhaustion, mean-reversion short
+    if d2_bull and d3_bull and d4_bull:
+        return "short", "Three White Soldiers"
+
+    # 8. Four Green Days — extreme exhaustion
+    if d1_bull and d2_bull and d3_bull and d4_bull:
+        return "short", "Four Green Days"
 
     return None, None
 
 
-# ── 5m C1 reversal checks ─────────────────────────────────────────────────────
+# =====================================================
+# 15m C1 REVERSAL CHECKS
+# =====================================================
 
 def is_bullish_reversal_c1(o, h, l, c, prev_o=None, prev_c=None):
     rng = h - l
@@ -495,12 +586,15 @@ def is_bearish_reversal_c1(o, h, l, c, prev_o=None, prev_c=None):
     return False, None
 
 
+# =====================================================
+# CANDLE FETCHER
+# =====================================================
+
 def fetch_candles(symbol, num_candles, resolution_str, candle_seconds):
-    pair_api = fut_pair(symbol)
-    url      = "https://public.coindcx.com/market_data/candlesticks"
-    now      = int(time.time())
-    params   = {
-        "pair":       pair_api,
+    url    = "https://public.coindcx.com/market_data/candlesticks"
+    now    = int(time.time())
+    params = {
+        "pair":       fut_pair(symbol),
         "from":       now - (num_candles + 5) * candle_seconds,
         "to":         now,
         "resolution": resolution_str,
@@ -542,7 +636,9 @@ def get_recent_low(symbol):
         return None
 
 
-# ── Quantity ──────────────────────────────────────────────────────────────────
+# =====================================================
+# QUANTITY
+# =====================================================
 
 def get_quantity_step(symbol):
     try:
@@ -572,10 +668,10 @@ def compute_qty(entry_price, symbol):
 # =====================================================
 
 def place_long_order(symbol, entry_price, tp_price, sl_price, precision):
-    entry = round(entry_price, precision)
-    tp    = round(tp_price,    precision)
-    sl    = round(sl_price,    precision)
-    qty   = compute_qty(entry_price, symbol)
+    entry  = round(entry_price, precision)
+    tp     = round(tp_price,    precision)
+    sl     = round(sl_price,    precision)
+    qty    = compute_qty(entry_price, symbol)
     tp_pct = round(((tp - entry) / entry) * 100, 2)
     sl_pct = round(((entry - sl) / entry) * 100, 2)
 
@@ -601,7 +697,6 @@ def place_long_order(symbol, entry_price, tp_price, sl_price, precision):
         return False
 
     print(f"  [API] {symbol}: {result}")
-
     if "order" not in result and not isinstance(result, list):
         print(f"  [ERROR] long rejected: {result}")
         send_telegram(f"❌ <b>LONG REJECTED — {symbol}</b>\n<code>{str(result)[:200]}</code>")
@@ -612,7 +707,7 @@ def place_long_order(symbol, entry_price, tp_price, sl_price, precision):
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📍 Entry : <code>{entry}</code>\n"
         f"🎯 TP    : <code>{tp}</code>  (+{tp_pct}%)\n"
-        f"🛑 SL    : <code>{sl}</code>  (-{sl_pct}%)  ← C1 low\n"
+        f"🛑 SL    : <code>{sl}</code>  (-{sl_pct}%)\n"
         f"📦 Qty   : <code>{qty}</code>\n"
         f"💰 Margin: <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
     )
@@ -620,10 +715,10 @@ def place_long_order(symbol, entry_price, tp_price, sl_price, precision):
 
 
 def place_short_order(symbol, entry_price, tp_price, sl_price, precision):
-    entry = round(entry_price, precision)
-    tp    = round(tp_price,    precision)
-    sl    = round(sl_price,    precision)
-    qty   = compute_qty(entry_price, symbol)
+    entry  = round(entry_price, precision)
+    tp     = round(tp_price,    precision)
+    sl     = round(sl_price,    precision)
+    qty    = compute_qty(entry_price, symbol)
     tp_pct = round(((entry - tp) / entry) * 100, 2)
     sl_pct = round(((sl - entry) / entry) * 100, 2)
 
@@ -649,7 +744,6 @@ def place_short_order(symbol, entry_price, tp_price, sl_price, precision):
         return False
 
     print(f"  [API] {symbol}: {result}")
-
     if "order" not in result and not isinstance(result, list):
         print(f"  [ERROR] short rejected: {result}")
         send_telegram(f"❌ <b>SHORT REJECTED — {symbol}</b>\n<code>{str(result)[:200]}</code>")
@@ -660,7 +754,7 @@ def place_short_order(symbol, entry_price, tp_price, sl_price, precision):
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📍 Entry : <code>{entry}</code>\n"
         f"🎯 TP    : <code>{tp}</code>  (-{tp_pct}%)\n"
-        f"🛑 SL    : <code>{sl}</code>  (+" + f"{sl_pct}%)  ← C1 high\n"
+        f"🛑 SL    : <code>{sl}</code>  (+{sl_pct}%)\n"
         f"📦 Qty   : <code>{qty}</code>\n"
         f"💰 Margin: <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
     )
@@ -674,19 +768,29 @@ def place_short_order(symbol, entry_price, tp_price, sl_price, precision):
 def check_and_trade(symbol, row, df, all_state, global_positions, global_orders):
     now_ms    = int(time.time() * 1000)
     pair_name = fut_pair(symbol)
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    # ── 1. Daily candles → bias ───────────────────────────────────────────
-    daily = fetch_candles(symbol, CANDLES_DAILY, RESOLUTION_DAILY, CANDLE_SECONDS_DAY)
-    if daily and (now_ms - int(daily[-1]["time"])) < CANDLE_SECONDS_DAY * 1000:
-        daily = daily[:-1]
-    if len(daily) < 2:
-        print(f"  [{symbol}] SKIP — not enough completed daily candles")
+    # ── DEPLOYMENT GUARD ──────────────────────────────────────────────────
+    # If today == the day the bot was first started, skip all trading.
+    # This prevents entering mid-day on an incomplete/unknown candle context.
+    bot_start_date = all_state.get("bot_start_date")
+    if bot_start_date and today_str == bot_start_date:
+        print(f"  [{symbol}] SKIP — deployment day ({bot_start_date}), trading starts tomorrow")
         return
 
-    d1 = daily[-2]
-    d2 = daily[-1]
-    precision          = get_precision(float(d2["close"]))
-    bias, bias_pattern = get_daily_bias(d1, d2)
+    # ── 1. Daily candles → 4-candle bias ─────────────────────────────────
+    daily = fetch_candles(symbol, CANDLES_DAILY, RESOLUTION_DAILY, CANDLE_SECONDS_DAY)
+    # Drop in-progress bar
+    if daily and (now_ms - int(daily[-1]["time"])) < CANDLE_SECONDS_DAY * 1000:
+        daily = daily[:-1]
+
+    if len(daily) < 4:
+        print(f"  [{symbol}] SKIP — not enough completed daily candles ({len(daily)})")
+        return
+
+    d1, d2, d3, d4    = daily[-4], daily[-3], daily[-2], daily[-1]
+    precision          = get_precision(float(d4["close"]))
+    bias, bias_pattern = get_daily_bias(d1, d2, d3, d4)
 
     # ── 2. State init / backfill ──────────────────────────────────────────
     st = all_state.setdefault(symbol, init_symbol_state())
@@ -694,8 +798,7 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
         if k not in st:
             st[k] = v
 
-    # ── 3. New-day reset ──────────────────────────────────────────────────
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # ── 3. New-day reset (00:00 UTC) ──────────────────────────────────────
     if st["current_day_str"] != today_str:
         print(f"  [{symbol}] NEW DAY — Bias: {bias or 'NONE'} ({bias_pattern or '-'})")
         preserved = {k: st[k] for k in
@@ -803,26 +906,25 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
         save_state(all_state)
         return
 
-    # ── 7. Fetch last 3 completed 5m candles (prev, C1, C2) ──────────────
-    candles_5m = fetch_candles(symbol, CANDLES_5M, RESOLUTION_5M, CANDLE_SECONDS_5M)
+    # ── 7. Fetch last 3 completed 15m candles (prev, C1, C2) ─────────────
+    candles_15m = fetch_candles(symbol, CANDLES_15M, RESOLUTION_15M, CANDLE_SECONDS_15M)
     # Drop in-progress bar
-    if candles_5m and (now_ms - int(candles_5m[-1]["time"])) < CANDLE_SECONDS_5M * 1000:
-        candles_5m = candles_5m[:-1]
+    if candles_15m and (now_ms - int(candles_15m[-1]["time"])) < CANDLE_SECONDS_15M * 1000:
+        candles_15m = candles_15m[:-1]
 
-    if len(candles_5m) < 3:
-        print(f"  [{symbol}] SKIP — not enough 5m candles ({len(candles_5m)})")
+    if len(candles_15m) < 3:
+        print(f"  [{symbol}] SKIP — not enough 15m candles ({len(candles_15m)})")
         save_state(all_state)
         return
 
-    prev_c = candles_5m[-3]   # candle before C1 (needed for Engulfing check on C1)
-    c1     = candles_5m[-2]
-    c2     = candles_5m[-1]
+    prev_c = candles_15m[-3]
+    c1     = candles_15m[-2]
+    c2     = candles_15m[-1]
+    c2_ts  = int(c2["time"])
 
-    c2_ts = int(c2["time"])
-
-    # Dedup: if we already acted on this C2 candle, skip
+    # Dedup — already acted on this C2
     if c2_ts <= st.get("last_c2_ts", 0):
-        print(f"  [{symbol}] SKIP — C2 already processed (ts={c2_ts})")
+        print(f"  [{symbol}] SKIP — C2 already processed")
         save_state(all_state)
         return
 
@@ -830,7 +932,7 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
     c1_l = float(c1["low"]);   c1_c = float(c1["close"])
     c2_o = float(c2["open"]);  c2_h = float(c2["high"])
     c2_l = float(c2["low"]);   c2_c = float(c2["close"])
-    prev_o = float(prev_c["open"]); prev_cl = float(prev_c["close"])
+    p_o  = float(prev_c["open"]); p_c = float(prev_c["close"])
 
     print(f"  [{symbol}] Bias={bias.upper()} ({bias_pattern}) | "
           f"C1: O={round(c1_o,precision)} H={round(c1_h,precision)} "
@@ -844,56 +946,47 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
     entry_path   = None
 
     if bias == "long":
-        c1_match, c1_pattern = is_bullish_reversal_c1(c1_o, c1_h, c1_l, c1_c, prev_o, prev_cl)
+        c1_match, c1_pattern = is_bullish_reversal_c1(c1_o, c1_h, c1_l, c1_c, p_o, p_c)
         if not c1_match:
             print(f"  [{symbol}] C1 not a bullish reversal — skip")
             save_state(all_state)
             return
         body_pct = round((c2_c - c2_o) / (c2_h - c2_l) * 100, 1) if c2_h != c2_l else 0
         if is_strong_bullish(c2_o, c2_h, c2_l, c2_c) and c2_c > c1_c:
-            print(f"  [{symbol}] C1=[{c1_pattern}] C2-LONG confirmed body={body_pct}%")
             entry_price  = c2_c
-            natural_sl   = c1_l
-            min_sl       = entry_price * (1 - MIN_SL_PCT / 100)
-            sl_price_val = min(natural_sl, min_sl)
+            sl_price_val = entry_price * (1 - SL_PCT / 100)
             tp_price_val = entry_price * (1 + TP_PCT / 100)
             entry_path   = "long_trend"
+            print(f"  [{symbol}] C1=[{c1_pattern}] C2-LONG confirmed body={body_pct}%")
         else:
-            print(f"  [{symbol}] C1=[{c1_pattern}] C2-LONG failed body={body_pct}% C2={round(c2_c,precision)} C1={round(c1_c,precision)}")
+            print(f"  [{symbol}] C1=[{c1_pattern}] C2-LONG failed body={body_pct}% "
+                  f"C2={round(c2_c,precision)} C1={round(c1_c,precision)}")
 
     elif bias == "short":
-        c1_match, c1_pattern = is_bearish_reversal_c1(c1_o, c1_h, c1_l, c1_c, prev_o, prev_cl)
+        c1_match, c1_pattern = is_bearish_reversal_c1(c1_o, c1_h, c1_l, c1_c, p_o, p_c)
         if not c1_match:
             print(f"  [{symbol}] C1 not a bearish reversal — skip")
             save_state(all_state)
             return
         body_pct = round((c2_o - c2_c) / (c2_h - c2_l) * 100, 1) if c2_h != c2_l else 0
         if is_strong_bearish(c2_o, c2_h, c2_l, c2_c) and c2_c < c1_c:
-            print(f"  [{symbol}] C1=[{c1_pattern}] C2-SHORT confirmed body={body_pct}%")
             entry_price  = c2_c
-            natural_sl   = c1_h
-            min_sl       = entry_price * (1 + MIN_SL_PCT / 100)
-            sl_price_val = max(natural_sl, min_sl)
+            sl_price_val = entry_price * (1 + SL_PCT / 100)
             tp_price_val = entry_price * (1 - TP_PCT / 100)
             entry_path   = "short_trend"
+            print(f"  [{symbol}] C1=[{c1_pattern}] C2-SHORT confirmed body={body_pct}%")
         else:
-            print(f"  [{symbol}] C1=[{c1_pattern}] C2-SHORT failed body={body_pct}% C2={round(c2_c,precision)} C1={round(c1_c,precision)}")
+            print(f"  [{symbol}] C1=[{c1_pattern}] C2-SHORT failed body={body_pct}% "
+                  f"C2={round(c2_c,precision)} C1={round(c1_c,precision)}")
+
+    # Always mark C2 as seen
+    st["last_c2_ts"] = c2_ts
 
     if entry_path is None:
         save_state(all_state)
         return
 
-    # ── 9. Validate SL ────────────────────────────────────────────────────
-    if entry_path == "long_trend" and sl_price_val >= entry_price:
-        print(f"  [{symbol}] SKIP — invalid long SL (entry={entry_price} SL={sl_price_val})")
-        save_state(all_state)
-        return
-    if entry_path == "short_trend" and sl_price_val <= entry_price:
-        print(f"  [{symbol}] SKIP — invalid short SL (entry={entry_price} SL={sl_price_val})")
-        save_state(all_state)
-        return
-
-    # ── 10. Place order ───────────────────────────────────────────────────
+    # ── 9. Place order ────────────────────────────────────────────────────
     if entry_path == "long_trend":
         placed = place_long_order(symbol, entry_price, tp_price_val, sl_price_val, precision)
     else:
@@ -906,12 +999,9 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
         st["tp_level"]      = round(tp_price_val, precision)
         st["sl_price"]      = round(sl_price_val, precision)
         st["last_entry_ts"] = c2_ts
-        st["last_c2_ts"]    = c2_ts
         update_sheet_tp(row, st["tp_level"])
         update_sheet_sl(row, st["sl_price"])
 
-    # Always mark this C2 as seen regardless of order result
-    st["last_c2_ts"] = c2_ts
     save_state(all_state)
 
 
@@ -923,26 +1013,40 @@ cycle              = 0
 consecutive_errors = 0
 MAX_CONSECUTIVE_ERRORS = 10
 
+# ── Record deployment date (once, on first ever start) ────────────────────────
+_boot_state = load_state()
+if "bot_start_date" not in _boot_state:
+    _boot_state["bot_start_date"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    save_state(_boot_state)
+    print(f"[BOOT] Deployment date set: {_boot_state['bot_start_date']} — no trades today")
+else:
+    print(f"[BOOT] Deployment date already recorded: {_boot_state['bot_start_date']}")
+
 send_telegram(
     f"✅ <b>Daily Trend Bot Started</b>\n"
     f"━━━━━━━━━━━━━━━━━━\n"
-    f"📐 Strategy   : <code>Daily 2-Candle Bias + 5m C1/C2 Reversal</code>\n"
+    f"🚫 Deployment guard : <code>No trades on {_boot_state['bot_start_date']} (UTC)</code>\n"
+    f"📐 Strategy         : <code>4-Day Bias + 15m C1/C2 Reversal</code>\n"
     f"\n"
     f"📈 LONG Bias  :\n"
-    f"  <code>① Bullish Engulfing  ② Piercing Line</code>\n"
-    f"  <code>③ Bullish Harami     ④ Hammer / Dragonfly Doji</code>\n"
-    f"  <code>⑤ Two Red Days</code>\n"
+    f"  <code>① Morning Star</code>\n"
+    f"  <code>② Three Down + Hammer/Doji</code>\n"
+    f"  <code>③ Bullish Engulfing  ④ Piercing Line</code>\n"
+    f"  <code>⑤ Bullish Harami     ⑥ Two Red + Hammer/Doji</code>\n"
+    f"  <code>⑦ Three Black Crows  ⑧ Four Red Days</code>\n"
     f"\n"
     f"📉 SHORT Bias :\n"
-    f"  <code>① Bearish Engulfing  ② Dark Cloud Cover</code>\n"
-    f"  <code>③ Bearish Harami     ④ Shooting Star / Gravestone Doji</code>\n"
-    f"  <code>⑤ Two Green Days</code>\n"
+    f"  <code>① Evening Star</code>\n"
+    f"  <code>② Three Up + Shooting Star/Doji</code>\n"
+    f"  <code>③ Bearish Engulfing  ④ Dark Cloud Cover</code>\n"
+    f"  <code>⑤ Bearish Harami     ⑥ Two Green + Shooting Star/Doji</code>\n"
+    f"  <code>⑦ Three White Soldiers  ⑧ Four Green Days</code>\n"
     f"\n"
-    f"⚡ C1 (5m)    : <code>Doji / Hammer / Pin Bar / Shooting Star / Engulfing</code>\n"
-    f"⚡ C2 (5m)    : <code>body ≥ {MIN_BODY_PCT}%, closes beyond C1 close</code>\n"
+    f"⚡ C1 (15m)   : <code>Doji / Hammer / Pin Bar / Shooting Star / Engulfing</code>\n"
+    f"⚡ C2 (15m)   : <code>body ≥ {MIN_BODY_PCT}%, closes beyond C1 close</code>\n"
+    f"🎯 TP         : <code>+{TP_PCT}% fixed</code>\n"
+    f"🛑 SL         : <code>-{SL_PCT}% fixed</code>\n"
     f"🔁 Scan       : <code>Every {SCAN_INTERVAL}s</code>\n"
-    f"🎯 TP         : <code>entry ± {TP_PCT}%</code>\n"
-    f"🛑 SL         : <code>C1 low/high, min {MIN_SL_PCT}% from entry</code>\n"
     f"💰 Capital    : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
 )
 
@@ -958,7 +1062,7 @@ while True:
         global_orders    = get_all_open_orders()
 
         if global_positions is None or global_orders is None:
-            print("[WARN] API fetch failed — skipping cycle to protect state")
+            print("[WARN] API fetch failed — skipping cycle")
             time.sleep(SCAN_INTERVAL)
             continue
 
