@@ -43,8 +43,8 @@ BASE_URL = "https://api.coindcx.com"
 # PIVOT PARAMS: PIVOT_LEN=5 (bars required on each side for confirmation)
 # =============================================================================
 
-TP_PCT    = 3.0    # fallback TP % when BB basis ≤ entry price
-SL_PCT    = 1.5    # fallback SL % when candle low ≥ entry price
+TP_PCT    = 3.1    # fallback TP % when BB basis ≤ entry price
+SL_PCT    = 3.0    # fallback SL % when candle low ≥ entry price
 
 BB_LENGTH = 20
 BB_MULT   = 2.0
