@@ -39,8 +39,6 @@ BASE_URL = "https://api.coindcx.com"
 #   SL : trigger candle's low
 #      Fallback: TP_PCT above entry if basis ≤ entry / SL_PCT below entry if low ≥ entry
 #
-# DEPLOYMENT GUARD : No trades on the calendar day the bot first starts.
-#
 # BB PARAMS   : Length=20, StdDev=2.0
 # PIVOT PARAMS: PIVOT_LEN=5 (bars required on each side for confirmation)
 # =============================================================================
@@ -530,12 +528,6 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
     pair_name = fut_pair(symbol)
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    # ── DEPLOYMENT GUARD ──────────────────────────────────────────────────
-    bot_start_date = all_state.get("bot_start_date")
-    if bot_start_date and today_str == bot_start_date:
-        print(f"  [{symbol}] SKIP — deployment day, trading starts tomorrow")
-        return
-
     # ── 1. Fetch 15m candles ──────────────────────────────────────────────
     candles_15m = fetch_candles(symbol, CANDLES_15M, RESOLUTION_15M, CANDLE_SECONDS_15M)
     # Drop in-progress bar
@@ -727,18 +719,9 @@ cycle              = 0
 consecutive_errors = 0
 MAX_CONSECUTIVE_ERRORS = 10
 
-_boot_state = load_state()
-if "bot_start_date" not in _boot_state:
-    _boot_state["bot_start_date"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    save_state(_boot_state)
-    print(f"[BOOT] Deployment date set: {_boot_state['bot_start_date']} — no trades today")
-else:
-    print(f"[BOOT] Deployment date: {_boot_state['bot_start_date']}")
-
 send_telegram(
     f"✅ <b>Rizzy Bot Started</b>\n"
     f"━━━━━━━━━━━━━━━━━━\n"
-    f"🚫 Deploy guard : <code>No trades on {_boot_state['bot_start_date']} (UTC)</code>\n"
     f"📐 Strategy     : <code>Rizzy Bottom Reversal (Body Length Projection)</code>\n"
     f"\n"
     f"📊 Setup        :\n"
