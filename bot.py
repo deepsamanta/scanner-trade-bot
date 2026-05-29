@@ -17,45 +17,51 @@ getcontext().prec = 28
 BASE_URL = "https://api.coindcx.com"
 
 # =============================================================================
-# STRATEGY: Rizzy Bottom Reversal (Body Length Projection)
+# STRATEGY: Strict 1-Day Compression + Rolling 1H Breakout
 #
-# TIMEFRAME   : 15m candles
+# TIMEFRAME   : 15m candles (entry) + 1D candles (compression filter)
 #
-# SETUP:
-#   1. Two most recent confirmed pivot highs (PIVOT_LEN bars each side) →
-#      structural descending trendline
-#   2. Most recent confirmed pivot low
-#   3. rizzy_depth   = trendline_value_at_pivot_low_bar − pivot_low
-#   4. projected_target = pivot_low − rizzy_depth
+# STEP 1 — DAILY COMPRESSION FILTER (yesterday's completed daily candle):
+#   • body_pct  = abs(close - open) / open * 100  ≤ MAX_DAILY_BODY_PCT (5%)
+#   • range_pct = (high - low)      / open * 100  ≤ MAX_DAILY_RANGE_PCT (5%)
+#   Both must pass — ensures entry only after a tight consolidation day.
 #
-# ENTRY (LONG ONLY — limit order at trigger candle close):
-#   ① low  ≤ projected_target   — price hit the structural projection
-#   ② low  <  BB lower band     — detached from reality (outside BB)
-#   ③ close > high[prev candle] — breakout above prior bar's high
-#   ④ close > open              — bullish candle confirmation
+# STEP 2 — ROLLING PUMP CHECK (on trigger 15m candle):
+#   • move_15m = (close - open[0]) / open[0] * 100   current candle
+#   • move_30m = (close - open[1]) / open[1] * 100   vs 1-bar-ago open
+#   • move_45m = (close - open[2]) / open[2] * 100   vs 2-bars-ago open
+#   • move_1h  = (close - open[3]) / open[3] * 100   vs 3-bars-ago open
+#   ANY window >= MIN_PUMP_PCT (3%) triggers.
 #
-# EXIT:
-#   TP : BB middle band (SMA 20) at time of entry — "return to reality"
-#   SL : trigger candle's low
-#      Fallback: TP_PCT above entry if basis ≤ entry / SL_PCT below entry if low ≥ entry
+# STEP 3 — CANDLE QUALITY FILTERS:
+#   • close > open                              (bullish candle)
+#   • (close - low) / (high - low) >= 0.70     (strong close — top 70% of range)
+#   • volume > EMA(volume, 20)                  (above-average volume)
 #
-# BB PARAMS   : Length=20, StdDev=2.0
-# PIVOT PARAMS: PIVOT_LEN=5 (bars required on each side for confirmation)
+# ENTRY  : Limit order at trigger candle close (long only)
+# TP     : close * (1 + TP_PCT / 100)          fixed 1.5% above entry
+# SL     : trigger candle low
+#          Fallback: SL_PCT below entry if candle low >= entry
 # =============================================================================
 
-TP_PCT    = 3.1    # fallback TP % when BB basis ≤ entry price
-SL_PCT    = 3.0    # fallback SL % when candle low ≥ entry price
+MAX_DAILY_BODY_PCT  = 5.0   # yesterday's body must be within this %
+MAX_DAILY_RANGE_PCT = 5.0   # yesterday's wick range must be within this %
+MIN_PUMP_PCT        = 3.0   # minimum move over any rolling window to trigger
+TP_PCT              = 1.5   # fixed TP above entry close
+SL_PCT              = 1.5   # fallback SL below entry (if candle low >= entry)
 
-BB_LENGTH = 20
-BB_MULT   = 2.0
-PIVOT_LEN = 5      # bars on each side required to confirm a structural pivot
+STRONG_CLOSE_RATIO  = 0.70  # close must be in top 70% of candle range
+VOLUME_EMA_LEN      = 20    # EMA period for volume filter
 
-CANDLES_15M     = 100
-CANDLES_1M      = 5
+CANDLES_DAILY  = 5
+CANDLES_15M    = 50
+CANDLES_1M     = 5
 
+RESOLUTION_DAILY = "1D"
 RESOLUTION_15M   = "15"
 RESOLUTION_1M    = "1"
 
+CANDLE_SECONDS_DAY = 86400
 CANDLE_SECONDS_15M = 900
 CANDLE_SECONDS_1M  = 60
 
@@ -63,7 +69,7 @@ SCAN_INTERVAL          = 300
 REQUEST_TIMEOUT        = 15
 TELEGRAM_TIMEOUT       = 10
 GSHEET_REAUTH_INTERVAL = 45 * 60
-STATE_FILE             = "rizzy_bot_state.json"
+STATE_FILE             = "compression_bot_state.json"
 
 
 # =====================================================
@@ -320,89 +326,77 @@ def extract_tp_sl(obj):
 
 
 # =====================================================
-# RIZZY STRATEGY FUNCTIONS
+# STRATEGY FUNCTIONS
 # =====================================================
 
-def compute_bb(closes):
-    """
-    Bollinger Bands from a list of closes.
-    Returns (basis, upper, lower) or (None, None, None) if insufficient data.
-    """
-    if len(closes) < BB_LENGTH:
-        return None, None, None
-    recent   = closes[-BB_LENGTH:]
-    basis    = sum(recent) / BB_LENGTH
-    variance = sum((x - basis) ** 2 for x in recent) / BB_LENGTH
-    std      = variance ** 0.5
-    return basis, basis + BB_MULT * std, basis - BB_MULT * std
-
-
-def find_pivots(candles):
-    """
-    Identify the two most recent confirmed structural pivot highs and the most
-    recent confirmed pivot low. Confirmation requires PIVOT_LEN bars on each side.
-
-    Returns:
-        ph1, ph1_idx  — most recent pivot high (price, candle list index)
-        ph2, ph2_idx  — second most recent pivot high
-        pl,  pl_idx   — most recent pivot low
-        (any field may be None if not found)
-    """
-    n  = len(candles)
-    lb = PIVOT_LEN
-
-    pivot_highs = []   # [(index, price)]
-    pivot_lows  = []
-
-    for i in range(lb, n - lb):
-        h = float(candles[i]["high"])
-        l = float(candles[i]["low"])
-
-        if all(h >= float(candles[i + j]["high"]) for j in range(-lb, lb + 1) if j != 0):
-            pivot_highs.append((i, h))
-
-        if all(l <= float(candles[i + j]["low"])  for j in range(-lb, lb + 1) if j != 0):
-            pivot_lows.append((i, l))
-
-    ph1 = ph2 = pl = None
-    ph1_idx = ph2_idx = pl_idx = None
-
-    if len(pivot_highs) >= 2:
-        ph2_idx, ph2 = pivot_highs[-2]
-        ph1_idx, ph1 = pivot_highs[-1]
-    elif len(pivot_highs) == 1:
-        ph1_idx, ph1 = pivot_highs[-1]
-
-    if pivot_lows:
-        pl_idx, pl = pivot_lows[-1]
-
-    return ph1, ph1_idx, ph2, ph2_idx, pl, pl_idx
-
-
-def compute_projected_target(ph1, ph1_idx, ph2, ph2_idx, pl, pl_idx):
-    """
-    Rizzy projection:
-      trendline drawn through ph2 → ph1 (two confirmed pivot highs)
-      rizzy_depth     = trendline_value_at_pl_bar − pl
-      projected_target = pl − rizzy_depth
-
-    Returns float or None when the geometric setup is invalid.
-    """
-    if any(v is None for v in (ph1, ph1_idx, ph2, ph2_idx, pl, pl_idx)):
+def compute_ema(values, length):
+    """Standard EMA. Returns None if insufficient data."""
+    if len(values) < length:
         return None
-    if ph1_idx <= ph2_idx:
-        return None
-    if pl_idx <= ph2_idx:
-        return None
+    k   = 2 / (length + 1)
+    ema = sum(values[:length]) / length   # SMA seed
+    for v in values[length:]:
+        ema = v * k + ema * (1 - k)
+    return ema
 
-    slope        = (ph1 - ph2) / (ph1_idx - ph2_idx)
-    tl_at_pl_bar = ph1 + slope * (pl_idx - ph1_idx)
-    rizzy_depth  = tl_at_pl_bar - pl
 
-    if rizzy_depth <= 0:
-        return None   # trendline not above pivot low — invalid setup
+def check_daily_compression(daily_candles):
+    """
+    Evaluates yesterday's completed daily candle for tight compression.
+    Returns (valid: bool, body_pct: float, range_pct: float).
+    """
+    if len(daily_candles) < 1:
+        return False, 0.0, 0.0
 
-    return pl - rizzy_depth
+    yest   = daily_candles[-1]
+    o      = float(yest["open"])
+    c      = float(yest["close"])
+    h      = float(yest["high"])
+    l      = float(yest["low"])
+
+    if o == 0:
+        return False, 0.0, 0.0
+
+    body_pct  = abs(c - o) / o * 100
+    range_pct = (h - l)   / o * 100
+
+    valid = body_pct <= MAX_DAILY_BODY_PCT and range_pct <= MAX_DAILY_RANGE_PCT
+    return valid, round(body_pct, 2), round(range_pct, 2)
+
+
+def check_rolling_pump(candles_15m):
+    """
+    Checks if current close has moved >= MIN_PUMP_PCT over any of the four
+    rolling open anchors (15m, 30m, 45m, 1h back).
+    Returns (triggered: bool, best_move_pct: float, window_label: str).
+    """
+    if len(candles_15m) < 4:
+        return False, 0.0, ""
+
+    curr_c = float(candles_15m[-1]["close"])
+
+    windows = [
+        ("15m", float(candles_15m[-1]["open"])),
+        ("30m", float(candles_15m[-2]["open"])),
+        ("45m", float(candles_15m[-3]["open"])),
+        ("1h",  float(candles_15m[-4]["open"])),
+    ]
+
+    best_label = ""
+    best_move  = 0.0
+    triggered  = False
+
+    for label, anchor_open in windows:
+        if anchor_open == 0:
+            continue
+        move = (curr_c - anchor_open) / anchor_open * 100
+        if move > best_move:
+            best_move  = move
+            best_label = label
+        if move >= MIN_PUMP_PCT:
+            triggered = True
+
+    return triggered, round(best_move, 2), best_label
 
 
 # =====================================================
@@ -508,7 +502,7 @@ def place_long_order(symbol, entry_price, tp_price, sl_price, precision):
         return False
 
     send_telegram(
-        f"🟢 <b>NEW LONG (RIZZY) — {symbol}</b>\n"
+        f"🟢 <b>NEW LONG (COMPRESSION) — {symbol}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📍 Entry : <code>{entry}</code>\n"
         f"🎯 TP    : <code>{tp}</code>  (+{tp_pct}%)\n"
@@ -528,15 +522,24 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
     pair_name = fut_pair(symbol)
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    # ── 1. Fetch 15m candles ──────────────────────────────────────────────
+    # ── 1. Fetch candles ──────────────────────────────────────────────────
+    # Daily — for compression filter
+    daily_all = fetch_candles(symbol, CANDLES_DAILY, RESOLUTION_DAILY, CANDLE_SECONDS_DAY)
+    if daily_all and (now_ms - int(daily_all[-1]["time"])) < CANDLE_SECONDS_DAY * 1000:
+        daily_all = daily_all[:-1]   # drop in-progress daily bar
+
+    # 15m — for entry conditions
     candles_15m = fetch_candles(symbol, CANDLES_15M, RESOLUTION_15M, CANDLE_SECONDS_15M)
-    # Drop in-progress bar
     if candles_15m and (now_ms - int(candles_15m[-1]["time"])) < CANDLE_SECONDS_15M * 1000:
         candles_15m = candles_15m[:-1]
 
-    min_required = BB_LENGTH + PIVOT_LEN * 2 + 2
-    if len(candles_15m) < min_required:
-        print(f"  [{symbol}] SKIP — insufficient 15m candles ({len(candles_15m)} < {min_required})")
+    if len(daily_all) < 1:
+        print(f"  [{symbol}] SKIP — no completed daily candle")
+        return
+
+    min_15m = VOLUME_EMA_LEN + 4   # EMA seed + 4 rolling-window bars
+    if len(candles_15m) < min_15m:
+        print(f"  [{symbol}] SKIP — insufficient 15m candles ({len(candles_15m)} < {min_15m})")
         return
 
     # ── 2. State init / backfill ──────────────────────────────────────────
@@ -635,67 +638,60 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
         print(f"  [{symbol}] SKIP — open order on book")
         return
 
-    # ── 6. Bollinger Bands ────────────────────────────────────────────────
-    closes = [float(c["close"]) for c in candles_15m]
-    basis, upper_band, lower_band = compute_bb(closes)
-    if basis is None:
-        print(f"  [{symbol}] SKIP — insufficient data for BB")
+    # ── 6. Daily compression filter ───────────────────────────────────────
+    compression_ok, body_pct, range_pct = check_daily_compression(daily_all)
+    print(f"  [{symbol}] Daily body={body_pct}% range={range_pct}% "
+          f"compression={'OK' if compression_ok else 'FAIL'}")
+
+    if not compression_ok:
         save_state(all_state)
         return
 
-    # ── 7. Structural pivots + Rizzy projection ───────────────────────────
-    ph1, ph1_idx, ph2, ph2_idx, pl, pl_idx = find_pivots(candles_15m)
-    projected_target = compute_projected_target(ph1, ph1_idx, ph2, ph2_idx, pl, pl_idx)
-
-    if projected_target is None:
-        print(f"  [{symbol}] SKIP — no valid Rizzy projection "
-              f"(ph1={ph1}, ph2={ph2}, pl={pl})")
-        save_state(all_state)
-        return
-
-    # ── 8. Entry conditions on last completed candle ──────────────────────
-    curr = candles_15m[-1]
-    prev = candles_15m[-2]
-
+    # ── 7. Last completed 15m candle ──────────────────────────────────────
+    curr   = candles_15m[-1]
     curr_o = float(curr["open"]);  curr_h = float(curr["high"])
     curr_l = float(curr["low"]);   curr_c = float(curr["close"])
-    prev_h = float(prev["high"])
     curr_ts = int(curr["time"])
-
-    print(f"  [{symbol}] BB basis={round(basis, precision)} lower={round(lower_band, precision)} | "
-          f"proj={round(projected_target, precision)} | "
-          f"L={round(curr_l, precision)} C={round(curr_c, precision)} prevH={round(prev_h, precision)}")
 
     if curr_ts <= st.get("last_candle_ts", 0):
         print(f"  [{symbol}] SKIP — candle already processed")
         save_state(all_state)
         return
 
-    cond_target   = curr_l <= projected_target
-    cond_reality  = curr_l < lower_band
-    cond_breakout = curr_c > prev_h
-    cond_bullish  = curr_c > curr_o
+    # ── 8. Rolling pump check ─────────────────────────────────────────────
+    pump_ok, best_move, best_window = check_rolling_pump(candles_15m)
 
-    print(f"  [{symbol}] ① target={cond_target} ② outside_BB={cond_reality} "
-          f"③ breakout={cond_breakout} ④ bullish={cond_bullish}")
+    # ── 9. Candle quality filters ─────────────────────────────────────────
+    cond_bullish = curr_c > curr_o
+
+    candle_range = curr_h - curr_l
+    cond_strong_close = (
+        candle_range > 0 and
+        (curr_c - curr_l) / candle_range >= STRONG_CLOSE_RATIO
+    )
+
+    volumes   = [float(c["volume"]) for c in candles_15m]
+    vol_ema20 = compute_ema(volumes, VOLUME_EMA_LEN)
+    cond_volume = vol_ema20 is not None and float(curr["volume"]) > vol_ema20
+
+    print(f"  [{symbol}] pump={pump_ok}({best_move}% over {best_window}) "
+          f"bullish={cond_bullish} strong_close={cond_strong_close} volume={cond_volume}")
 
     st["last_candle_ts"] = curr_ts
 
-    if not (cond_target and cond_reality and cond_breakout and cond_bullish):
+    if not (pump_ok and cond_bullish and cond_strong_close and cond_volume):
         save_state(all_state)
         return
 
-    # ── 9. Compute entry / TP / SL ────────────────────────────────────────
+    # ── 10. Compute entry / TP / SL ───────────────────────────────────────
     entry_price  = curr_c
-    # TP: BB basis (return to reality). Fallback to fixed % if basis ≤ entry.
-    tp_price_val = basis if basis > entry_price else entry_price * (1 + TP_PCT / 100)
-    # SL: trigger candle low. Fallback to fixed % if low ≥ entry.
+    tp_price_val = entry_price * (1 + TP_PCT / 100)
     sl_price_val = curr_l if curr_l < entry_price else entry_price * (1 - SL_PCT / 100)
 
-    print(f"  [{symbol}] RIZZY ENTRY — Entry={round(entry_price, precision)} "
+    print(f"  [{symbol}] ENTRY — Entry={round(entry_price, precision)} "
           f"TP={round(tp_price_val, precision)} SL={round(sl_price_val, precision)}")
 
-    # ── 10. Place order ───────────────────────────────────────────────────
+    # ── 11. Place order ───────────────────────────────────────────────────
     placed = place_long_order(symbol, entry_price, tp_price_val, sl_price_val, precision)
 
     if placed:
@@ -720,26 +716,27 @@ consecutive_errors = 0
 MAX_CONSECUTIVE_ERRORS = 10
 
 send_telegram(
-    f"✅ <b>Rizzy Bot Started</b>\n"
+    f"✅ <b>Compression Breakout Bot Started</b>\n"
     f"━━━━━━━━━━━━━━━━━━\n"
-    f"📐 Strategy     : <code>Rizzy Bottom Reversal (Body Length Projection)</code>\n"
+    f"📐 Strategy      : <code>1-Day Compression + Rolling 1H Breakout</code>\n"
     f"\n"
-    f"📊 Setup        :\n"
-    f"  <code>2 pivot highs → structural trendline</code>\n"
-    f"  <code>rizzy_depth = trendline_at_low_bar − pivot_low</code>\n"
-    f"  <code>projected_target = pivot_low − rizzy_depth</code>\n"
+    f"📊 Daily Filter  :\n"
+    f"  <code>Body  ≤ {MAX_DAILY_BODY_PCT}%  (yesterday open→close)</code>\n"
+    f"  <code>Range ≤ {MAX_DAILY_RANGE_PCT}%  (yesterday high−low)</code>\n"
     f"\n"
-    f"🔍 Entry (LONG) :\n"
-    f"  <code>① Low ≤ projected target</code>\n"
-    f"  <code>② Low below BB lower band (20, 2.0)</code>\n"
-    f"  <code>③ Close > prior candle high (breakout)</code>\n"
-    f"  <code>④ Close > Open (bullish candle)</code>\n"
+    f"⚡ Pump Windows  :\n"
+    f"  <code>move_15m / 30m / 45m / 1h ≥ {MIN_PUMP_PCT}% (any triggers)</code>\n"
     f"\n"
-    f"🎯 TP           : <code>BB middle band (SMA 20)</code>\n"
-    f"🛑 SL           : <code>Trigger candle low</code>\n"
-    f"⏱ Timeframe    : <code>15m</code>\n"
-    f"🔁 Scan         : <code>Every {SCAN_INTERVAL}s</code>\n"
-    f"💰 Capital      : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
+    f"🔍 Quality Filters:\n"
+    f"  <code>① Bullish candle (close > open)</code>\n"
+    f"  <code>② Strong close (top {int(STRONG_CLOSE_RATIO*100)}% of range)</code>\n"
+    f"  <code>③ Volume > EMA({VOLUME_EMA_LEN}) of volume</code>\n"
+    f"\n"
+    f"🎯 TP            : <code>+{TP_PCT}% above entry close</code>\n"
+    f"🛑 SL            : <code>Trigger candle low</code>\n"
+    f"⏱ Timeframe     : <code>15m</code>\n"
+    f"🔁 Scan          : <code>Every {SCAN_INTERVAL}s</code>\n"
+    f"💰 Capital       : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
 )
 
 while True:
