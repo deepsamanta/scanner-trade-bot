@@ -46,7 +46,7 @@ BASE_URL = "https://api.coindcx.com"
 
 MAX_DAILY_BODY_PCT  = 5.0   # yesterday's body must be within this %
 MAX_DAILY_RANGE_PCT = 7.0   # yesterday's wick range must be within this %
-MIN_PUMP_PCT        = 3.0   # minimum move over any rolling window to trigger
+MIN_PUMP_PCT        = 2.1   # minimum move over any rolling window to trigger
 TP_PCT              = 1.5   # fixed TP above entry close
 SL_PCT              = 1.5   # fallback SL below entry (if candle low >= entry)
 
