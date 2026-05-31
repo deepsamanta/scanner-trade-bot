@@ -39,14 +39,14 @@ BASE_URL = "https://api.coindcx.com"
 #   • volume > EMA(volume, 20)                  (above-average volume)
 #
 # ENTRY  : Limit order at trigger candle close (long only)
-# TP     : close * (1 + TP_PCT / 100)          fixed 1.5% above entry
+# TP     : rounded_entry * (1 + TP_PCT / 100)  — computed from rounded entry
 # SL     : trigger candle low
-#          Fallback: SL_PCT below entry if candle low >= entry
+#          Fallback: SL_PCT below rounded entry if candle low >= entry
 # =============================================================================
 
 MAX_DAILY_BODY_PCT  = 5.0   # yesterday's body must be within this %
 MAX_DAILY_RANGE_PCT = 7.0   # yesterday's wick range must be within this %
-MIN_PUMP_PCT        = 3.0   # minimum move over any rolling window to trigger
+MIN_PUMP_PCT        = 2.1   # minimum move over any rolling window to trigger
 TP_PCT              = 1.5   # fixed TP above entry close
 SL_PCT              = 1.5   # fallback SL below entry (if candle low >= entry)
 
@@ -172,6 +172,7 @@ def init_symbol_state():
         "last_entry_ts":   0,
         "current_day_str": None,
         "last_candle_ts":  0,
+        "tp_completed":    False,   # NEW: day-level TP completed flag
     }
 
 
@@ -471,6 +472,13 @@ def place_long_order(symbol, entry_price, tp_price, sl_price, precision):
     tp     = round(tp_price,    precision)
     sl     = round(sl_price,    precision)
     qty    = compute_qty(entry_price, symbol)
+
+    # FIX: verify TP is strictly derived from rounded entry to avoid exchange mismatch
+    expected_tp = round(entry * (1 + TP_PCT / 100), precision)
+    if tp != expected_tp:
+        print(f"  [WARN] TP mismatch corrected: {tp} -> {expected_tp}")
+        tp = expected_tp
+
     tp_pct = round(((tp - entry) / entry) * 100, 2)
     sl_pct = round(((entry - sl) / entry) * 100, 2)
 
@@ -493,13 +501,13 @@ def place_long_order(symbol, entry_price, tp_price, sl_price, precision):
         ).json()
     except Exception as e:
         print(f"  [ERROR] order failed: {e}")
-        return False
+        return False, None, None
 
     print(f"  [API] {symbol}: {result}")
     if "order" not in result and not isinstance(result, list):
         print(f"  [ERROR] long rejected: {result}")
         send_telegram(f"❌ <b>LONG REJECTED — {symbol}</b>\n<code>{str(result)[:200]}</code>")
-        return False
+        return False, None, None
 
     send_telegram(
         f"🟢 <b>NEW LONG (COMPRESSION) — {symbol}</b>\n"
@@ -510,7 +518,8 @@ def place_long_order(symbol, entry_price, tp_price, sl_price, precision):
         f"📦 Qty   : <code>{qty}</code>\n"
         f"💰 Margin: <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
     )
-    return True
+    # Return the exact rounded values used so state stores the same numbers
+    return True, entry, tp
 
 
 # =====================================================
@@ -523,12 +532,10 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     # ── 1. Fetch candles ──────────────────────────────────────────────────
-    # Daily — for compression filter
     daily_all = fetch_candles(symbol, CANDLES_DAILY, RESOLUTION_DAILY, CANDLE_SECONDS_DAY)
     if daily_all and (now_ms - int(daily_all[-1]["time"])) < CANDLE_SECONDS_DAY * 1000:
-        daily_all = daily_all[:-1]   # drop in-progress daily bar
+        daily_all = daily_all[:-1]
 
-    # 15m — for entry conditions
     candles_15m = fetch_candles(symbol, CANDLES_15M, RESOLUTION_15M, CANDLE_SECONDS_15M)
     if candles_15m and (now_ms - int(candles_15m[-1]["time"])) < CANDLE_SECONDS_15M * 1000:
         candles_15m = candles_15m[:-1]
@@ -537,7 +544,7 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
         print(f"  [{symbol}] SKIP — no completed daily candle")
         return
 
-    min_15m = VOLUME_EMA_LEN + 4   # EMA seed + 4 rolling-window bars
+    min_15m = VOLUME_EMA_LEN + 4
     if len(candles_15m) < min_15m:
         print(f"  [{symbol}] SKIP — insufficient 15m candles ({len(candles_15m)} < {min_15m})")
         return
@@ -550,7 +557,7 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
 
     # ── 3. New-day reset ──────────────────────────────────────────────────
     if st["current_day_str"] != today_str:
-        print(f"  [{symbol}] NEW DAY")
+        print(f"  [{symbol}] NEW DAY — resetting daily state")
         preserved = {k: st[k] for k in
                      ("in_position", "direction", "entry_price",
                       "tp_level", "sl_price", "last_entry_ts")}
@@ -562,16 +569,35 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
     precision = get_precision(float(candles_15m[-1]["close"]))
 
     # ── 4. TP COMPLETED check ─────────────────────────────────────────────
+    # Check BOTH sheet and in-state flag — either blocks trading for today
     tp_raw = str(df.iloc[row, 1]).strip() if df.shape[1] > 1 else ""
-    if tp_raw.upper() == "TP COMPLETED":
-        print(f"  [{symbol}] SKIP — TP COMPLETED in sheet")
-        save_state(all_state)
+
+    if tp_raw.upper() == "TP COMPLETED" or st.get("tp_completed") is True:
+        print(f"  [{symbol}] SKIP — TP COMPLETED (sheet={tp_raw.upper() == 'TP COMPLETED'} "
+              f"state={st.get('tp_completed')})")
+        # Ensure state is cleared so no ghost in_position
+        if st.get("in_position"):
+            prev_last = st.get("last_entry_ts", 0)
+            all_state[symbol] = init_symbol_state()
+            all_state[symbol]["last_entry_ts"]   = prev_last
+            all_state[symbol]["current_day_str"] = today_str
+            all_state[symbol]["tp_completed"]    = True
+            save_state(all_state)
         return
 
-    try:
-        tp_stored = float(tp_raw)
-    except (ValueError, TypeError):
-        tp_stored = None
+    # ── 5. Resolve TP target from state (authoritative) then sheet fallback ──
+    # State is always written with the exact rounded value used in the order,
+    # so it is the only reliable source. Sheet is only used to backfill when
+    # state is missing (e.g. bot restarted mid-trade).
+    tp_stored = st.get("tp_level")
+    if not tp_stored:
+        try:
+            v = float(tp_raw)
+            if v > 0:
+                tp_stored    = v
+                st["tp_level"] = v   # backfill state from sheet
+        except (ValueError, TypeError):
+            tp_stored = None
 
     if tp_stored and tp_stored > 0:
         last_1m    = fetch_candles(symbol, CANDLES_1M, RESOLUTION_1M, CANDLE_SECONDS_1M)
@@ -580,11 +606,14 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
         hit_kind   = None
         hit_price  = None
 
-        if last_close and last_close >= tp_stored:
+        # Small tolerance (0.01%) to handle float comparison edge cases
+        tp_threshold = tp_stored * 0.9999
+
+        if last_close and last_close >= tp_threshold:
             tp_hit, hit_kind, hit_price = True, "close", last_close
         if not tp_hit:
             rh = get_recent_high(symbol)
-            if rh and rh >= tp_stored:
+            if rh and rh >= tp_threshold:
                 tp_hit, hit_kind, hit_price = True, "wick", rh
 
         if tp_hit:
@@ -592,11 +621,13 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
             print(f"  [{symbol}] TP HIT ({hit_kind}) price={hit_price} target={tp_stored}")
             prev_last = st.get("last_entry_ts", 0)
             all_state[symbol] = init_symbol_state()
-            all_state[symbol]["last_entry_ts"] = prev_last
+            all_state[symbol]["last_entry_ts"]   = prev_last
+            all_state[symbol]["current_day_str"] = today_str
+            all_state[symbol]["tp_completed"]    = True   # block rest of day
             save_state(all_state)
             return
 
-    # ── 5. Reconcile with exchange ────────────────────────────────────────
+    # ── 6. Reconcile with exchange ────────────────────────────────────────
     position = next((p for p in global_positions if p.get("pair") == pair_name), None)
 
     if position is not None:
@@ -638,7 +669,7 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
         print(f"  [{symbol}] SKIP — open order on book")
         return
 
-    # ── 6. Daily compression filter ───────────────────────────────────────
+    # ── 7. Daily compression filter ───────────────────────────────────────
     compression_ok, body_pct, range_pct = check_daily_compression(daily_all)
     print(f"  [{symbol}] Daily body={body_pct}% range={range_pct}% "
           f"compression={'OK' if compression_ok else 'FAIL'}")
@@ -647,7 +678,7 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
         save_state(all_state)
         return
 
-    # ── 7. Last completed 15m candle ──────────────────────────────────────
+    # ── 8. Last completed 15m candle ──────────────────────────────────────
     curr   = candles_15m[-1]
     curr_o = float(curr["open"]);  curr_h = float(curr["high"])
     curr_l = float(curr["low"]);   curr_c = float(curr["close"])
@@ -658,10 +689,10 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
         save_state(all_state)
         return
 
-    # ── 8. Rolling pump check ─────────────────────────────────────────────
+    # ── 9. Rolling pump check ─────────────────────────────────────────────
     pump_ok, best_move, best_window = check_rolling_pump(candles_15m)
 
-    # ── 9. Candle quality filters ─────────────────────────────────────────
+    # ── 10. Candle quality filters ────────────────────────────────────────
     cond_bullish = curr_c > curr_o
 
     candle_range = curr_h - curr_l
@@ -683,22 +714,28 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
         save_state(all_state)
         return
 
-    # ── 10. Compute entry / TP / SL ───────────────────────────────────────
-    entry_price  = curr_c
-    tp_price_val = entry_price * (1 + TP_PCT / 100)
+    # ── 11. Compute entry / TP / SL ───────────────────────────────────────
+    # FIX: round entry first, then compute TP from rounded entry.
+    # This ensures the TP stored in state/sheet/exchange is exactly
+    # rounded_entry * (1 + TP_PCT/100) — no accumulated rounding error.
+    entry_price  = round(curr_c, precision)
+    tp_price_val = round(entry_price * (1 + TP_PCT / 100), precision)
     sl_price_val = curr_l if curr_l < entry_price else entry_price * (1 - SL_PCT / 100)
 
-    print(f"  [{symbol}] ENTRY — Entry={round(entry_price, precision)} "
-          f"TP={round(tp_price_val, precision)} SL={round(sl_price_val, precision)}")
+    print(f"  [{symbol}] ENTRY — Entry={entry_price} "
+          f"TP={tp_price_val} SL={round(sl_price_val, precision)}")
 
-    # ── 11. Place order ───────────────────────────────────────────────────
-    placed = place_long_order(symbol, entry_price, tp_price_val, sl_price_val, precision)
+    # ── 12. Place order ───────────────────────────────────────────────────
+    placed, confirmed_entry, confirmed_tp = place_long_order(
+        symbol, entry_price, tp_price_val, sl_price_val, precision
+    )
 
     if placed:
+        # Use the exact values returned from place_long_order (post-rounding + correction)
         st["in_position"] = True
         st["direction"]   = "long"
-        st["entry_price"] = round(entry_price,  precision)
-        st["tp_level"]    = round(tp_price_val, precision)
+        st["entry_price"] = confirmed_entry
+        st["tp_level"]    = confirmed_tp          # exact value sent to exchange
         st["sl_price"]    = round(sl_price_val, precision)
         st["last_entry_ts"] = curr_ts
         update_sheet_tp(row, st["tp_level"])
