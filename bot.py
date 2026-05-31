@@ -19,18 +19,18 @@ BASE_URL = "https://api.coindcx.com"
 # =============================================================================
 # STRATEGY: Strict 1-Day Compression + Rolling 1H Breakout
 #
-# TIMEFRAME   : 15m candles (entry) + 1D candles (compression filter)
+# TIMEFRAME   : 1m candles (entry) + 1D candles (compression filter)
 #
 # STEP 1 — DAILY COMPRESSION FILTER (yesterday's completed daily candle):
 #   • body_pct  = abs(close - open) / open * 100  ≤ MAX_DAILY_BODY_PCT (5%)
 #   • range_pct = (high - low)      / open * 100  ≤ MAX_DAILY_RANGE_PCT (5%)
 #   Both must pass — ensures entry only after a tight consolidation day.
 #
-# STEP 2 — ROLLING PUMP CHECK (on trigger 15m candle):
-#   • move_15m = (close - open[0]) / open[0] * 100   current candle
-#   • move_30m = (close - open[1]) / open[1] * 100   vs 1-bar-ago open
-#   • move_45m = (close - open[2]) / open[2] * 100   vs 2-bars-ago open
-#   • move_1h  = (close - open[3]) / open[3] * 100   vs 3-bars-ago open
+# STEP 2 — ROLLING PUMP CHECK (on last completed 1m candle):
+#   • move_15m = (close - open[14])  / open[14]  * 100   vs bar 15 back
+#   • move_30m = (close - open[29])  / open[29]  * 100   vs bar 30 back
+#   • move_45m = (close - open[44])  / open[44]  * 100   vs bar 45 back
+#   • move_1h  = (close - open[59])  / open[59]  * 100   vs bar 60 back
 #   ANY window >= MIN_PUMP_PCT (3%) triggers.
 #
 # STEP 3 — CANDLE QUALITY FILTERS:
@@ -51,19 +51,19 @@ TP_PCT              = 1.5   # fixed TP above entry close
 SL_PCT              = 1.5   # fallback SL below entry (if candle low >= entry)
 
 STRONG_CLOSE_RATIO  = 0.70  # close must be in top 70% of candle range
-VOLUME_EMA_LEN      = 20    # EMA period for volume filter
+VOLUME_EMA_LEN      = 18    # EMA period for volume filter
 
 CANDLES_DAILY  = 5
-CANDLES_15M    = 50
+CANDLES_ENTRY  = 70    # 60 bars (1h lookback) + 10 buffer for EMA seed + in-progress drop
 CANDLES_1M     = 5
 
 RESOLUTION_DAILY = "1D"
-RESOLUTION_15M   = "15"
+RESOLUTION_ENTRY = "1"
 RESOLUTION_1M    = "1"
 
-CANDLE_SECONDS_DAY = 86400
-CANDLE_SECONDS_15M = 900
-CANDLE_SECONDS_1M  = 60
+CANDLE_SECONDS_DAY   = 86400
+CANDLE_SECONDS_ENTRY = 60
+CANDLE_SECONDS_1M    = 60
 
 SCAN_INTERVAL          = 300
 REQUEST_TIMEOUT        = 15
@@ -365,22 +365,22 @@ def check_daily_compression(daily_candles):
     return valid, round(body_pct, 2), round(range_pct, 2)
 
 
-def check_rolling_pump(candles_15m):
+def check_rolling_pump(candles_1m):
     """
-    Checks if current close has moved >= MIN_PUMP_PCT over any of the four
-    rolling open anchors (15m, 30m, 45m, 1h back).
+    Checks if current 1m close has moved >= MIN_PUMP_PCT over any of the four
+    rolling open anchors at 15, 30, 45, 60 bars back (1m resolution).
     Returns (triggered: bool, best_move_pct: float, window_label: str).
     """
-    if len(candles_15m) < 4:
+    if len(candles_1m) < 61:
         return False, 0.0, ""
 
-    curr_c = float(candles_15m[-1]["close"])
+    curr_c = float(candles_1m[-1]["close"])
 
     windows = [
-        ("15m", float(candles_15m[-1]["open"])),
-        ("30m", float(candles_15m[-2]["open"])),
-        ("45m", float(candles_15m[-3]["open"])),
-        ("1h",  float(candles_15m[-4]["open"])),
+        ("15m", float(candles_1m[-15]["open"])),
+        ("30m", float(candles_1m[-30]["open"])),
+        ("45m", float(candles_1m[-45]["open"])),
+        ("1h",  float(candles_1m[-60]["open"])),
     ]
 
     best_label = ""
@@ -536,17 +536,17 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
     if daily_all and (now_ms - int(daily_all[-1]["time"])) < CANDLE_SECONDS_DAY * 1000:
         daily_all = daily_all[:-1]
 
-    candles_15m = fetch_candles(symbol, CANDLES_15M, RESOLUTION_15M, CANDLE_SECONDS_15M)
-    if candles_15m and (now_ms - int(candles_15m[-1]["time"])) < CANDLE_SECONDS_15M * 1000:
-        candles_15m = candles_15m[:-1]
+    candles_1m = fetch_candles(symbol, CANDLES_ENTRY, RESOLUTION_ENTRY, CANDLE_SECONDS_ENTRY)
+    if candles_1m and (now_ms - int(candles_1m[-1]["time"])) < CANDLE_SECONDS_ENTRY * 1000:
+        candles_1m = candles_1m[:-1]
 
     if len(daily_all) < 1:
         print(f"  [{symbol}] SKIP — no completed daily candle")
         return
 
-    min_15m = VOLUME_EMA_LEN + 4
-    if len(candles_15m) < min_15m:
-        print(f"  [{symbol}] SKIP — insufficient 15m candles ({len(candles_15m)} < {min_15m})")
+    min_1m = VOLUME_EMA_LEN + 61   # EMA seed + 60 bars for 1h lookback + in-progress dropped
+    if len(candles_1m) < min_1m:
+        print(f"  [{symbol}] SKIP — insufficient 1m candles ({len(candles_1m)} < {min_1m})")
         return
 
     # ── 2. State init / backfill ──────────────────────────────────────────
@@ -566,7 +566,7 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
         all_state[symbol] = st
 
     st["current_day_str"] = today_str
-    precision = get_precision(float(candles_15m[-1]["close"]))
+    precision = get_precision(float(candles_1m[-1]["close"]))
 
     # ── 4. TP COMPLETED check ─────────────────────────────────────────────
     # Check BOTH sheet and in-state flag — either blocks trading for today
@@ -678,8 +678,8 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
         save_state(all_state)
         return
 
-    # ── 8. Last completed 15m candle ──────────────────────────────────────
-    curr   = candles_15m[-1]
+    # ── 8. Last completed 1m candle ───────────────────────────────────────
+    curr   = candles_1m[-1]
     curr_o = float(curr["open"]);  curr_h = float(curr["high"])
     curr_l = float(curr["low"]);   curr_c = float(curr["close"])
     curr_ts = int(curr["time"])
@@ -690,7 +690,7 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
         return
 
     # ── 9. Rolling pump check ─────────────────────────────────────────────
-    pump_ok, best_move, best_window = check_rolling_pump(candles_15m)
+    pump_ok, best_move, best_window = check_rolling_pump(candles_1m)
 
     # ── 10. Candle quality filters ────────────────────────────────────────
     cond_bullish = curr_c > curr_o
@@ -701,7 +701,7 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
         (curr_c - curr_l) / candle_range >= STRONG_CLOSE_RATIO
     )
 
-    volumes   = [float(c["volume"]) for c in candles_15m]
+    volumes   = [float(c["volume"]) for c in candles_1m]
     vol_ema20 = compute_ema(volumes, VOLUME_EMA_LEN)
     cond_volume = vol_ema20 is not None and float(curr["volume"]) > vol_ema20
 
@@ -771,7 +771,7 @@ send_telegram(
     f"\n"
     f"🎯 TP            : <code>+{TP_PCT}% above entry close</code>\n"
     f"🛑 SL            : <code>Trigger candle low</code>\n"
-    f"⏱ Timeframe     : <code>15m</code>\n"
+    f"⏱ Timeframe     : <code>1m</code>\n"
     f"🔁 Scan          : <code>Every {SCAN_INTERVAL}s</code>\n"
     f"💰 Capital       : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
 )
