@@ -40,8 +40,7 @@ BASE_URL = "https://api.coindcx.com"
 #
 # ENTRY  : Limit order at trigger candle close (long only)
 # TP     : rounded_entry * (1 + TP_PCT / 100)  — computed from rounded entry
-# SL     : trigger candle low
-#          Fallback: SL_PCT below rounded entry if candle low >= entry
+# SL     : rounded_entry * (1 - SL_PCT / 100)  — always 1.5% below entry
 # =============================================================================
 
 MAX_DAILY_BODY_PCT  = 5.0   # yesterday's body must be within this %
@@ -756,7 +755,7 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
     # rounded_entry * (1 + TP_PCT/100) — no accumulated rounding error.
     entry_price  = round(curr_c, precision)
     tp_price_val = round(entry_price * (1 + TP_PCT / 100), precision)
-    sl_price_val = curr_l if curr_l < entry_price else entry_price * (1 - SL_PCT / 100)
+    sl_price_val = round(entry_price * (1 - SL_PCT / 100), precision)
 
     print(f"  [{symbol}] ENTRY — Entry={entry_price} "
           f"TP={tp_price_val} SL={round(sl_price_val, precision)}")
@@ -806,7 +805,7 @@ send_telegram(
     f"  <code>③ Volume > EMA({VOLUME_EMA_LEN}) of volume</code>\n"
     f"\n"
     f"🎯 TP            : <code>+{TP_PCT}% above entry close</code>\n"
-    f"🛑 SL            : <code>Trigger candle low</code>\n"
+    f"🛑 SL            : <code>-{SL_PCT}% below entry (fixed)</code>\n"
     f"⏱ Timeframe     : <code>1m</code>\n"
     f"🔁 Scan          : <code>Every {SCAN_INTERVAL}s</code>\n"
     f"💰 Capital       : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
