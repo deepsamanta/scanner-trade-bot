@@ -46,14 +46,15 @@ BASE_URL = "https://api.coindcx.com"
 
 MAX_DAILY_BODY_PCT  = 5.0   # yesterday's body must be within this %
 MAX_DAILY_RANGE_PCT = 7.0   # yesterday's wick range must be within this %
-MIN_PUMP_PCT        = 2.1   # minimum move over any rolling window to trigger
+MIN_PUMP_PCT        = 3.0   # minimum move over any rolling window to trigger
 TP_PCT              = 1.5   # fixed TP above entry close
 SL_PCT              = 1.5   # fallback SL below entry (if candle low >= entry)
 
 STRONG_CLOSE_RATIO  = 0.70  # close must be in top 70% of candle range
 VOLUME_EMA_LEN      = 20    # EMA period for volume filter
+NEAR_BOTTOM_PCT     = 20.0  # current price must be within 20% above 1000d low
 
-CANDLES_DAILY  = 5
+CANDLES_DAILY  = 1000
 CANDLES_ENTRY  = 90    # 60 bars (1h lookback) + 20 EMA seed + 10 buffer for in-progress drop
 CANDLES_1M     = 5
 
@@ -65,7 +66,7 @@ CANDLE_SECONDS_DAY   = 86400
 CANDLE_SECONDS_ENTRY = 60
 CANDLE_SECONDS_1M    = 60
 
-SCAN_INTERVAL          = 90
+SCAN_INTERVAL          = 300
 REQUEST_TIMEOUT        = 15
 TELEGRAM_TIMEOUT       = 10
 GSHEET_REAUTH_INTERVAL = 45 * 60
@@ -365,7 +366,25 @@ def check_daily_compression(daily_candles):
     return valid, round(body_pct, 2), round(range_pct, 2)
 
 
-def check_rolling_pump(candles_1m):
+def check_near_bottom(daily_candles, current_price):
+    """
+    Checks if current price is within NEAR_BOTTOM_PCT% above the 1000-day low,
+    or is making a new bottom.
+    Returns (valid: bool, low_1000d: float, pct_above_low: float).
+    """
+    if not daily_candles:
+        return False, 0.0, 0.0
+
+    low_1000d = min(float(c["low"]) for c in daily_candles)
+    if low_1000d == 0:
+        return False, 0.0, 0.0
+
+    pct_above_low = (current_price - low_1000d) / low_1000d * 100
+    valid = pct_above_low <= NEAR_BOTTOM_PCT   # also catches new bottom (pct <= 0)
+    return valid, round(low_1000d, 8), round(pct_above_low, 2)
+
+
+
     """
     Checks if current 1m close has moved >= MIN_PUMP_PCT over any of the four
     rolling open anchors at 15, 30, 45, 60 bars back (1m resolution).
@@ -533,18 +552,20 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
 
     # ── 1. Fetch candles ──────────────────────────────────────────────────
     daily_all = fetch_candles(symbol, CANDLES_DAILY, RESOLUTION_DAILY, CANDLE_SECONDS_DAY)
-    if daily_all and (now_ms - int(daily_all[-1]["time"])) < CANDLE_SECONDS_DAY * 1000:
-        daily_all = daily_all[:-1]
+    # Separate: completed bars for compression, all bars for 1000d low
+    daily_completed = daily_all[:-1] if (
+        daily_all and (now_ms - int(daily_all[-1]["time"])) < CANDLE_SECONDS_DAY * 1000
+    ) else daily_all
+
+    if not daily_all:
+        print(f"  [{symbol}] SKIP — no daily candles at all")
+        return
 
     candles_1m = fetch_candles(symbol, CANDLES_ENTRY, RESOLUTION_ENTRY, CANDLE_SECONDS_ENTRY)
     if candles_1m and (now_ms - int(candles_1m[-1]["time"])) < CANDLE_SECONDS_ENTRY * 1000:
         candles_1m = candles_1m[:-1]
 
-    if len(daily_all) < 1:
-        print(f"  [{symbol}] SKIP — no completed daily candle")
-        return
-
-    min_1m = VOLUME_EMA_LEN + 61   # EMA seed + 60 bars for 1h lookback + in-progress dropped
+    min_1m = VOLUME_EMA_LEN + 61
     if len(candles_1m) < min_1m:
         print(f"  [{symbol}] SKIP — insufficient 1m candles ({len(candles_1m)} < {min_1m})")
         return
@@ -670,11 +691,26 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
         return
 
     # ── 7. Daily compression filter ───────────────────────────────────────
-    compression_ok, body_pct, range_pct = check_daily_compression(daily_all)
-    print(f"  [{symbol}] Daily body={body_pct}% range={range_pct}% "
+    if len(daily_completed) < 1:
+        print(f"  [{symbol}] SKIP — no completed daily candle")
+        save_state(all_state)
+        return
+
+    compression_ok, body_pct, range_pct = check_daily_compression(daily_completed)
+    print(f"  [{symbol}] Daily candles={len(daily_all)} body={body_pct}% range={range_pct}% "
           f"compression={'OK' if compression_ok else 'FAIL'}")
 
     if not compression_ok:
+        save_state(all_state)
+        return
+
+    # ── 7b. Near-bottom filter ────────────────────────────────────────────
+    current_price = float(candles_1m[-1]["close"])
+    bottom_ok, low_1000d, pct_above = check_near_bottom(daily_all, current_price)
+    print(f"  [{symbol}] 1000d_low={low_1000d} current={current_price} "
+          f"pct_above_low={pct_above}% bottom={'OK' if bottom_ok else 'FAIL'}")
+
+    if not bottom_ok:
         save_state(all_state)
         return
 
