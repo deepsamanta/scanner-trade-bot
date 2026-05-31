@@ -45,16 +45,16 @@ BASE_URL = "https://api.coindcx.com"
 
 MAX_DAILY_BODY_PCT  = 5.0   # yesterday's body must be within this %
 MAX_DAILY_RANGE_PCT = 7.0   # yesterday's wick range must be within this %
-MIN_PUMP_PCT        = 2.0   # minimum move over any rolling window to trigger
+MIN_PUMP_PCT        = 2.1   # minimum move over any rolling window to trigger
 TP_PCT              = 1.5   # fixed TP above entry close
 SL_PCT              = 1.5   # fallback SL below entry (if candle low >= entry)
 
 STRONG_CLOSE_RATIO  = 0.70  # close must be in top 70% of candle range
 VOLUME_EMA_LEN      = 20    # EMA period for volume filter
-NEAR_BOTTOM_PCT     = 100.0  # current price must be within 20% above 1000d low
+NEAR_BOTTOM_PCT     = 100.0 # current price must be within 100% above 1000d low (new bottom)
 
 CANDLES_DAILY  = 1000
-CANDLES_ENTRY  = 90    # 60 bars (1h lookback) + 20 EMA seed + 10 buffer for in-progress drop
+CANDLES_ENTRY  = 120   # 90 bars (1.5h lookback) + 20 EMA seed + 10 buffer for in-progress drop
 CANDLES_1M     = 5
 
 RESOLUTION_DAILY = "1D"
@@ -65,7 +65,7 @@ CANDLE_SECONDS_DAY   = 86400
 CANDLE_SECONDS_ENTRY = 60
 CANDLE_SECONDS_1M    = 60
 
-SCAN_INTERVAL          = 90
+SCAN_INTERVAL          = 120
 REQUEST_TIMEOUT        = 15
 TELEGRAM_TIMEOUT       = 10
 GSHEET_REAUTH_INTERVAL = 45 * 60
@@ -424,33 +424,27 @@ def check_near_bottom(daily_candles, current_price):
 
 def check_rolling_pump(candles_1m):
     """
-    Checks if current 1m close has moved >= MIN_PUMP_PCT over any of the four
-    rolling open anchors at 15, 30, 45, 60 bars back (1m resolution).
+    Checks if current 1m close has moved >= MIN_PUMP_PCT over any of the
+    5min-interval anchors from 5m to 1.5h (5, 10, 15 ... 90 bars back).
     Returns (triggered: bool, best_move_pct: float, window_label: str).
     """
-    if len(candles_1m) < 61:
+    if len(candles_1m) < 91:
         return False, 0.0, ""
 
     curr_c = float(candles_1m[-1]["close"])
-
-    windows = [
-        ("15m", float(candles_1m[-15]["open"])),
-        ("30m", float(candles_1m[-30]["open"])),
-        ("45m", float(candles_1m[-45]["open"])),
-        ("1h",  float(candles_1m[-60]["open"])),
-    ]
 
     best_label = ""
     best_move  = 0.0
     triggered  = False
 
-    for label, anchor_open in windows:
+    for bars in range(5, 91, 5):
+        anchor_open = float(candles_1m[-bars]["open"])
         if anchor_open == 0:
             continue
         move = (curr_c - anchor_open) / anchor_open * 100
         if move > best_move:
             best_move  = move
-            best_label = label
+            best_label = f"{bars}m"
         if move >= MIN_PUMP_PCT:
             triggered = True
 
@@ -599,7 +593,7 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
     if candles_1m and (now_ms - int(candles_1m[-1]["time"])) < CANDLE_SECONDS_ENTRY * 1000:
         candles_1m = candles_1m[:-1]
 
-    min_1m = VOLUME_EMA_LEN + 61
+    min_1m = VOLUME_EMA_LEN + 91
     if len(candles_1m) < min_1m:
         print(f"  [{symbol}] SKIP — insufficient 1m candles ({len(candles_1m)} < {min_1m})")
         return
