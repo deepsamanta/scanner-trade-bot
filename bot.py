@@ -422,6 +422,41 @@ def check_near_bottom(daily_candles, current_price):
 # CANDLE FETCHER
 # =====================================================
 
+def check_rolling_pump(candles_1m):
+    """
+    Checks if current 1m close has moved >= MIN_PUMP_PCT over any of the four
+    rolling open anchors at 15, 30, 45, 60 bars back (1m resolution).
+    Returns (triggered: bool, best_move_pct: float, window_label: str).
+    """
+    if len(candles_1m) < 61:
+        return False, 0.0, ""
+
+    curr_c = float(candles_1m[-1]["close"])
+
+    windows = [
+        ("15m", float(candles_1m[-15]["open"])),
+        ("30m", float(candles_1m[-30]["open"])),
+        ("45m", float(candles_1m[-45]["open"])),
+        ("1h",  float(candles_1m[-60]["open"])),
+    ]
+
+    best_label = ""
+    best_move  = 0.0
+    triggered  = False
+
+    for label, anchor_open in windows:
+        if anchor_open == 0:
+            continue
+        move = (curr_c - anchor_open) / anchor_open * 100
+        if move > best_move:
+            best_move  = move
+            best_label = label
+        if move >= MIN_PUMP_PCT:
+            triggered = True
+
+    return triggered, round(best_move, 2), best_label
+
+
 def fetch_candles(symbol, num_candles, resolution_str, candle_seconds):
     url    = "https://public.coindcx.com/market_data/candlesticks"
     now    = int(time.time())
