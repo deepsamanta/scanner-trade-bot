@@ -46,15 +46,15 @@ BASE_URL = "https://api.coindcx.com"
 
 MAX_DAILY_BODY_PCT  = 5.0   # yesterday's body must be within this %
 MAX_DAILY_RANGE_PCT = 7.0   # yesterday's wick range must be within this %
-MIN_PUMP_PCT        = 2.1   # minimum move over any rolling window to trigger
+MIN_PUMP_PCT        = 3.0   # minimum move over any rolling window to trigger
 TP_PCT              = 1.5   # fixed TP above entry close
 SL_PCT              = 1.5   # fallback SL below entry (if candle low >= entry)
 
 STRONG_CLOSE_RATIO  = 0.70  # close must be in top 70% of candle range
-VOLUME_EMA_LEN      = 18    # EMA period for volume filter
+VOLUME_EMA_LEN      = 20    # EMA period for volume filter
 
 CANDLES_DAILY  = 5
-CANDLES_ENTRY  = 70    # 60 bars (1h lookback) + 10 buffer for EMA seed + in-progress drop
+CANDLES_ENTRY  = 90    # 60 bars (1h lookback) + 20 EMA seed + 10 buffer for in-progress drop
 CANDLES_1M     = 5
 
 RESOLUTION_DAILY = "1D"
