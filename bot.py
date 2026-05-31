@@ -45,13 +45,13 @@ BASE_URL = "https://api.coindcx.com"
 
 MAX_DAILY_BODY_PCT  = 5.0   # yesterday's body must be within this %
 MAX_DAILY_RANGE_PCT = 7.0   # yesterday's wick range must be within this %
-MIN_PUMP_PCT        = 3.0   # minimum move over any rolling window to trigger
+MIN_PUMP_PCT        = 2.0   # minimum move over any rolling window to trigger
 TP_PCT              = 1.5   # fixed TP above entry close
 SL_PCT              = 1.5   # fallback SL below entry (if candle low >= entry)
 
 STRONG_CLOSE_RATIO  = 0.70  # close must be in top 70% of candle range
 VOLUME_EMA_LEN      = 20    # EMA period for volume filter
-NEAR_BOTTOM_PCT     = 20.0  # current price must be within 20% above 1000d low
+NEAR_BOTTOM_PCT     = 100.0  # current price must be within 20% above 1000d low
 
 CANDLES_DAILY  = 1000
 CANDLES_ENTRY  = 90    # 60 bars (1h lookback) + 20 EMA seed + 10 buffer for in-progress drop
@@ -65,7 +65,7 @@ CANDLE_SECONDS_DAY   = 86400
 CANDLE_SECONDS_ENTRY = 60
 CANDLE_SECONDS_1M    = 60
 
-SCAN_INTERVAL          = 300
+SCAN_INTERVAL          = 90
 REQUEST_TIMEOUT        = 15
 TELEGRAM_TIMEOUT       = 10
 GSHEET_REAUTH_INTERVAL = 45 * 60
