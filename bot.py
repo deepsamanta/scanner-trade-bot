@@ -17,59 +17,51 @@ getcontext().prec = 28
 BASE_URL = "https://api.coindcx.com"
 
 # =============================================================================
-# STRATEGY: Strict 1-Day Compression + Rolling 1H Breakout
+# STRATEGY: ATL Coins — Rising Volume + 15m 200 EMA Breakout
 #
-# TIMEFRAME   : 1m candles (entry) + 1D candles (compression filter)
+# Sheet contains only coins already at their all-time low (curated manually).
+# No ATL proximity check is done in the bot — the sheet IS the filter.
 #
-# STEP 1 — DAILY COMPRESSION FILTER (yesterday's completed daily candle):
-#   • body_pct  = abs(close - open) / open * 100  ≤ MAX_DAILY_BODY_PCT (5%)
-#   • range_pct = (high - low)      / open * 100  ≤ MAX_DAILY_RANGE_PCT (5%)
-#   Both must pass — ensures entry only after a tight consolidation day.
+# STEP 1 — RISING VOLUME FILTER (15m candles):
+#   • avg_volume_recent = mean(volume of last VOL_RISING_BARS 15m candles)
+#   • avg_volume_prev   = mean(volume of preceding VOL_RISING_BARS 15m candles)
+#   • Pass if avg_volume_recent > avg_volume_prev
+#   Ensures accumulation / increasing participation before entry.
 #
-# STEP 2 — ROLLING PUMP CHECK (on last completed 1m candle):
-#   • move_15m = (close - open[14])  / open[14]  * 100   vs bar 15 back
-#   • move_30m = (close - open[29])  / open[29]  * 100   vs bar 30 back
-#   • move_45m = (close - open[44])  / open[44]  * 100   vs bar 45 back
-#   • move_1h  = (close - open[59])  / open[59]  * 100   vs bar 60 back
-#   ANY window >= MIN_PUMP_PCT (3%) triggers.
+# STEP 2 — 200 EMA BREAKOUT (15m candles):
+#   • Compute 200-period EMA of closes on 15m candles
+#   • Pass if last completed 15m candle close > EMA200
+#   Entry only when price has reclaimed the 200 EMA on 15m.
 #
-# STEP 3 — CANDLE QUALITY FILTERS:
-#   • close > open                              (bullish candle)
-#   • (close - low) / (high - low) >= 0.70     (strong close — top 70% of range)
-#   • volume > EMA(volume, 20)                  (above-average volume)
-#
-# ENTRY  : Limit order at trigger candle close (long only)
-# TP     : rounded_entry * (1 + TP_PCT / 100)  — computed from rounded entry
-# SL     : rounded_entry * (1 - SL_PCT / 100)  — always 1.5% below entry
+# ENTRY  : Limit order at trigger 15m candle close (long only)
+# TP     : rounded_entry * (1 + TP_PCT / 100)
+# SL     : rounded_entry * (1 - SL_PCT / 100)
 # =============================================================================
 
-MAX_DAILY_BODY_PCT  = 5.0   # yesterday's body must be within this %
-MAX_DAILY_RANGE_PCT = 7.0   # yesterday's wick range must be within this %
-MIN_PUMP_PCT        = 2.1   # minimum move over any rolling window to trigger
-TP_PCT              = 1.5   # fixed TP above entry close
-SL_PCT              = 1.5   # fallback SL below entry (if candle low >= entry)
+TP_PCT             = 10    # fixed TP above entry
+SL_PCT             = 5    # fixed SL below entry
 
-STRONG_CLOSE_RATIO  = 0.70  # close must be in top 70% of candle range
-VOLUME_EMA_LEN      = 20    # EMA period for volume filter
-NEAR_BOTTOM_PCT     = 100.0 # current price must be within 100% above 1000d low (new bottom)
+EMA200_LEN         = 200    # 200 EMA period on 15m candles
+VOL_RISING_BARS    = 10     # bars per window for volume comparison
 
-CANDLES_DAILY  = 1000
-CANDLES_ENTRY  = 120   # 90 bars (1.5h lookback) + 20 EMA seed + 10 buffer for in-progress drop
-CANDLES_1M     = 5
+# Need at least 200 (EMA seed) + 20 (two windows of 10) + 5 buffer
+CANDLES_15M        = 230
+CANDLES_1M         = 5
 
-RESOLUTION_DAILY = "1D"
-RESOLUTION_ENTRY = "1"
-RESOLUTION_1M    = "1"
+RESOLUTION_15M     = "15"
+RESOLUTION_1M      = "1"
+RESOLUTION_DAILY   = "1D"
 
-CANDLE_SECONDS_DAY   = 86400
-CANDLE_SECONDS_ENTRY = 60
+CANDLE_SECONDS_15M   = 900
 CANDLE_SECONDS_1M    = 60
+CANDLE_SECONDS_DAY   = 86400
 
+CANDLES_DAILY          = 1000
 SCAN_INTERVAL          = 120
 REQUEST_TIMEOUT        = 15
 TELEGRAM_TIMEOUT       = 10
 GSHEET_REAUTH_INTERVAL = 45 * 60
-STATE_FILE             = "compression_bot_state.json"
+STATE_FILE             = "atl_bot_state.json"
 
 
 # =====================================================
@@ -172,7 +164,7 @@ def init_symbol_state():
         "last_entry_ts":   0,
         "current_day_str": None,
         "last_candle_ts":  0,
-        "tp_completed":    False,   # NEW: day-level TP completed flag
+        "tp_completed":    False,
     }
 
 
@@ -341,115 +333,46 @@ def compute_ema(values, length):
     return ema
 
 
-def check_daily_compression(daily_candles):
+def check_volume_rising(candles_15m):
     """
-    Evaluates yesterday's completed daily candle for tight compression.
-    Returns (valid: bool, body_pct: float, range_pct: float).
+    Compares average volume of the last VOL_RISING_BARS candles
+    against the preceding VOL_RISING_BARS candles.
+    Returns (rising: bool, avg_recent: float, avg_prev: float).
     """
-    if len(daily_candles) < 1:
+    needed = VOL_RISING_BARS * 2
+    if len(candles_15m) < needed:
         return False, 0.0, 0.0
 
-    yest   = daily_candles[-1]
-    o      = float(yest["open"])
-    c      = float(yest["close"])
-    h      = float(yest["high"])
-    l      = float(yest["low"])
+    recent_vols = [float(c["volume"]) for c in candles_15m[-VOL_RISING_BARS:]]
+    prev_vols   = [float(c["volume"]) for c in candles_15m[-(VOL_RISING_BARS * 2):-VOL_RISING_BARS]]
 
-    if o == 0:
+    avg_recent = sum(recent_vols) / len(recent_vols)
+    avg_prev   = sum(prev_vols)   / len(prev_vols)
+
+    return avg_recent > avg_prev, round(avg_recent, 2), round(avg_prev, 2)
+
+
+def check_above_ema200(candles_15m):
+    """
+    Checks if the last completed 15m candle closed above the 200-period EMA.
+    Returns (above: bool, close: float, ema200: float).
+    """
+    if len(candles_15m) < EMA200_LEN:
         return False, 0.0, 0.0
 
-    body_pct  = abs(c - o) / o * 100
-    range_pct = (h - l)   / o * 100
+    closes = [float(c["close"]) for c in candles_15m]
+    ema200 = compute_ema(closes, EMA200_LEN)
 
-    valid = body_pct <= MAX_DAILY_BODY_PCT and range_pct <= MAX_DAILY_RANGE_PCT
-    return valid, round(body_pct, 2), round(range_pct, 2)
-
-
-def check_near_bottom(daily_candles, current_price):
-    """
-    Checks if current price is within NEAR_BOTTOM_PCT% above the 1000-day low,
-    or is making a new bottom.
-    Returns (valid: bool, low_1000d: float, pct_above_low: float).
-    """
-    if not daily_candles:
+    if ema200 is None:
         return False, 0.0, 0.0
 
-    low_1000d = min(float(c["low"]) for c in daily_candles)
-    if low_1000d == 0:
-        return False, 0.0, 0.0
-
-    pct_above_low = (current_price - low_1000d) / low_1000d * 100
-    valid = pct_above_low <= NEAR_BOTTOM_PCT   # also catches new bottom (pct <= 0)
-    return valid, round(low_1000d, 8), round(pct_above_low, 2)
-
-
-
-    """
-    Checks if current 1m close has moved >= MIN_PUMP_PCT over any of the four
-    rolling open anchors at 15, 30, 45, 60 bars back (1m resolution).
-    Returns (triggered: bool, best_move_pct: float, window_label: str).
-    """
-    if len(candles_1m) < 61:
-        return False, 0.0, ""
-
-    curr_c = float(candles_1m[-1]["close"])
-
-    windows = [
-        ("15m", float(candles_1m[-15]["open"])),
-        ("30m", float(candles_1m[-30]["open"])),
-        ("45m", float(candles_1m[-45]["open"])),
-        ("1h",  float(candles_1m[-60]["open"])),
-    ]
-
-    best_label = ""
-    best_move  = 0.0
-    triggered  = False
-
-    for label, anchor_open in windows:
-        if anchor_open == 0:
-            continue
-        move = (curr_c - anchor_open) / anchor_open * 100
-        if move > best_move:
-            best_move  = move
-            best_label = label
-        if move >= MIN_PUMP_PCT:
-            triggered = True
-
-    return triggered, round(best_move, 2), best_label
+    last_close = closes[-1]
+    return last_close > ema200, round(last_close, 8), round(ema200, 8)
 
 
 # =====================================================
 # CANDLE FETCHER
 # =====================================================
-
-def check_rolling_pump(candles_1m):
-    """
-    Checks if current 1m close has moved >= MIN_PUMP_PCT over any of the
-    5min-interval anchors from 5m to 1.5h (5, 10, 15 ... 90 bars back).
-    Returns (triggered: bool, best_move_pct: float, window_label: str).
-    """
-    if len(candles_1m) < 91:
-        return False, 0.0, ""
-
-    curr_c = float(candles_1m[-1]["close"])
-
-    best_label = ""
-    best_move  = 0.0
-    triggered  = False
-
-    for bars in range(5, 91, 5):
-        anchor_open = float(candles_1m[-bars]["open"])
-        if anchor_open == 0:
-            continue
-        move = (curr_c - anchor_open) / anchor_open * 100
-        if move > best_move:
-            best_move  = move
-            best_label = f"{bars}m"
-        if move >= MIN_PUMP_PCT:
-            triggered = True
-
-    return triggered, round(best_move, 2), best_label
-
 
 def fetch_candles(symbol, num_candles, resolution_str, candle_seconds):
     url    = "https://public.coindcx.com/market_data/candlesticks"
@@ -520,7 +443,6 @@ def place_long_order(symbol, entry_price, tp_price, sl_price, precision):
     sl     = round(sl_price,    precision)
     qty    = compute_qty(entry_price, symbol)
 
-    # FIX: verify TP is strictly derived from rounded entry to avoid exchange mismatch
     expected_tp = round(entry * (1 + TP_PCT / 100), precision)
     if tp != expected_tp:
         print(f"  [WARN] TP mismatch corrected: {tp} -> {expected_tp}")
@@ -557,7 +479,7 @@ def place_long_order(symbol, entry_price, tp_price, sl_price, precision):
         return False, None, None
 
     send_telegram(
-        f"🟢 <b>NEW LONG (COMPRESSION) — {symbol}</b>\n"
+        f"🟢 <b>NEW LONG (ATL BREAKOUT) — {symbol}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📍 Entry : <code>{entry}</code>\n"
         f"🎯 TP    : <code>{tp}</code>  (+{tp_pct}%)\n"
@@ -565,7 +487,6 @@ def place_long_order(symbol, entry_price, tp_price, sl_price, precision):
         f"📦 Qty   : <code>{qty}</code>\n"
         f"💰 Margin: <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
     )
-    # Return the exact rounded values used so state stores the same numbers
     return True, entry, tp
 
 
@@ -579,23 +500,16 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     # ── 1. Fetch candles ──────────────────────────────────────────────────
-    daily_all = fetch_candles(symbol, CANDLES_DAILY, RESOLUTION_DAILY, CANDLE_SECONDS_DAY)
-    # Separate: completed bars for compression, all bars for 1000d low
-    daily_completed = daily_all[:-1] if (
-        daily_all and (now_ms - int(daily_all[-1]["time"])) < CANDLE_SECONDS_DAY * 1000
-    ) else daily_all
+    # 15m candles: used for both EMA200 and volume check (primary entry TF)
+    candles_15m = fetch_candles(symbol, CANDLES_15M, RESOLUTION_15M, CANDLE_SECONDS_15M)
 
-    if not daily_all:
-        print(f"  [{symbol}] SKIP — no daily candles at all")
-        return
+    # Drop the in-progress 15m candle — only use fully closed bars
+    if candles_15m and (now_ms - int(candles_15m[-1]["time"])) < CANDLE_SECONDS_15M * 1000:
+        candles_15m = candles_15m[:-1]
 
-    candles_1m = fetch_candles(symbol, CANDLES_ENTRY, RESOLUTION_ENTRY, CANDLE_SECONDS_ENTRY)
-    if candles_1m and (now_ms - int(candles_1m[-1]["time"])) < CANDLE_SECONDS_ENTRY * 1000:
-        candles_1m = candles_1m[:-1]
-
-    min_1m = VOLUME_EMA_LEN + 91
-    if len(candles_1m) < min_1m:
-        print(f"  [{symbol}] SKIP — insufficient 1m candles ({len(candles_1m)} < {min_1m})")
+    min_15m = EMA200_LEN + VOL_RISING_BARS * 2
+    if len(candles_15m) < min_15m:
+        print(f"  [{symbol}] SKIP — insufficient 15m candles ({len(candles_15m)} < {min_15m})")
         return
 
     # ── 2. State init / backfill ──────────────────────────────────────────
@@ -615,16 +529,14 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
         all_state[symbol] = st
 
     st["current_day_str"] = today_str
-    precision = get_precision(float(candles_1m[-1]["close"]))
+    precision = get_precision(float(candles_15m[-1]["close"]))
 
     # ── 4. TP COMPLETED check ─────────────────────────────────────────────
-    # Check BOTH sheet and in-state flag — either blocks trading for today
     tp_raw = str(df.iloc[row, 1]).strip() if df.shape[1] > 1 else ""
 
     if tp_raw.upper() == "TP COMPLETED" or st.get("tp_completed") is True:
         print(f"  [{symbol}] SKIP — TP COMPLETED (sheet={tp_raw.upper() == 'TP COMPLETED'} "
               f"state={st.get('tp_completed')})")
-        # Ensure state is cleared so no ghost in_position
         if st.get("in_position"):
             prev_last = st.get("last_entry_ts", 0)
             all_state[symbol] = init_symbol_state()
@@ -634,17 +546,14 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
             save_state(all_state)
         return
 
-    # ── 5. Resolve TP target from state (authoritative) then sheet fallback ──
-    # State is always written with the exact rounded value used in the order,
-    # so it is the only reliable source. Sheet is only used to backfill when
-    # state is missing (e.g. bot restarted mid-trade).
+    # ── 5. Resolve TP target from state then sheet fallback ───────────────
     tp_stored = st.get("tp_level")
     if not tp_stored:
         try:
             v = float(tp_raw)
             if v > 0:
-                tp_stored    = v
-                st["tp_level"] = v   # backfill state from sheet
+                tp_stored      = v
+                st["tp_level"] = v
         except (ValueError, TypeError):
             tp_stored = None
 
@@ -655,7 +564,6 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
         hit_kind   = None
         hit_price  = None
 
-        # Small tolerance (0.01%) to handle float comparison edge cases
         tp_threshold = tp_stored * 0.9999
 
         if last_close and last_close >= tp_threshold:
@@ -672,7 +580,7 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
             all_state[symbol] = init_symbol_state()
             all_state[symbol]["last_entry_ts"]   = prev_last
             all_state[symbol]["current_day_str"] = today_str
-            all_state[symbol]["tp_completed"]    = True   # block rest of day
+            all_state[symbol]["tp_completed"]    = True
             save_state(all_state)
             return
 
@@ -718,88 +626,50 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
         print(f"  [{symbol}] SKIP — open order on book")
         return
 
-    # ── 7. Daily compression filter ───────────────────────────────────────
-    if len(daily_completed) < 1:
-        print(f"  [{symbol}] SKIP — no completed daily candle")
-        save_state(all_state)
-        return
-
-    compression_ok, body_pct, range_pct = check_daily_compression(daily_completed)
-    print(f"  [{symbol}] Daily candles={len(daily_all)} body={body_pct}% range={range_pct}% "
-          f"compression={'OK' if compression_ok else 'FAIL'}")
-
-    if not compression_ok:
-        save_state(all_state)
-        return
-
-    # ── 7b. Near-bottom filter ────────────────────────────────────────────
-    current_price = float(candles_1m[-1]["close"])
-    bottom_ok, low_1000d, pct_above = check_near_bottom(daily_all, current_price)
-    print(f"  [{symbol}] 1000d_low={low_1000d} current={current_price} "
-          f"pct_above_low={pct_above}% bottom={'OK' if bottom_ok else 'FAIL'}")
-
-    if not bottom_ok:
-        save_state(all_state)
-        return
-
-    # ── 8. Last completed 1m candle ───────────────────────────────────────
-    curr   = candles_1m[-1]
-    curr_o = float(curr["open"]);  curr_h = float(curr["high"])
-    curr_l = float(curr["low"]);   curr_c = float(curr["close"])
+    # ── 7. Last completed 15m candle — dedup guard ────────────────────────
+    curr    = candles_15m[-1]
     curr_ts = int(curr["time"])
+    curr_c  = float(curr["close"])
 
     if curr_ts <= st.get("last_candle_ts", 0):
-        print(f"  [{symbol}] SKIP — candle already processed")
+        print(f"  [{symbol}] SKIP — 15m candle already processed")
         save_state(all_state)
         return
 
-    # ── 9. Rolling pump check ─────────────────────────────────────────────
-    pump_ok, best_move, best_window = check_rolling_pump(candles_1m)
+    # ── 8. Rising volume check (15m) ──────────────────────────────────────
+    vol_ok, avg_recent, avg_prev = check_volume_rising(candles_15m)
+    print(f"  [{symbol}] volume_rising={vol_ok} "
+          f"avg_recent={avg_recent} avg_prev={avg_prev}")
 
-    # ── 10. Candle quality filters ────────────────────────────────────────
-    cond_bullish = curr_c > curr_o
-
-    candle_range = curr_h - curr_l
-    cond_strong_close = (
-        candle_range > 0 and
-        (curr_c - curr_l) / candle_range >= STRONG_CLOSE_RATIO
-    )
-
-    volumes   = [float(c["volume"]) for c in candles_1m]
-    vol_ema20 = compute_ema(volumes, VOLUME_EMA_LEN)
-    cond_volume = vol_ema20 is not None and float(curr["volume"]) > vol_ema20
-
-    print(f"  [{symbol}] pump={pump_ok}({best_move}% over {best_window}) "
-          f"bullish={cond_bullish} strong_close={cond_strong_close} volume={cond_volume}")
+    # ── 9. 200 EMA breakout check (15m) ───────────────────────────────────
+    ema_ok, last_close_15m, ema200_val = check_above_ema200(candles_15m)
+    print(f"  [{symbol}] above_ema200={ema_ok} "
+          f"close={last_close_15m} ema200={ema200_val}")
 
     st["last_candle_ts"] = curr_ts
 
-    if not (pump_ok and cond_bullish and cond_strong_close and cond_volume):
+    if not (vol_ok and ema_ok):
         save_state(all_state)
         return
 
-    # ── 11. Compute entry / TP / SL ───────────────────────────────────────
-    # FIX: round entry first, then compute TP from rounded entry.
-    # This ensures the TP stored in state/sheet/exchange is exactly
-    # rounded_entry * (1 + TP_PCT/100) — no accumulated rounding error.
+    # ── 10. Compute entry / TP / SL ───────────────────────────────────────
     entry_price  = round(curr_c, precision)
     tp_price_val = round(entry_price * (1 + TP_PCT / 100), precision)
     sl_price_val = round(entry_price * (1 - SL_PCT / 100), precision)
 
     print(f"  [{symbol}] ENTRY — Entry={entry_price} "
-          f"TP={tp_price_val} SL={round(sl_price_val, precision)}")
+          f"TP={tp_price_val} SL={sl_price_val}")
 
-    # ── 12. Place order ───────────────────────────────────────────────────
+    # ── 11. Place order ───────────────────────────────────────────────────
     placed, confirmed_entry, confirmed_tp = place_long_order(
         symbol, entry_price, tp_price_val, sl_price_val, precision
     )
 
     if placed:
-        # Use the exact values returned from place_long_order (post-rounding + correction)
         st["in_position"] = True
         st["direction"]   = "long"
         st["entry_price"] = confirmed_entry
-        st["tp_level"]    = confirmed_tp          # exact value sent to exchange
+        st["tp_level"]    = confirmed_tp
         st["sl_price"]    = round(sl_price_val, precision)
         st["last_entry_ts"] = curr_ts
         update_sheet_tp(row, st["tp_level"])
@@ -817,25 +687,17 @@ consecutive_errors = 0
 MAX_CONSECUTIVE_ERRORS = 10
 
 send_telegram(
-    f"✅ <b>Compression Breakout Bot Started</b>\n"
+    f"✅ <b>ATL Breakout Bot Started</b>\n"
     f"━━━━━━━━━━━━━━━━━━\n"
-    f"📐 Strategy      : <code>1-Day Compression + Rolling 1H Breakout</code>\n"
+    f"📐 Strategy      : <code>ATL Coins — Rising Volume + 15m 200 EMA Breakout</code>\n"
     f"\n"
-    f"📊 Daily Filter  :\n"
-    f"  <code>Body  ≤ {MAX_DAILY_BODY_PCT}%  (yesterday open→close)</code>\n"
-    f"  <code>Range ≤ {MAX_DAILY_RANGE_PCT}%  (yesterday high−low)</code>\n"
+    f"📊 Entry Filters :\n"
+    f"  <code>① Rising avg volume (last {VOL_RISING_BARS} vs prev {VOL_RISING_BARS} 15m bars)</code>\n"
+    f"  <code>② 15m candle close > 200 EMA</code>\n"
     f"\n"
-    f"⚡ Pump Windows  :\n"
-    f"  <code>move_15m / 30m / 45m / 1h ≥ {MIN_PUMP_PCT}% (any triggers)</code>\n"
-    f"\n"
-    f"🔍 Quality Filters:\n"
-    f"  <code>① Bullish candle (close > open)</code>\n"
-    f"  <code>② Strong close (top {int(STRONG_CLOSE_RATIO*100)}% of range)</code>\n"
-    f"  <code>③ Volume > EMA({VOLUME_EMA_LEN}) of volume</code>\n"
-    f"\n"
-    f"🎯 TP            : <code>+{TP_PCT}% above entry close</code>\n"
-    f"🛑 SL            : <code>-{SL_PCT}% below entry (fixed)</code>\n"
-    f"⏱ Timeframe     : <code>1m</code>\n"
+    f"🎯 TP            : <code>+{TP_PCT}% above entry</code>\n"
+    f"🛑 SL            : <code>-{SL_PCT}% below entry</code>\n"
+    f"⏱ Timeframe     : <code>15m</code>\n"
     f"🔁 Scan          : <code>Every {SCAN_INTERVAL}s</code>\n"
     f"💰 Capital       : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
 )
