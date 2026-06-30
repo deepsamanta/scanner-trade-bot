@@ -33,11 +33,11 @@ BASE_URL = "https://api.coindcx.com"
 #   • Pass if last completed 15m candle close > EMA200
 #   Entry only when price has reclaimed the 200 EMA on 15m.
 #
-# STEP 3 — 4H VOLUME CONFIRMATION:
-#   • avg_volume_recent = mean(volume of last HTF_VOL_BARS 4H candles)
-#   • avg_volume_prev   = mean(volume of preceding HTF_VOL_BARS 4H candles)
-#   • Pass if avg_volume_recent > avg_volume_prev (rising volume on 4H)
-#   • AND latest closed 4H candle must be bullish (close > open)
+# STEP 3 — 1H VOLUME CONFIRMATION:
+#   • avg_volume_recent = mean(volume of last HTF_VOL_BARS 1H candles)
+#   • avg_volume_prev   = mean(volume of preceding HTF_VOL_BARS 1H candles)
+#   • Pass if avg_volume_recent > avg_volume_prev (rising volume on 1H)
+#   • AND latest closed 1H candle must be bullish (close > open)
 #   Confirms higher-timeframe volume is actually pushing price up.
 #
 # ENTRY  : Limit order at trigger 15m candle close (long only)
@@ -50,22 +50,22 @@ SL_PCT             = 5    # fixed SL below entry
 
 EMA200_LEN         = 200    # 200 EMA period on 15m candles
 VOL_RISING_BARS    = 10     # bars per window for volume comparison
-HTF_VOL_BARS       = 2      # bars per window for 4H volume comparison (last 4 4H candles total)
+HTF_VOL_BARS       = 2      # bars per window for 1H volume comparison (last 4 1H candles total)
 
 # Need at least 200 (EMA seed) + 20 (two windows of 10) + 5 buffer
 CANDLES_15M        = 230
 CANDLES_1M         = 5
-CANDLES_4H         = 10
+CANDLES_1H         = 10
 
 RESOLUTION_15M     = "15"
 RESOLUTION_1M      = "1"
 RESOLUTION_DAILY   = "1D"
-RESOLUTION_4H      = "240"
+RESOLUTION_1H      = "60"
 
 CANDLE_SECONDS_15M   = 900
 CANDLE_SECONDS_1M    = 60
 CANDLE_SECONDS_DAY   = 86400
-CANDLE_SECONDS_4H    = 14400
+CANDLE_SECONDS_1H    = 3600
 
 CANDLES_DAILY          = 1000
 SCAN_INTERVAL          = 120
@@ -381,28 +381,28 @@ def check_above_ema200(candles_15m):
     return last_close > ema200, round(last_close, 8), round(ema200, 8)
 
 
-def check_htf_volume_confirmation(candles_4h):
+def check_htf_volume_confirmation(candles_1h):
     """
-    4H confirmation filter:
-      • avg_volume_recent = mean(volume of last HTF_VOL_BARS 4H candles)
-      • avg_volume_prev   = mean(volume of preceding HTF_VOL_BARS 4H candles)
+    1H confirmation filter:
+      • avg_volume_recent = mean(volume of last HTF_VOL_BARS 1H candles)
+      • avg_volume_prev   = mean(volume of preceding HTF_VOL_BARS 1H candles)
       • Pass if avg_volume_recent > avg_volume_prev (rising volume)
-      • AND latest closed 4H candle must be bullish (close > open) —
+      • AND latest closed 1H candle must be bullish (close > open) —
         confirms rising volume is actually pushing price up, not down.
     Returns (passed: bool, avg_recent: float, avg_prev: float, is_bullish: bool).
     """
     needed = HTF_VOL_BARS * 2
-    if len(candles_4h) < needed:
+    if len(candles_1h) < needed:
         return False, 0.0, 0.0, False
 
-    recent_vols = [float(c["volume"]) for c in candles_4h[-HTF_VOL_BARS:]]
-    prev_vols   = [float(c["volume"]) for c in candles_4h[-(HTF_VOL_BARS * 2):-HTF_VOL_BARS]]
+    recent_vols = [float(c["volume"]) for c in candles_1h[-HTF_VOL_BARS:]]
+    prev_vols   = [float(c["volume"]) for c in candles_1h[-(HTF_VOL_BARS * 2):-HTF_VOL_BARS]]
 
     avg_recent = sum(recent_vols) / len(recent_vols)
     avg_prev   = sum(prev_vols)   / len(prev_vols)
     vol_rising = avg_recent > avg_prev
 
-    last       = candles_4h[-1]
+    last       = candles_1h[-1]
     is_bullish = float(last["close"]) > float(last["open"])
 
     return (vol_rising and is_bullish), round(avg_recent, 2), round(avg_prev, 2), is_bullish
@@ -684,12 +684,12 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
     print(f"  [{symbol}] above_ema200={ema_ok} "
           f"close={last_close_15m} ema200={ema200_val}")
 
-    # ── 9b. 4H volume confirmation ──────────────────────────────────────────
-    candles_4h = fetch_candles(symbol, CANDLES_4H, RESOLUTION_4H, CANDLE_SECONDS_4H)
-    if candles_4h and (now_ms - int(candles_4h[-1]["time"])) < CANDLE_SECONDS_4H * 1000:
-        candles_4h = candles_4h[:-1]
-    htf_ok, htf_avg_recent, htf_avg_prev, htf_bullish = check_htf_volume_confirmation(candles_4h)
-    print(f"  [{symbol}] htf_4h_ok={htf_ok} "
+    # ── 9b. 1H volume confirmation ──────────────────────────────────────────
+    candles_1h = fetch_candles(symbol, CANDLES_1H, RESOLUTION_1H, CANDLE_SECONDS_1H)
+    if candles_1h and (now_ms - int(candles_1h[-1]["time"])) < CANDLE_SECONDS_1H * 1000:
+        candles_1h = candles_1h[:-1]
+    htf_ok, htf_avg_recent, htf_avg_prev, htf_bullish = check_htf_volume_confirmation(candles_1h)
+    print(f"  [{symbol}] htf_1h_ok={htf_ok} "
           f"avg_recent={htf_avg_recent} avg_prev={htf_avg_prev} bullish={htf_bullish}")
 
     st["last_candle_ts"] = curr_ts
@@ -740,7 +740,7 @@ send_telegram(
     f"📊 Entry Filters :\n"
     f"  <code>① Rising avg volume (last {VOL_RISING_BARS} vs prev {VOL_RISING_BARS} 15m bars)</code>\n"
     f"  <code>② 15m candle close > 200 EMA</code>\n"
-    f"  <code>③ 4H volume rising (last {HTF_VOL_BARS} vs prev {HTF_VOL_BARS} bars) + latest 4H candle bullish</code>\n"
+    f"  <code>③ 1H volume rising (last {HTF_VOL_BARS} vs prev {HTF_VOL_BARS} bars) + latest 1H candle bullish</code>\n"
     f"\n"
     f"🎯 TP            : <code>+{TP_PCT}% above entry</code>\n"
     f"🛑 SL            : <code>-{SL_PCT}% below entry</code>\n"
