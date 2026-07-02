@@ -52,9 +52,11 @@ SL_PCT             = 5    # fixed SL below entry
 EMA200_LEN         = 200    # 200 EMA period on 15m candles
 VOL_RISING_BARS    = 10     # bars per window for volume comparison
 HTF_VOL_BARS       = 2      # bars per window for 1H volume comparison (last 4 1H candles total)
+PUMP_LOOKBACK_BARS = 60     # 15h in 15m candles (60 × 15m = 15h)
+PUMP_SKIP_PCT      = 10     # skip if coin already pumped this % in lookback window
 
 # Need at least 200 (EMA seed) + 20 (two windows of 10) + 5 buffer
-CANDLES_15M        = 230
+CANDLES_15M        = 270
 CANDLES_1M         = 5
 CANDLES_1H         = 10
 
@@ -384,6 +386,49 @@ def check_above_ema200(candles_15m):
     return (above and within_2pct), round(last_close, 8), round(ema200, 8)
 
 
+def check_pumped_after_ema_cross(candles_15m):
+    """
+    Looks back PUMP_LOOKBACK_BARS (60 = 15h) 15m candles.
+    Finds the most recent candle where price crossed above the 200 EMA
+    (prev close <= prev EMA, curr close > curr EMA).
+    From that cross close, if the highest high to now >= PUMP_SKIP_PCT% — skip.
+    """
+    if len(candles_15m) < EMA200_LEN + 1:
+        return False
+
+    closes = [float(c["close"]) for c in candles_15m]
+
+    # Build full EMA200 series; first EMA200_LEN slots are None (seed period)
+    k   = 2 / (EMA200_LEN + 1)
+    ema = sum(closes[:EMA200_LEN]) / EMA200_LEN
+    ema_series = [None] * EMA200_LEN
+    for v in closes[EMA200_LEN:]:
+        ema = v * k + ema * (1 - k)
+        ema_series.append(ema)
+
+    # Examine the last PUMP_LOOKBACK_BARS candles for a cross above EMA200
+    window_candles = candles_15m[-PUMP_LOOKBACK_BARS:]
+    window_ema     = ema_series[-PUMP_LOOKBACK_BARS:]
+
+    cross_idx   = None
+    cross_close = None
+    for i in range(1, len(window_candles)):
+        if window_ema[i - 1] is None or window_ema[i] is None:
+            continue
+        prev_c = float(window_candles[i - 1]["close"])
+        curr_c = float(window_candles[i]["close"])
+        if prev_c <= window_ema[i - 1] and curr_c > window_ema[i]:
+            cross_idx   = i          # keep scanning — take the most recent cross
+            cross_close = curr_c
+
+    if cross_idx is None:
+        return False
+
+    max_high = max(float(c["high"]) for c in window_candles[cross_idx:])
+    pump_pct = ((max_high - cross_close) / cross_close) * 100
+    return pump_pct >= PUMP_SKIP_PCT
+
+
 def check_htf_volume_confirmation(candles_1h):
     """
     1H confirmation filter:
@@ -687,6 +732,10 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
     print(f"  [{symbol}] above_ema200={ema_ok} "
           f"close={last_close_15m} ema200={ema200_val}")
 
+    # ── 9a. Already-pumped guard (15h lookback, 10% threshold) ────────────
+    pumped = check_pumped_after_ema_cross(candles_15m)
+    print(f"  [{symbol}] pumped_after_cross={pumped}")
+
     # ── 9b. 1H volume confirmation ──────────────────────────────────────────
     candles_1h = fetch_candles(symbol, CANDLES_1H, RESOLUTION_1H, CANDLE_SECONDS_1H)
     if candles_1h and (now_ms - int(candles_1h[-1]["time"])) < CANDLE_SECONDS_1H * 1000:
@@ -697,7 +746,7 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
 
     st["last_candle_ts"] = curr_ts
 
-    if not (vol_ok and ema_ok and htf_ok):
+    if not (vol_ok and ema_ok and htf_ok) or pumped:
         save_state(all_state)
         return
 
