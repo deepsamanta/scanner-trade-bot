@@ -28,10 +28,11 @@ BASE_URL = "https://api.coindcx.com"
 #   • Pass if avg_volume_recent > avg_volume_prev
 #   Ensures accumulation / increasing participation before entry.
 #
-# STEP 2 — 200 EMA BREAKOUT (15m candles):
+# STEP 2 — 200 EMA BREAKOUT + PROXIMITY (15m candles):
 #   • Compute 200-period EMA of closes on 15m candles
 #   • Pass if last completed 15m candle close > EMA200
-#   Entry only when price has reclaimed the 200 EMA on 15m.
+#   • AND close <= EMA200 * 1.02  (within 2% above EMA — not extended)
+#   Entry only when price has just reclaimed the 200 EMA on 15m.
 #
 # STEP 3 — 1H VOLUME CONFIRMATION:
 #   • avg_volume_recent = mean(volume of last HTF_VOL_BARS 1H candles)
@@ -378,7 +379,9 @@ def check_above_ema200(candles_15m):
         return False, 0.0, 0.0
 
     last_close = closes[-1]
-    return last_close > ema200, round(last_close, 8), round(ema200, 8)
+    above      = last_close > ema200
+    within_2pct = last_close <= ema200 * 1.02
+    return (above and within_2pct), round(last_close, 8), round(ema200, 8)
 
 
 def check_htf_volume_confirmation(candles_1h):
