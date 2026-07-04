@@ -52,7 +52,7 @@ SL_PCT             = 5    # fixed SL below entry
 EMA200_LEN         = 200    # 200 EMA period on 15m candles
 VOL_RISING_BARS    = 10     # bars per window for volume comparison
 HTF_VOL_BARS       = 2      # bars per window for 1H volume comparison (last 4 1H candles total)
-PUMP_LOOKBACK_BARS = 480     # 15h in 15m candles (60 × 15m = 15h)
+PUMP_LOOKBACK_BARS = 480    # 5 days in 15m candles (5 × 96 = 480)
 PUMP_SKIP_PCT      = 10     # skip if coin already pumped this % in lookback window
 
 # Need at least 200 (EMA seed) + 20 (two windows of 10) + 5 buffer
@@ -388,10 +388,11 @@ def check_above_ema200(candles_15m):
 
 def check_pumped_after_ema_cross(candles_15m):
     """
-    Looks back PUMP_LOOKBACK_BARS (60 = 15h) 15m candles.
-    Finds the most recent candle where price crossed above the 200 EMA
-    (prev close <= prev EMA, curr close > curr EMA).
-    From that cross close, if the highest high to now >= PUMP_SKIP_PCT% — skip.
+    Looks back PUMP_LOOKBACK_BARS 15m candles (5 days).
+    Finds ALL candles where price crossed above the 200 EMA.
+    For each cross, checks max high from that cross close to end of window.
+    If ANY cross led to a pump >= PUMP_SKIP_PCT% — skip the trade.
+    Catches dead cat bounces where the real move already happened earlier.
     """
     if len(candles_15m) < EMA200_LEN + 1:
         return False
@@ -406,27 +407,22 @@ def check_pumped_after_ema_cross(candles_15m):
         ema = v * k + ema * (1 - k)
         ema_series.append(ema)
 
-    # Examine the last PUMP_LOOKBACK_BARS candles for a cross above EMA200
     window_candles = candles_15m[-PUMP_LOOKBACK_BARS:]
     window_ema     = ema_series[-PUMP_LOOKBACK_BARS:]
 
-    cross_idx   = None
-    cross_close = None
     for i in range(1, len(window_candles)):
         if window_ema[i - 1] is None or window_ema[i] is None:
             continue
         prev_c = float(window_candles[i - 1]["close"])
         curr_c = float(window_candles[i]["close"])
         if prev_c <= window_ema[i - 1] and curr_c > window_ema[i]:
-            cross_idx   = i          # keep scanning — take the most recent cross
-            cross_close = curr_c
+            # Cross found — check max high from this cross to end of window
+            max_high = max(float(c["high"]) for c in window_candles[i:])
+            pump_pct = ((max_high - curr_c) / curr_c) * 100
+            if pump_pct >= PUMP_SKIP_PCT:
+                return True
 
-    if cross_idx is None:
-        return False
-
-    max_high = max(float(c["high"]) for c in window_candles[cross_idx:])
-    pump_pct = ((max_high - cross_close) / cross_close) * 100
-    return pump_pct >= PUMP_SKIP_PCT
+    return False
 
 
 def check_htf_volume_confirmation(candles_1h):
