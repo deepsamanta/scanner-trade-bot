@@ -52,11 +52,11 @@ SL_PCT             = 5    # fixed SL below entry
 EMA200_LEN         = 200    # 200 EMA period on 15m candles
 VOL_RISING_BARS    = 10     # bars per window for volume comparison
 HTF_VOL_BARS       = 2      # bars per window for 1H volume comparison (last 4 1H candles total)
-PUMP_LOOKBACK_BARS = 60     # 15h in 15m candles (60 × 15m = 15h)
+PUMP_LOOKBACK_BARS = 480     # 15h in 15m candles (60 × 15m = 15h)
 PUMP_SKIP_PCT      = 10     # skip if coin already pumped this % in lookback window
 
 # Need at least 200 (EMA seed) + 20 (two windows of 10) + 5 buffer
-CANDLES_15M        = 270
+CANDLES_15M        = 686
 CANDLES_1M         = 5
 CANDLES_1H         = 10
 
