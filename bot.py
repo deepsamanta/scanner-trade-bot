@@ -1,3 +1,4 @@
+
 import pandas as pd
 import requests
 import time
@@ -17,48 +18,40 @@ getcontext().prec = 28
 BASE_URL = "https://api.coindcx.com"
 
 # =============================================================================
-# STRATEGY: ATL Coins — Rising Volume + 15m 200 EMA Breakout
+# STRATEGY: Institutional Quant Trend + Volatility Expansion Engine
 #
-# Sheet contains only coins already at their all-time low (curated manually).
-# No ATL proximity check is done in the bot — the sheet IS the filter.
+# Scaled to handle the entire CoinDCX asset list cleanly by filtering out noise.
 #
-# STEP 1 — RISING VOLUME FILTER (15m candles):
-#   • avg_volume_recent = mean(volume of last VOL_RISING_BARS 15m candles)
-#   • avg_volume_prev   = mean(volume of preceding VOL_RISING_BARS 15m candles)
-#   • Pass if avg_volume_recent > avg_volume_prev
-#   Ensures accumulation / increasing participation before entry.
+# STEP 1 — PROGRAMMATIC LIQUIDITY FILTER:
+#   • Computes rolling 24-hour dollar volume dynamically.
+#   • Automatically discards assets with < MIN_DAILY_VOL_USDT to prevent slippage.
 #
-# STEP 2 — 200 EMA BREAKOUT + PROXIMITY (15m candles):
-#   • Compute 200-period EMA of closes on 15m candles
-#   • Pass if last completed 15m candle close > EMA200
-#   • AND close <= EMA200 * 1.02  (within 2% above EMA — not extended)
-#   Entry only when price has just reclaimed the 200 EMA on 15m.
+# STEP 2 — MULTI-TIMEFRAME TREND & MOMENTUM ALIGNMENT:
+#   • 1H HTF Trend Check: 1H Close must be above the 50 EMA.
+#   • 15m Momentum Check: 15m Fast EMA (20) must be above the Slow EMA (50).
+#   • Price Position: 15m Close must be above the 20 EMA.
 #
-# STEP 3 — 1H VOLUME CONFIRMATION:
-#   • avg_volume_recent = mean(volume of last HTF_VOL_BARS 1H candles)
-#   • avg_volume_prev   = mean(volume of preceding HTF_VOL_BARS 1H candles)
-#   • Pass if avg_volume_recent > avg_volume_prev (rising volume on 1H)
-#   • AND latest closed 1H candle must be bullish (close > open)
-#   Confirms higher-timeframe volume is actually pushing price up.
+# STEP 3 — INSTITUTIONAL VOLUME SURGE CONFIRMATION:
+#   • The trigger 15m candle's volume must be >= 1.5x the average volume of the
+#     preceding 20 candles. Ensures active institutional capital participation.
 #
-# ENTRY  : Limit order at trigger 15m candle close (long only)
-# TP     : rounded_entry * (1 + TP_PCT / 100)
-# SL     : rounded_entry * (1 - SL_PCT / 100)
+# STEP 4 — DYNAMIC RISK RISK SIZING (ATR):
+#   • Computes 14-period Average True Range (ATR) on the 15m timeframe.
+#   • Dynamic SL = Entry - (2.0 * ATR)
+#   • Dynamic TP = Entry + (4.0 * ATR) -> Structural 2:1 Reward-to-Risk ratio.
 # =============================================================================
 
-TP_PCT             = 10    # fixed TP above entry
-SL_PCT             = 5    # fixed SL below entry
+ATR_LEN             = 14      # Period for ATR calculation
+SL_ATR_MULT         = 2.0     # Distance multiplier for Stop Loss
+TP_ATR_MULT         = 4.0     # Distance multiplier for Take Profit (2:1 RRR)
+EMA_FAST            = 20      # Fast momentum window
+EMA_SLOW            = 50      # Trend structure window
+MIN_DAILY_VOL_USDT  = 500000  # $500k minimum 24h rolling volume filter
 
-EMA200_LEN         = 200    # 200 EMA period on 15m candles
-VOL_RISING_BARS    = 10     # bars per window for volume comparison
-HTF_VOL_BARS       = 2      # bars per window for 1H volume comparison (last 4 1H candles total)
-PUMP_LOOKBACK_BARS = 480    # 5 days in 15m candles (5 × 96 = 480)
-PUMP_SKIP_PCT      = 10     # skip if coin already pumped this % in lookback window
-
-# Need at least 200 (EMA seed) + 20 (two windows of 10) + 5 buffer
-CANDLES_15M        = 686
+# Allocation buffers for indicators
+CANDLES_15M        = 200
 CANDLES_1M         = 5
-CANDLES_1H         = 10
+CANDLES_1H         = 100
 
 RESOLUTION_15M     = "15"
 RESOLUTION_1M      = "1"
@@ -75,7 +68,7 @@ SCAN_INTERVAL          = 120
 REQUEST_TIMEOUT        = 15
 TELEGRAM_TIMEOUT       = 10
 GSHEET_REAUTH_INTERVAL = 45 * 60
-STATE_FILE             = "atl_bot_state.json"
+STATE_FILE             = "quant_bot_state.json"
 
 
 # =====================================================
@@ -333,123 +326,82 @@ def extract_tp_sl(obj):
 
 
 # =====================================================
-# STRATEGY FUNCTIONS
+# QUANT STRATEGY SYSTEM CORE FUNCTIONS
 # =====================================================
 
 def compute_ema(values, length):
-    """Standard EMA. Returns None if insufficient data."""
+    """Standard exponential moving average calculation loop."""
     if len(values) < length:
         return None
     k   = 2 / (length + 1)
-    ema = sum(values[:length]) / length   # SMA seed
+    ema = sum(values[:length]) / length   # SMA baseline seed
     for v in values[length:]:
         ema = v * k + ema * (1 - k)
     return ema
 
 
-def check_volume_rising(candles_15m):
+def compute_atr(candles, length=14):
+    """Computes standard rolling Average True Range (ATR) on raw candle series."""
+    if len(candles) < length + 1:
+        return 0.0
+    tr_values = []
+    for i in range(1, len(candles)):
+        high = float(candles[i]["high"])
+        low = float(candles[i]["low"])
+        prev_close = float(candles[i-1]["close"])
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        tr_values.append(tr)
+    if len(tr_values) < length:
+        return 0.0
+    return sum(tr_values[-length:]) / length
+
+
+def check_market_filters(symbol, candles_15m, candles_1h):
     """
-    Compares average volume of the last VOL_RISING_BARS candles
-    against the preceding VOL_RISING_BARS candles.
-    Returns (rising: bool, avg_recent: float, avg_prev: float).
+    Core Strategic Engine Filters.
+    Returns: (passed: bool, reason: str, est_daily_vol: float)
     """
-    needed = VOL_RISING_BARS * 2
-    if len(candles_15m) < needed:
-        return False, 0.0, 0.0
+    # Safeguard allocation lengths
+    if len(candles_15m) < max(EMA_SLOW, ATR_LEN + 1) or len(candles_1h) < EMA_SLOW:
+        return False, "Insufficient Candles Data", 0.0
 
-    recent_vols = [float(c["volume"]) for c in candles_15m[-VOL_RISING_BARS:]]
-    prev_vols   = [float(c["volume"]) for c in candles_15m[-(VOL_RISING_BARS * 2):-VOL_RISING_BARS]]
+    # 1. Stage 1: Liquidity Filter (Approximate 24h rolling volume window in USDT)
+    # 96 candles of 15m = 24 hours
+    recent_24h = candles_15m[-96:] if len(candles_15m) >= 96 else candles_15m
+    est_daily_volume = sum(float(c["volume"]) * float(c["close"]) for c in recent_24h)
+    if est_daily_volume < MIN_DAILY_VOL_USDT:
+        return False, f"Low Vol Filter (${round(est_daily_volume, 2)})", est_daily_volume
 
-    avg_recent = sum(recent_vols) / len(recent_vols)
-    avg_prev   = sum(prev_vols)   / len(prev_vols)
+    # 2. Stage 2: Higher Timeframe Trend Alignment (1H Structural Bullishness)
+    h1_closes = [float(c["close"]) for c in candles_1h]
+    h1_ema50 = compute_ema(h1_closes, EMA_SLOW)
+    if h1_ema50 is None or h1_closes[-1] <= h1_ema50:
+        return False, "Bearish 1H Structure (Close <= 1H EMA50)", est_daily_volume
 
-    return avg_recent > avg_prev, round(avg_recent, 2), round(avg_prev, 2)
+    # 3. Stage 3: Short Timeframe Momentum Convergence (15m Alignment)
+    m15_closes = [float(c["close"]) for c in candles_15m]
+    m15_ema20 = compute_ema(m15_closes, EMA_FAST)
+    m15_ema50 = compute_ema(m15_closes, EMA_SLOW)
+    
+    if m15_ema20 is None or m15_ema50 is None:
+        return False, "Processing Error Calculation", est_daily_volume
+        
+    if m15_ema20 <= m15_ema50:
+        return False, "Negative Momentum Alignment (15m EMA20 <= EMA50)", est_daily_volume
+        
+    if m15_closes[-1] <= m15_ema20:
+        return False, "Below Execution Base (15m Close <= EMA20)", est_daily_volume
 
+    # 4. Stage 4: Volume Surge Acceleration Check (Institutional Footprint)
+    m15_vols = [float(c["volume"]) for c in candles_15m]
+    # Calculate average volume of the previous 20 candles before the current closed trigger candle
+    avg_vol_20 = sum(m15_vols[-21:-1]) / 20 if len(m15_vols) >= 21 else sum(m15_vols[:-1]) / len(m15_vols[:-1])
+    current_vol = m15_vols[-1]
+    
+    if avg_vol_20 > 0 and current_vol < (avg_vol_20 * 1.5):
+        return False, f"Missing Vol Surge ({round(current_vol / avg_vol_20, 2)}x / 1.5x)", est_daily_volume
 
-def check_above_ema200(candles_15m):
-    """
-    Checks if the last completed 15m candle closed above the 200-period EMA.
-    Returns (above: bool, close: float, ema200: float).
-    """
-    if len(candles_15m) < EMA200_LEN:
-        return False, 0.0, 0.0
-
-    closes = [float(c["close"]) for c in candles_15m]
-    ema200 = compute_ema(closes, EMA200_LEN)
-
-    if ema200 is None:
-        return False, 0.0, 0.0
-
-    last_close = closes[-1]
-    above      = last_close > ema200
-    within_2pct = last_close <= ema200 * 1.02
-    return (above and within_2pct), round(last_close, 8), round(ema200, 8)
-
-
-def check_pumped_after_ema_cross(candles_15m):
-    """
-    Looks back PUMP_LOOKBACK_BARS 15m candles (5 days).
-    Finds ALL candles where price crossed above the 200 EMA.
-    For each cross, checks max high from that cross close to end of window.
-    If ANY cross led to a pump >= PUMP_SKIP_PCT% — skip the trade.
-    Catches dead cat bounces where the real move already happened earlier.
-    """
-    if len(candles_15m) < EMA200_LEN + 1:
-        return False
-
-    closes = [float(c["close"]) for c in candles_15m]
-
-    # Build full EMA200 series; first EMA200_LEN slots are None (seed period)
-    k   = 2 / (EMA200_LEN + 1)
-    ema = sum(closes[:EMA200_LEN]) / EMA200_LEN
-    ema_series = [None] * EMA200_LEN
-    for v in closes[EMA200_LEN:]:
-        ema = v * k + ema * (1 - k)
-        ema_series.append(ema)
-
-    window_candles = candles_15m[-PUMP_LOOKBACK_BARS:]
-    window_ema     = ema_series[-PUMP_LOOKBACK_BARS:]
-
-    for i in range(1, len(window_candles)):
-        if window_ema[i - 1] is None or window_ema[i] is None:
-            continue
-        prev_c = float(window_candles[i - 1]["close"])
-        curr_c = float(window_candles[i]["close"])
-        if prev_c <= window_ema[i - 1] and curr_c > window_ema[i]:
-            # Cross found — check max high from this cross to end of window
-            max_high = max(float(c["high"]) for c in window_candles[i:])
-            pump_pct = ((max_high - curr_c) / curr_c) * 100
-            if pump_pct >= PUMP_SKIP_PCT:
-                return True
-
-    return False
-
-
-def check_htf_volume_confirmation(candles_1h):
-    """
-    1H confirmation filter:
-      • avg_volume_recent = mean(volume of last HTF_VOL_BARS 1H candles)
-      • avg_volume_prev   = mean(volume of preceding HTF_VOL_BARS 1H candles)
-      • Pass if avg_volume_recent > avg_volume_prev (rising volume)
-      • AND latest closed 1H candle must be bullish (close > open) —
-        confirms rising volume is actually pushing price up, not down.
-    Returns (passed: bool, avg_recent: float, avg_prev: float, is_bullish: bool).
-    """
-    needed = HTF_VOL_BARS * 2
-    if len(candles_1h) < needed:
-        return False, 0.0, 0.0, False
-
-    recent_vols = [float(c["volume"]) for c in candles_1h[-HTF_VOL_BARS:]]
-    prev_vols   = [float(c["volume"]) for c in candles_1h[-(HTF_VOL_BARS * 2):-HTF_VOL_BARS]]
-
-    avg_recent = sum(recent_vols) / len(recent_vols)
-    avg_prev   = sum(prev_vols)   / len(prev_vols)
-    vol_rising = avg_recent > avg_prev
-
-    last       = candles_1h[-1]
-    is_bullish = float(last["close"]) > float(last["open"])
-
-    return (vol_rising and is_bullish), round(avg_recent, 2), round(avg_prev, 2), is_bullish
+    return True, "All Engine Strategies Confirmed", est_daily_volume
 
 
 # =====================================================
@@ -525,10 +477,6 @@ def place_long_order(symbol, entry_price, tp_price, sl_price, precision):
     sl     = round(sl_price,    precision)
     qty    = compute_qty(entry_price, symbol)
 
-    expected_tp = round(entry * (1 + TP_PCT / 100), precision)
-    if tp != expected_tp:
-        print(f"  [WARN] TP mismatch corrected: {tp} -> {expected_tp}")
-        tp = expected_tp
 
     tp_pct = round(((tp - entry) / entry) * 100, 2)
     sl_pct = round(((entry - sl) / entry) * 100, 2)
@@ -561,11 +509,11 @@ def place_long_order(symbol, entry_price, tp_price, sl_price, precision):
         return False, None, None
 
     send_telegram(
-        f"🟢 <b>NEW LONG (ATL BREAKOUT) — {symbol}</b>\n"
+        f"🟢 <b>NEW QUANT LONG POSITION — {symbol}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📍 Entry : <code>{entry}</code>\n"
-        f"🎯 TP    : <code>{tp}</code>  (+{tp_pct}%)\n"
-        f"🛑 SL    : <code>{sl}</code>  (-{sl_pct}%)\n"
+        f"🎯 TP (Dynamic ATR): <code>{tp}</code>  (+{tp_pct}%)\n"
+        f"🛑 SL (Dynamic ATR): <code>{sl}</code>  (-{sl_pct}%)\n"
         f"📦 Qty   : <code>{qty}</code>\n"
         f"💰 Margin: <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
     )
@@ -582,16 +530,17 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     # ── 1. Fetch candles ──────────────────────────────────────────────────
-    # 15m candles: used for both EMA200 and volume check (primary entry TF)
     candles_15m = fetch_candles(symbol, CANDLES_15M, RESOLUTION_15M, CANDLE_SECONDS_15M)
+    candles_1h  = fetch_candles(symbol, CANDLES_1H, RESOLUTION_1H, CANDLE_SECONDS_1H)
 
-    # Drop the in-progress 15m candle — only use fully closed bars
+    # Drop the in-progress candles — only use fully closed bars
     if candles_15m and (now_ms - int(candles_15m[-1]["time"])) < CANDLE_SECONDS_15M * 1000:
         candles_15m = candles_15m[:-1]
+    if candles_1h and (now_ms - int(candles_1h[-1]["time"])) < CANDLE_SECONDS_1H * 1000:
+        candles_1h = candles_1h[:-1]
 
-    min_15m = EMA200_LEN + VOL_RISING_BARS * 2
-    if len(candles_15m) < min_15m:
-        print(f"  [{symbol}] SKIP — insufficient 15m candles ({len(candles_15m)} < {min_15m})")
+    if not candles_15m or not candles_1h:
+        print(f"  [{symbol}] SKIP — Could not parse historical context timelines.")
         return
 
     # ── 2. State init / backfill ──────────────────────────────────────────
@@ -718,43 +667,38 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
         save_state(all_state)
         return
 
-    # ── 8. Rising volume check (15m) ──────────────────────────────────────
-    vol_ok, avg_recent, avg_prev = check_volume_rising(candles_15m)
-    print(f"  [{symbol}] volume_rising={vol_ok} "
-          f"avg_recent={avg_recent} avg_prev={avg_prev}")
-
-    # ── 9. 200 EMA breakout check (15m) ───────────────────────────────────
-    ema_ok, last_close_15m, ema200_val = check_above_ema200(candles_15m)
-    print(f"  [{symbol}] above_ema200={ema_ok} "
-          f"close={last_close_15m} ema200={ema200_val}")
-
-    # ── 9a. Already-pumped guard (15h lookback, 10% threshold) ────────────
-    pumped = check_pumped_after_ema_cross(candles_15m)
-    print(f"  [{symbol}] pumped_after_cross={pumped}")
-
-    # ── 9b. 1H volume confirmation ──────────────────────────────────────────
-    candles_1h = fetch_candles(symbol, CANDLES_1H, RESOLUTION_1H, CANDLE_SECONDS_1H)
-    if candles_1h and (now_ms - int(candles_1h[-1]["time"])) < CANDLE_SECONDS_1H * 1000:
-        candles_1h = candles_1h[:-1]
-    htf_ok, htf_avg_recent, htf_avg_prev, htf_bullish = check_htf_volume_confirmation(candles_1h)
-    print(f"  [{symbol}] htf_1h_ok={htf_ok} "
-          f"avg_recent={htf_avg_recent} avg_prev={htf_avg_prev} bullish={htf_bullish}")
+    # ── 8. Compute Engine Filters Execution ───────────────────────────────
+    passed, reason, daily_vol = check_market_filters(symbol, candles_15m, candles_1h)
+    print(f"  [{symbol}] Filter Status: {passed} | Reason: {reason} | Est 24h Vol: ${round(daily_vol, 2)}")
 
     st["last_candle_ts"] = curr_ts
 
-    if not (vol_ok and ema_ok and htf_ok) or pumped:
+    if not passed:
         save_state(all_state)
         return
 
-    # ── 10. Compute entry / TP / SL ───────────────────────────────────────
+    # ── 9. Compute Dynamic Entry / ATR TP / ATR SL ────────────────────────
     entry_price  = round(curr_c, precision)
-    tp_price_val = round(entry_price * (1 + TP_PCT / 100), precision)
-    sl_price_val = round(entry_price * (1 - SL_PCT / 100), precision)
+    
+    # Calculate True Volatility Space
+    atr_val = compute_atr(candles_15m, ATR_LEN)
+    if atr_val <= 0:
+        print(f"  [{symbol}] SKIP — Invalid ATR calculated (${atr_val})")
+        save_state(all_state)
+        return
 
-    print(f"  [{symbol}] ENTRY — Entry={entry_price} "
-          f"TP={tp_price_val} SL={sl_price_val}")
+    tp_price_val = round(entry_price + (atr_val * TP_ATR_MULT), precision)
+    sl_price_val = round(entry_price - (atr_val * SL_ATR_MULT), precision)
 
-    # ── 11. Place order ───────────────────────────────────────────────────
+    # Protection Check: Stop Loss must not cross under zero or equal entry
+    if sl_price_val <= 0 or sl_price_val >= entry_price or tp_price_val <= entry_price:
+        print(f"  [{symbol}] SKIP — Mathematical anomaly in dynamic metrics computation.")
+        save_state(all_state)
+        return
+
+    print(f"  [{symbol}] STRATEGY TRIGGER CONFIRMED — Entry={entry_price} TP={tp_price_val} SL={sl_price_val}")
+
+    # ── 10. Place order ───────────────────────────────────────────────────
     placed, confirmed_entry, confirmed_tp = place_long_order(
         symbol, entry_price, tp_price_val, sl_price_val, precision
     )
@@ -781,20 +725,22 @@ consecutive_errors = 0
 MAX_CONSECUTIVE_ERRORS = 10
 
 send_telegram(
-    f"✅ <b>ATL Breakout Bot Started</b>\n"
+    f"🚀 <b>Institutional Multi-Strategy Quant Bot Active</b>\n"
     f"━━━━━━━━━━━━━━━━━━\n"
-    f"📐 Strategy      : <code>ATL Coins — Rising Volume + 15m 200 EMA Breakout</code>\n"
+    f"📐 Strategy      : <code>Trend Structure + Momentum Alignment + Volatility Breakout</code>\n"
     f"\n"
-    f"📊 Entry Filters :\n"
-    f"  <code>① Rising avg volume (last {VOL_RISING_BARS} vs prev {VOL_RISING_BARS} 15m bars)</code>\n"
-    f"  <code>② 15m candle close > 200 EMA</code>\n"
-    f"  <code>③ 1H volume rising (last {HTF_VOL_BARS} vs prev {HTF_VOL_BARS} bars) + latest 1H candle bullish</code>\n"
+    f"📊 Quantitative Funnel Filters:\n"
+    f"  <code>① Liquidity  : Minimum ${MIN_DAILY_VOL_USDT} USDT Rolling 24h Volume</code>\n"
+    f"  <code>② HTF Trend  : 1H Close > 50 EMA Structural Support</code>\n"
+    f"  <code>③ Shorter TF : 15m Momentum (EMA 20 > EMA 50) + Close > EMA 20</code>\n"
+    f"  <code>④ Momentum   : Volume Surge Verification (Trigger Bar >= 1.5x of 20 MAs)</code>\n"
     f"\n"
-    f"🎯 TP            : <code>+{TP_PCT}% above entry</code>\n"
-    f"🛑 SL            : <code>-{SL_PCT}% below entry</code>\n"
-    f"⏱ Timeframe     : <code>15m</code>\n"
-    f"🔁 Scan          : <code>Every {SCAN_INTERVAL}s</code>\n"
-    f"💰 Capital       : <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
+    f"🎯 Dynamic Risk Setup (ATR Sized):\n"
+    f"  <code>• Take Profit : Entry + ({TP_ATR_MULT} × ATR)</code>\n"
+    f"  <code>• Stop Loss   : Entry - ({SL_ATR_MULT} × ATR) [2:1 Target Ratio]</code>\n"
+    f"⏱ Execution Base : <code>15m Timeframe</code>\n"
+    f"🔁 Scanning Delay: <code>Every {SCAN_INTERVAL} seconds</code>\n"
+    f"💰 Exposure      : <code>{CAPITAL_USDT} USDT Allocation × {LEVERAGE}x Leverage</code>"
 )
 
 while True:
@@ -833,7 +779,7 @@ while True:
                 print(f"  [{symbol}] ERROR: {e}")
                 continue
 
-        print(f"===== CYCLE {cycle} DONE — {symbols_checked} symbols =====")
+        print(f"===== CYCLE {cycle} DONE — {symbols_checked} symbols checked =====")
         save_state(state)
         time.sleep(SCAN_INTERVAL)
 
@@ -842,9 +788,10 @@ while True:
         print(f"BOT ERROR ({consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}): {e}")
         if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
             send_telegram(
-                f"🚨 <b>Bot Crashed</b>\n"
+                f"🚨 <b>Bot Infrastructure Crash Alert</b>\n"
                 f"❌ <code>{str(e)[:200]}</code>\n"
-                f"🔁 {consecutive_errors} consecutive errors"
+                f"🔁 {consecutive_errors} consecutive failures recorded."
             )
             raise SystemExit(1)
         time.sleep(60)
+
