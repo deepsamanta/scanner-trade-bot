@@ -46,7 +46,7 @@ SL_ATR_MULT         = 2.0     # Distance multiplier for Stop Loss
 TP_ATR_MULT         = 4.0     # Distance multiplier for Take Profit (2:1 RRR)
 EMA_FAST            = 20      # Fast momentum window
 EMA_SLOW            = 50      # Trend structure window
-MIN_DAILY_VOL_USDT  = 500000  # $500k minimum 24h rolling volume filter
+MIN_DAILY_VOL_USDT  = 2000000  # $2M minimum 24h rolling volume filter
 
 # Allocation buffers for indicators
 CANDLES_15M        = 200
