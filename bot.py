@@ -70,7 +70,7 @@ MIN_TP_PCT        = 4.0
 MIN_SL_PCT        = 2.0
 
 # ── Universe filter ───────────────────────────────────────────────────────────
-MIN_24H_VOL_USDT  = 2_000_000
+MIN_24H_VOL_USDT  = 3_000_000
 
 STABLECOINS = {
     "USDT","USDC","BUSD","DAI","TUSD","USDP","FRAX","UST","LUSD",
