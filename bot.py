@@ -1,4 +1,3 @@
-
 import pandas as pd
 import requests
 import time
@@ -18,57 +17,94 @@ getcontext().prec = 28
 BASE_URL = "https://api.coindcx.com"
 
 # =============================================================================
-# STRATEGY: Institutional Quant Trend + Volatility Expansion Engine
+# STRATEGY: Multi-Stage Momentum Breakout — All 430 Instruments
 #
-# Scaled to handle the entire CoinDCX asset list cleanly by filtering out noise.
+# Sheet now contains ALL CoinDCX USDT futures instruments (~430).
+# Each cycle the bot self-selects the best MAX_OPEN_TRADES setups via 4 stages:
 #
-# STEP 1 — PROGRAMMATIC LIQUIDITY FILTER:
-#   • Computes rolling 24-hour dollar volume dynamically.
-#   • Automatically discards assets with < MIN_DAILY_VOL_USDT to prevent slippage.
+# STAGE 1 — UNIVERSE FILTER  (cycle-level, single ticker API call):
+#   • 24h USD volume >= MIN_24H_VOL_USDT  — ensures meaningful liquidity
+#   • Exclude stablecoins and wrapped tokens
+#   • BTC daily regime gate: close > 200 EMA -> bull mode; else no new longs
+#   Typical result: 430 -> ~40-80 instruments.
 #
-# STEP 2 — MULTI-TIMEFRAME TREND & MOMENTUM ALIGNMENT:
-#   • 1H HTF Trend Check: 1H Close must be above the 50 EMA.
-#   • 15m Momentum Check: 15m Fast EMA (20) must be above the Slow EMA (50).
-#   • Price Position: 15m Close must be above the 20 EMA.
+# STAGE 2 — STRUCTURAL SCREEN  (per-symbol, candle-based):
+#   • 4H trend: last close > 50-period EMA on 4H  (trade only with trend)
+#   • 1H ATR compression: ATR(14) on 1H < ATR_COMPRESS_PCT% of price
+#       (tight coiling = energy building before the next move)
+#   • Not already extended: max high-low swing in last 5 days < PUMP_SKIP_PCT%
+#   Typical result: 40-80 -> ~10-20 instruments.
 #
-# STEP 3 — INSTITUTIONAL VOLUME SURGE CONFIRMATION:
-#   • The trigger 15m candle's volume must be >= 1.5x the average volume of the
-#     preceding 20 candles. Ensures active institutional capital participation.
+# STAGE 3 — ENTRY SIGNAL  (per-symbol, 15m candle-based):
+#   • 15m breakout: last closed candle close > max close of prior BREAKOUT_BARS bars
+#   • 15m volume spike: breakout candle volume >= VOL_SPIKE_MULT x avg of those bars
+#   • 1H HTF confirmation: latest 1H candle bullish AND 1H volume rising
+#   Typical result: 10-20 -> ~3-8 candidates.
 #
-# STEP 4 — DYNAMIC RISK RISK SIZING (ATR):
-#   • Computes 14-period Average True Range (ATR) on the 15m timeframe.
-#   • Dynamic SL = Entry - (2.0 * ATR)
-#   • Dynamic TP = Entry + (4.0 * ATR) -> Structural 2:1 Reward-to-Risk ratio.
+# STAGE 4 — RANKING  (cycle-level, all Stage-3 survivors scored):
+#   Weighted score across 4 factors:
+#     (1) Volume spike ratio    30 pts  — strength of the volume surge
+#     (2) Breakout strength     20 pts  — how far above the 20-bar high
+#     (3) 4H EMA50 proximity    20 pts  — prefer near EMA, not extended
+#     (4) 24h USD volume rank   30 pts  — prefer more liquid instruments
+#   -> Top MAX_OPEN_TRADES symbols get actual entries
+#      (slots = MAX_OPEN_TRADES - currently open positions).
+#
+# ENTRY  : Limit order at breakout 15m candle close
+# TP     : entry x (1 + TP_PCT / 100)
+# SL     : entry x (1 - SL_PCT / 100)
 # =============================================================================
 
-ATR_LEN             = 14      # Period for ATR calculation
-SL_ATR_MULT         = 2.0     # Distance multiplier for Stop Loss
-TP_ATR_MULT         = 4.0     # Distance multiplier for Take Profit (2:1 RRR)
-EMA_FAST            = 20      # Fast momentum window
-EMA_SLOW            = 50      # Trend structure window
-MIN_DAILY_VOL_USDT  = 2000000  # $2M minimum 24h rolling volume filter
+# ── Trade params ──────────────────────────────────────────────────────────────
+TP_PCT             = 8    # take-profit %
+SL_PCT             = 4    # stop-loss %
+MAX_OPEN_TRADES    = 5    # max concurrent positions
 
-# Allocation buffers for indicators
-CANDLES_15M        = 200
+# ── Universe filter ───────────────────────────────────────────────────────────
+MIN_24H_VOL_USDT   = 1_000_000   # $1M 24h USD volume floor
+
+STABLECOINS = {
+    "USDT", "USDC", "BUSD", "DAI", "TUSD", "USDP", "FRAX", "UST", "LUSD",
+    "FDUSD", "PYUSD", "USDD", "USDN", "GUSD", "SUSD", "CUSD", "USDX", "OUSD",
+}
+WRAPPED = {"WBTC", "WETH", "WBNB", "WMATIC", "WAVAX", "WSOL", "WFTM"}
+
+# ── Strategy params ───────────────────────────────────────────────────────────
+EMA200_DAILY_LEN   = 200   # BTC daily 200 EMA for regime gate
+EMA50_4H_LEN       = 50    # 4H trend filter
+ATR_LEN            = 14    # 1H ATR for compression check
+ATR_COMPRESS_PCT   = 2.5   # max ATR% for market to be "coiling"
+BREAKOUT_BARS      = 20    # 15m bars that define the prior high
+VOL_SPIKE_MULT     = 1.5   # breakout candle volume >= this x prior avg
+HTF_VOL_BARS       = 2     # bars per window for 1H volume comparison
+PUMP_LOOKBACK_BARS = 480   # 5 days in 15m candles
+PUMP_SKIP_PCT      = 15    # skip if 5-day swing >= this %
+
+# ── Candle counts ─────────────────────────────────────────────────────────────
+CANDLES_15M        = 550   # pump lookback (480) + BREAKOUT_BARS + buffer
+CANDLES_4H         = 65    # EMA50_4H_LEN + buffer
+CANDLES_1H         = 30    # ATR(14) + HTF vol (4) + buffer
 CANDLES_1M         = 5
-CANDLES_1H         = 100
 
+# ── Resolutions ───────────────────────────────────────────────────────────────
 RESOLUTION_15M     = "15"
 RESOLUTION_1M      = "1"
 RESOLUTION_DAILY   = "1D"
 RESOLUTION_1H      = "60"
+RESOLUTION_4H      = "240"
 
-CANDLE_SECONDS_15M   = 900
-CANDLE_SECONDS_1M    = 60
-CANDLE_SECONDS_DAY   = 86400
-CANDLE_SECONDS_1H    = 3600
+CANDLE_SECONDS_15M = 900
+CANDLE_SECONDS_1M  = 60
+CANDLE_SECONDS_DAY = 86400
+CANDLE_SECONDS_1H  = 3600
+CANDLE_SECONDS_4H  = 14400
 
-CANDLES_DAILY          = 1000
+# ── Timing ───────────────────────────────────────────────────────────────────
 SCAN_INTERVAL          = 120
 REQUEST_TIMEOUT        = 15
 TELEGRAM_TIMEOUT       = 10
 GSHEET_REAUTH_INTERVAL = 45 * 60
-STATE_FILE             = "quant_bot_state.json"
+STATE_FILE             = "atl_bot_state.json"
 
 
 # =====================================================
@@ -326,82 +362,233 @@ def extract_tp_sl(obj):
 
 
 # =====================================================
-# QUANT STRATEGY SYSTEM CORE FUNCTIONS
+# MATH UTILITIES
 # =====================================================
 
 def compute_ema(values, length):
-    """Standard exponential moving average calculation loop."""
+    """Standard EMA. Returns None if insufficient data."""
     if len(values) < length:
         return None
     k   = 2 / (length + 1)
-    ema = sum(values[:length]) / length   # SMA baseline seed
+    ema = sum(values[:length]) / length
     for v in values[length:]:
         ema = v * k + ema * (1 - k)
     return ema
 
 
-def compute_atr(candles, length=14):
-    """Computes standard rolling Average True Range (ATR) on raw candle series."""
+def compute_atr(candles, length):
+    """Wilder's ATR (RMA smoothing). Returns None if insufficient data."""
     if len(candles) < length + 1:
-        return 0.0
-    tr_values = []
+        return None
+    trs = []
     for i in range(1, len(candles)):
-        high = float(candles[i]["high"])
-        low = float(candles[i]["low"])
-        prev_close = float(candles[i-1]["close"])
-        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-        tr_values.append(tr)
-    if len(tr_values) < length:
-        return 0.0
-    return sum(tr_values[-length:]) / length
+        h  = float(candles[i]["high"])
+        l  = float(candles[i]["low"])
+        pc = float(candles[i - 1]["close"])
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    if len(trs) < length:
+        return None
+    atr = sum(trs[:length]) / length
+    for tr in trs[length:]:
+        atr = (atr * (length - 1) + tr) / length
+    return atr
 
 
-def check_market_filters(symbol, candles_15m, candles_1h):
+# =====================================================
+# STAGE 1 — UNIVERSE FILTER
+# =====================================================
+
+def fetch_24h_tickers():
+    """Single API call — returns all CoinDCX 24h ticker data keyed by market."""
+    try:
+        r = requests.get(BASE_URL + "/exchange/ticker", timeout=REQUEST_TIMEOUT)
+        if r.status_code != 200:
+            print(f"[TICKER] HTTP {r.status_code}")
+            return {}
+        data = r.json()
+        return {t["market"]: t for t in data} if isinstance(data, list) else {}
+    except Exception as e:
+        print(f"[TICKER] Error: {e}")
+        return {}
+
+
+def get_btc_regime():
     """
-    Core Strategic Engine Filters.
-    Returns: (passed: bool, reason: str, est_daily_vol: float)
+    Fetch BTC daily candles, compute 200 EMA.
+    Returns (is_bull: bool, close: float, ema200: float).
     """
-    # Safeguard allocation lengths
-    if len(candles_15m) < max(EMA_SLOW, ATR_LEN + 1) or len(candles_1h) < EMA_SLOW:
-        return False, "Insufficient Candles Data", 0.0
+    try:
+        candles = fetch_candles("BTCUSDT", 220, RESOLUTION_DAILY, CANDLE_SECONDS_DAY)
+        if len(candles) < EMA200_DAILY_LEN:
+            print(f"[BTC REGIME] Only {len(candles)} daily candles — defaulting to bull")
+            return True, 0.0, 0.0
+        closes = [float(c["close"]) for c in candles]
+        ema200 = compute_ema(closes, EMA200_DAILY_LEN)
+        is_bull = closes[-1] > ema200 if ema200 else True
+        print(f"[BTC REGIME] close={closes[-1]:,.2f}  EMA200={ema200:,.2f}  bull={is_bull}")
+        return is_bull, closes[-1], ema200 or 0.0
+    except Exception as e:
+        print(f"[BTC REGIME] Error: {e} — defaulting to bull")
+        return True, 0.0, 0.0
 
-    # 1. Stage 1: Liquidity Filter (Approximate 24h rolling volume window in USDT)
-    # 96 candles of 15m = 24 hours
-    recent_24h = candles_15m[-96:] if len(candles_15m) >= 96 else candles_15m
-    est_daily_volume = sum(float(c["volume"]) * float(c["close"]) for c in recent_24h)
-    if est_daily_volume < MIN_DAILY_VOL_USDT:
-        return False, f"Low Vol Filter (${round(est_daily_volume, 2)})", est_daily_volume
 
-    # 2. Stage 2: Higher Timeframe Trend Alignment (1H Structural Bullishness)
-    h1_closes = [float(c["close"]) for c in candles_1h]
-    h1_ema50 = compute_ema(h1_closes, EMA_SLOW)
-    if h1_ema50 is None or h1_closes[-1] <= h1_ema50:
-        return False, "Bearish 1H Structure (Close <= 1H EMA50)", est_daily_volume
+def is_excluded(symbol):
+    """True if stablecoin or wrapped token."""
+    base = symbol.replace("USDT", "")
+    return base in STABLECOINS or base in WRAPPED
 
-    # 3. Stage 3: Short Timeframe Momentum Convergence (15m Alignment)
-    m15_closes = [float(c["close"]) for c in candles_15m]
-    m15_ema20 = compute_ema(m15_closes, EMA_FAST)
-    m15_ema50 = compute_ema(m15_closes, EMA_SLOW)
-    
-    if m15_ema20 is None or m15_ema50 is None:
-        return False, "Processing Error Calculation", est_daily_volume
-        
-    if m15_ema20 <= m15_ema50:
-        return False, "Negative Momentum Alignment (15m EMA20 <= EMA50)", est_daily_volume
-        
-    if m15_closes[-1] <= m15_ema20:
-        return False, "Below Execution Base (15m Close <= EMA20)", est_daily_volume
 
-    # 4. Stage 4: Volume Surge Acceleration Check (Institutional Footprint)
-    m15_vols = [float(c["volume"]) for c in candles_15m]
-    # Calculate average volume of the previous 20 candles before the current closed trigger candle
-    avg_vol_20 = sum(m15_vols[-21:-1]) / 20 if len(m15_vols) >= 21 else sum(m15_vols[:-1]) / len(m15_vols[:-1])
-    current_vol = m15_vols[-1]
-    
-    if avg_vol_20 > 0 and current_vol < (avg_vol_20 * 1.5):
-        return False, f"Missing Vol Surge ({round(current_vol / avg_vol_20, 2)}x / 1.5x)", est_daily_volume
+def build_eligible_universe(all_symbols_rows, tickers):
+    """
+    Stage 1: apply volume floor + exclusions.
+    Returns list of (symbol, row, vol_24h_usd) sorted by volume desc.
+    """
+    eligible    = []
+    skip_stable = 0
+    skip_vol    = 0
 
-    return True, "All Engine Strategies Confirmed", est_daily_volume
+    for symbol, row in all_symbols_rows:
+        if is_excluded(symbol):
+            skip_stable += 1
+            continue
+        ticker = tickers.get(fut_pair(symbol), {})
+        try:
+            vol_usd = float(ticker.get("volume", 0)) * float(ticker.get("last_price", 0))
+        except (TypeError, ValueError):
+            vol_usd = 0.0
+
+        if vol_usd < MIN_24H_VOL_USDT:
+            skip_vol += 1
+            continue
+
+        eligible.append((symbol, row, vol_usd))
+
+    eligible.sort(key=lambda x: x[2], reverse=True)
+    print(
+        f"[UNIVERSE] {len(all_symbols_rows)} total  |  "
+        f"-{skip_stable} stables/wrapped  |  "
+        f"-{skip_vol} low-vol  |  "
+        f"-> {len(eligible)} eligible"
+    )
+    return eligible
+
+
+# =====================================================
+# STAGES 2-3 — STRUCTURAL SCREEN + ENTRY SIGNAL
+# =====================================================
+
+def check_4h_trend(candles_4h):
+    """
+    Stage 2a — Trend gate.
+    Last 4H close > 50-period EMA. Returns (ok, close, ema50).
+    """
+    if len(candles_4h) < EMA50_4H_LEN:
+        return False, 0.0, 0.0
+    closes = [float(c["close"]) for c in candles_4h]
+    ema50  = compute_ema(closes, EMA50_4H_LEN)
+    if ema50 is None:
+        return False, 0.0, 0.0
+    last_close = closes[-1]
+    return last_close > ema50, round(last_close, 8), round(ema50, 8)
+
+
+def check_1h_compression(candles_1h):
+    """
+    Stage 2b — ATR compression.
+    1H ATR(14) < ATR_COMPRESS_PCT% of price -> market is coiling.
+    Returns (ok, atr_pct, atr).
+    """
+    atr = compute_atr(candles_1h, ATR_LEN)
+    if atr is None:
+        return False, 0.0, 0.0
+    last_close = float(candles_1h[-1]["close"])
+    atr_pct    = (atr / last_close) * 100 if last_close > 0 else 999.0
+    return atr_pct < ATR_COMPRESS_PCT, round(atr_pct, 4), round(atr, 8)
+
+
+def check_not_extended(candles_15m):
+    """
+    Stage 2c — Pump guard.
+    If max high-to-low swing in last PUMP_LOOKBACK_BARS 15m candles
+    >= PUMP_SKIP_PCT%, the move already happened — skip.
+    Returns already_extended (bool).
+    """
+    if len(candles_15m) < PUMP_LOOKBACK_BARS:
+        return False
+    window = candles_15m[-PUMP_LOOKBACK_BARS:]
+    lo     = min(float(c["low"])  for c in window)
+    hi     = max(float(c["high"]) for c in window)
+    if lo <= 0:
+        return False
+    return ((hi - lo) / lo) * 100 >= PUMP_SKIP_PCT
+
+
+def check_15m_breakout(candles_15m):
+    """
+    Stage 3a — 15m breakout + volume spike.
+    • close[-1] > max(close of prior BREAKOUT_BARS candles)
+    • volume[-1] >= VOL_SPIKE_MULT x avg(volume of prior BREAKOUT_BARS candles)
+    Returns (ok, curr_close, prev_high, vol_ratio).
+    """
+    needed = BREAKOUT_BARS + 1
+    if len(candles_15m) < needed:
+        return False, 0.0, 0.0, 0.0
+
+    curr      = candles_15m[-1]
+    prev_bars = candles_15m[-(BREAKOUT_BARS + 1):-1]
+
+    curr_close = float(curr["close"])
+    curr_vol   = float(curr["volume"])
+    prev_high  = max(float(c["close"]) for c in prev_bars)
+    avg_vol    = sum(float(c["volume"]) for c in prev_bars) / len(prev_bars) if prev_bars else 0
+
+    vol_ratio  = curr_vol / avg_vol if avg_vol > 0 else 0.0
+    price_ok   = curr_close > prev_high
+    vol_ok     = vol_ratio >= VOL_SPIKE_MULT
+
+    return (price_ok and vol_ok), round(curr_close, 8), round(prev_high, 8), round(vol_ratio, 2)
+
+
+def check_1h_confirmation(candles_1h):
+    """
+    Stage 3b — 1H HTF confirmation.
+    • 1H volume rising (last HTF_VOL_BARS > preceding HTF_VOL_BARS)
+    • Latest closed 1H candle bullish (close > open)
+    Returns (ok, avg_recent, avg_prev, is_bullish).
+    """
+    needed = HTF_VOL_BARS * 2
+    if len(candles_1h) < needed:
+        return False, 0.0, 0.0, False
+
+    recent_vols = [float(c["volume"]) for c in candles_1h[-HTF_VOL_BARS:]]
+    prev_vols   = [float(c["volume"]) for c in candles_1h[-(HTF_VOL_BARS * 2):-HTF_VOL_BARS]]
+    avg_recent  = sum(recent_vols) / len(recent_vols)
+    avg_prev    = sum(prev_vols)   / len(prev_vols)
+    vol_rising  = avg_recent > avg_prev
+
+    last       = candles_1h[-1]
+    is_bullish = float(last["close"]) > float(last["open"])
+
+    return (vol_rising and is_bullish), round(avg_recent, 2), round(avg_prev, 2), is_bullish
+
+
+# =====================================================
+# STAGE 4 — SCORING
+# =====================================================
+
+def score_candidate(vol_ratio, breakout_strength_pct, ema_proximity_pct, vol_24h_usd):
+    """
+    0-100 scale. Weights:
+      (1) Volume spike ratio   30 pts  (5x vol = max)
+      (2) Breakout strength    20 pts  (5% above high = max)
+      (3) 4H EMA50 proximity   20 pts  (0% above EMA = max, 10%+ = 0)
+      (4) 24h USD liquidity    30 pts  ($50M+ = max)
+    """
+    s1 = min(vol_ratio / 5.0,               1.0) * 30
+    s2 = min(breakout_strength_pct / 5.0,   1.0) * 20
+    s3 = max(0, 1 - ema_proximity_pct / 10) * 20
+    s4 = min(vol_24h_usd / 50_000_000,      1.0) * 30
+    return round(s1 + s2 + s3 + s4, 4)
 
 
 # =====================================================
@@ -472,16 +659,19 @@ def compute_qty(entry_price, symbol):
 # =====================================================
 
 def place_long_order(symbol, entry_price, tp_price, sl_price, precision):
-    entry  = round(entry_price, precision)
-    tp     = round(tp_price,    precision)
-    sl     = round(sl_price,    precision)
-    qty    = compute_qty(entry_price, symbol)
+    entry = round(entry_price, precision)
+    tp    = round(tp_price,    precision)
+    sl    = round(sl_price,    precision)
+    qty   = compute_qty(entry_price, symbol)
 
+    expected_tp = round(entry * (1 + TP_PCT / 100), precision)
+    if tp != expected_tp:
+        print(f"  [WARN] TP mismatch corrected: {tp} -> {expected_tp}")
+        tp = expected_tp
 
     tp_pct = round(((tp - entry) / entry) * 100, 2)
     sl_pct = round(((entry - sl) / entry) * 100, 2)
-
-    print(f"  [LONG] Entry={entry} TP={tp}(+{tp_pct}%) SL={sl}(-{sl_pct}%) Qty={qty}")
+    print(f"  [LONG] Entry={entry}  TP={tp}(+{tp_pct}%)  SL={sl}(-{sl_pct}%)  Qty={qty}")
 
     body = {
         "timestamp": int(time.time() * 1000),
@@ -509,47 +699,85 @@ def place_long_order(symbol, entry_price, tp_price, sl_price, precision):
         return False, None, None
 
     send_telegram(
-        f"🟢 <b>NEW QUANT LONG POSITION — {symbol}</b>\n"
+        f"🟢 <b>NEW LONG (MOMENTUM BREAKOUT) — {symbol}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📍 Entry : <code>{entry}</code>\n"
-        f"🎯 TP (Dynamic ATR): <code>{tp}</code>  (+{tp_pct}%)\n"
-        f"🛑 SL (Dynamic ATR): <code>{sl}</code>  (-{sl_pct}%)\n"
+        f"🎯 TP    : <code>{tp}</code>  (+{tp_pct}%)\n"
+        f"🛑 SL    : <code>{sl}</code>  (-{sl_pct}%)\n"
         f"📦 Qty   : <code>{qty}</code>\n"
-        f"💰 Margin: <code>{CAPITAL_USDT} USDT × {LEVERAGE}x</code>"
+        f"💰 Margin: <code>{CAPITAL_USDT} USDT x {LEVERAGE}x</code>"
     )
     return True, entry, tp
+
+
+# =====================================================
+# EXECUTE ENTRY — called only for top-ranked candidates
+# =====================================================
+
+def execute_entry(cand, all_state):
+    """
+    Place order for a pre-qualified, top-ranked candidate and update state.
+    cand keys: symbol, row, entry_price, tp_price, sl_price, precision, curr_ts
+    """
+    symbol      = cand["symbol"]
+    row         = cand["row"]
+    entry_price = cand["entry_price"]
+    tp_price    = cand["tp_price"]
+    sl_price    = cand["sl_price"]
+    precision   = cand["precision"]
+    curr_ts     = cand["curr_ts"]
+
+    st = all_state.setdefault(symbol, init_symbol_state())
+
+    placed, confirmed_entry, confirmed_tp = place_long_order(
+        symbol, entry_price, tp_price, sl_price, precision
+    )
+
+    if placed:
+        st["in_position"]   = True
+        st["direction"]     = "long"
+        st["entry_price"]   = confirmed_entry
+        st["tp_level"]      = confirmed_tp
+        st["sl_price"]      = round(sl_price, precision)
+        st["last_entry_ts"] = curr_ts
+        update_sheet_tp(row, st["tp_level"])
+        update_sheet_sl(row, st["sl_price"])
+
+    save_state(all_state)
 
 
 # =====================================================
 # MAIN PER-SYMBOL LOGIC
 # =====================================================
 
-def check_and_trade(symbol, row, df, all_state, global_positions, global_orders):
+def check_and_trade(symbol, row, df, all_state, global_positions, global_orders, vol_24h=0.0):
+    """
+    Runs ALL state management (TP hit, position reconciliation, day reset, dedup).
+    If symbol qualifies for a new entry, returns a candidate dict for ranking.
+    Does NOT place orders — execute_entry() handles that after ranking.
+    Returns: candidate dict | None
+    """
     now_ms    = int(time.time() * 1000)
     pair_name = fut_pair(symbol)
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    # ── 1. Fetch candles ──────────────────────────────────────────────────
+    # ── 1. Fetch 15m candles ──────────────────────────────────────────────────
     candles_15m = fetch_candles(symbol, CANDLES_15M, RESOLUTION_15M, CANDLE_SECONDS_15M)
-    candles_1h  = fetch_candles(symbol, CANDLES_1H, RESOLUTION_1H, CANDLE_SECONDS_1H)
-
-    # Drop the in-progress candles — only use fully closed bars
     if candles_15m and (now_ms - int(candles_15m[-1]["time"])) < CANDLE_SECONDS_15M * 1000:
         candles_15m = candles_15m[:-1]
-    if candles_1h and (now_ms - int(candles_1h[-1]["time"])) < CANDLE_SECONDS_1H * 1000:
-        candles_1h = candles_1h[:-1]
 
-    if not candles_15m or not candles_1h:
-        print(f"  [{symbol}] SKIP — Could not parse historical context timelines.")
-        return
+    min_15m = PUMP_LOOKBACK_BARS + BREAKOUT_BARS + 5
+    if len(candles_15m) < min_15m:
+        print(f"  [{symbol}] SKIP — insufficient 15m candles ({len(candles_15m)} < {min_15m})")
+        return None
 
-    # ── 2. State init / backfill ──────────────────────────────────────────
+    # ── 2. State init / backfill ──────────────────────────────────────────────
     st = all_state.setdefault(symbol, init_symbol_state())
     for k, v in init_symbol_state().items():
         if k not in st:
             st[k] = v
 
-    # ── 3. New-day reset ──────────────────────────────────────────────────
+    # ── 3. New-day reset ──────────────────────────────────────────────────────
     if st["current_day_str"] != today_str:
         print(f"  [{symbol}] NEW DAY — resetting daily state")
         preserved = {k: st[k] for k in
@@ -562,12 +790,11 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
     st["current_day_str"] = today_str
     precision = get_precision(float(candles_15m[-1]["close"]))
 
-    # ── 4. TP COMPLETED check ─────────────────────────────────────────────
+    # ── 4. TP COMPLETED check ─────────────────────────────────────────────────
     tp_raw = str(df.iloc[row, 1]).strip() if df.shape[1] > 1 else ""
 
     if tp_raw.upper() == "TP COMPLETED" or st.get("tp_completed") is True:
-        print(f"  [{symbol}] SKIP — TP COMPLETED (sheet={tp_raw.upper() == 'TP COMPLETED'} "
-              f"state={st.get('tp_completed')})")
+        print(f"  [{symbol}] SKIP — TP COMPLETED")
         if st.get("in_position"):
             prev_last = st.get("last_entry_ts", 0)
             all_state[symbol] = init_symbol_state()
@@ -575,9 +802,9 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
             all_state[symbol]["current_day_str"] = today_str
             all_state[symbol]["tp_completed"]    = True
             save_state(all_state)
-        return
+        return None
 
-    # ── 5. Resolve TP target from state then sheet fallback ───────────────
+    # ── 5. Resolve TP target from state then sheet fallback ───────────────────
     tp_stored = st.get("tp_level")
     if not tp_stored:
         try:
@@ -613,9 +840,9 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
             all_state[symbol]["current_day_str"] = today_str
             all_state[symbol]["tp_completed"]    = True
             save_state(all_state)
-            return
+            return None
 
-    # ── 6. Reconcile with exchange ────────────────────────────────────────
+    # ── 6. Reconcile with exchange ────────────────────────────────────────────
     position = next((p for p in global_positions if p.get("pair") == pair_name), None)
 
     if position is not None:
@@ -642,7 +869,7 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
             update_sheet_sl(row, st["sl_price"])
 
         save_state(all_state)
-        return
+        return None   # already in position — no new entry
 
     if st.get("in_position"):
         print(f"  [{symbol}] POSITION CLOSED — resetting state")
@@ -655,65 +882,83 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
     has_order = any(o.get("pair") == pair_name for o in global_orders)
     if has_order:
         print(f"  [{symbol}] SKIP — open order on book")
-        return
+        return None
 
-    # ── 7. Last completed 15m candle — dedup guard ────────────────────────
+    # ── 7. Candle dedup guard ─────────────────────────────────────────────────
     curr    = candles_15m[-1]
     curr_ts = int(curr["time"])
     curr_c  = float(curr["close"])
 
     if curr_ts <= st.get("last_candle_ts", 0):
-        print(f"  [{symbol}] SKIP — 15m candle already processed")
+        print(f"  [{symbol}] SKIP — candle already processed")
         save_state(all_state)
-        return
+        return None
 
-    # ── 8. Compute Engine Filters Execution ───────────────────────────────
-    passed, reason, daily_vol = check_market_filters(symbol, candles_15m, candles_1h)
-    print(f"  [{symbol}] Filter Status: {passed} | Reason: {reason} | Est 24h Vol: ${round(daily_vol, 2)}")
+    # ── 8. Fetch 4H and 1H candles ───────────────────────────────────────────
+    candles_4h = fetch_candles(symbol, CANDLES_4H, RESOLUTION_4H, CANDLE_SECONDS_4H)
+    candles_1h = fetch_candles(symbol, CANDLES_1H, RESOLUTION_1H, CANDLE_SECONDS_1H)
+
+    if candles_4h and (now_ms - int(candles_4h[-1]["time"])) < CANDLE_SECONDS_4H * 1000:
+        candles_4h = candles_4h[:-1]
+    if candles_1h and (now_ms - int(candles_1h[-1]["time"])) < CANDLE_SECONDS_1H * 1000:
+        candles_1h = candles_1h[:-1]
+
+    # ── 9. STAGE 2 — Structural screen ───────────────────────────────────────
+    trend_ok, close_4h, ema50_4h = check_4h_trend(candles_4h)
+    print(f"  [{symbol}] 4h_trend={trend_ok}  close={close_4h}  ema50={ema50_4h}")
+
+    compress_ok, atr_pct, _ = check_1h_compression(candles_1h)
+    print(f"  [{symbol}] compression={compress_ok}  atr_pct={atr_pct}%")
+
+    extended = check_not_extended(candles_15m)
+    print(f"  [{symbol}] already_extended={extended}")
+
+    if not trend_ok or not compress_ok or extended:
+        st["last_candle_ts"] = curr_ts
+        save_state(all_state)
+        return None
+
+    # ── 10. STAGE 3 — Entry signal ────────────────────────────────────────────
+    bo_ok, bo_close, prev_high, vol_ratio = check_15m_breakout(candles_15m)
+    print(f"  [{symbol}] breakout={bo_ok}  close={bo_close}  "
+          f"prev_high={prev_high}  vol_ratio={vol_ratio}x")
+
+    htf_ok, htf_recent, htf_prev, htf_bull = check_1h_confirmation(candles_1h)
+    print(f"  [{symbol}] 1h_confirm={htf_ok}  "
+          f"avg_recent={htf_recent}  avg_prev={htf_prev}  bullish={htf_bull}")
 
     st["last_candle_ts"] = curr_ts
 
-    if not passed:
+    if not bo_ok or not htf_ok:
         save_state(all_state)
-        return
+        return None
 
-    # ── 9. Compute Dynamic Entry / ATR TP / ATR SL ────────────────────────
+    # ── 11. STAGE 4 — Build candidate dict with score ─────────────────────────
+    breakout_pct = ((bo_close - prev_high) / prev_high * 100) if prev_high > 0 else 0.0
+    ema_prox_pct = ((bo_close / ema50_4h  - 1) * 100)        if ema50_4h  > 0 else 0.0
+
     entry_price  = round(curr_c, precision)
-    
-    # Calculate True Volatility Space
-    atr_val = compute_atr(candles_15m, ATR_LEN)
-    if atr_val <= 0:
-        print(f"  [{symbol}] SKIP — Invalid ATR calculated (${atr_val})")
-        save_state(all_state)
-        return
+    tp_price     = round(entry_price * (1 + TP_PCT / 100), precision)
+    sl_price     = round(entry_price * (1 - SL_PCT / 100), precision)
 
-    tp_price_val = round(entry_price + (atr_val * TP_ATR_MULT), precision)
-    sl_price_val = round(entry_price - (atr_val * SL_ATR_MULT), precision)
+    candidate_score = score_candidate(vol_ratio, breakout_pct, ema_prox_pct, vol_24h)
 
-    # Protection Check: Stop Loss must not cross under zero or equal entry
-    if sl_price_val <= 0 or sl_price_val >= entry_price or tp_price_val <= entry_price:
-        print(f"  [{symbol}] SKIP — Mathematical anomaly in dynamic metrics computation.")
-        save_state(all_state)
-        return
+    print(f"  [{symbol}] CANDIDATE  score={candidate_score}  "
+          f"entry={entry_price}  tp={tp_price}  sl={sl_price}")
 
-    print(f"  [{symbol}] STRATEGY TRIGGER CONFIRMED — Entry={entry_price} TP={tp_price_val} SL={sl_price_val}")
-
-    # ── 10. Place order ───────────────────────────────────────────────────
-    placed, confirmed_entry, confirmed_tp = place_long_order(
-        symbol, entry_price, tp_price_val, sl_price_val, precision
-    )
-
-    if placed:
-        st["in_position"] = True
-        st["direction"]   = "long"
-        st["entry_price"] = confirmed_entry
-        st["tp_level"]    = confirmed_tp
-        st["sl_price"]    = round(sl_price_val, precision)
-        st["last_entry_ts"] = curr_ts
-        update_sheet_tp(row, st["tp_level"])
-        update_sheet_sl(row, st["sl_price"])
-
-    save_state(all_state)
+    return {
+        "symbol":       symbol,
+        "row":          row,
+        "score":        candidate_score,
+        "entry_price":  entry_price,
+        "tp_price":     tp_price,
+        "sl_price":     sl_price,
+        "precision":    precision,
+        "curr_ts":      curr_ts,
+        "vol_ratio":    vol_ratio,
+        "breakout_pct": round(breakout_pct, 4),
+        "ema_prox_pct": round(ema_prox_pct, 4),
+    }
 
 
 # =====================================================
@@ -725,22 +970,28 @@ consecutive_errors = 0
 MAX_CONSECUTIVE_ERRORS = 10
 
 send_telegram(
-    f"🚀 <b>Institutional Multi-Strategy Quant Bot Active</b>\n"
+    f"✅ <b>Momentum Breakout Bot Started</b>\n"
     f"━━━━━━━━━━━━━━━━━━\n"
-    f"📐 Strategy      : <code>Trend Structure + Momentum Alignment + Volatility Breakout</code>\n"
+    f"📐 Strategy : <code>Multi-Stage Momentum Breakout (All Instruments)</code>\n"
     f"\n"
-    f"📊 Quantitative Funnel Filters:\n"
-    f"  <code>① Liquidity  : Minimum ${MIN_DAILY_VOL_USDT} USDT Rolling 24h Volume</code>\n"
-    f"  <code>② HTF Trend  : 1H Close > 50 EMA Structural Support</code>\n"
-    f"  <code>③ Shorter TF : 15m Momentum (EMA 20 > EMA 50) + Close > EMA 20</code>\n"
-    f"  <code>④ Momentum   : Volume Surge Verification (Trigger Bar >= 1.5x of 20 MAs)</code>\n"
+    f"🔍 Stage 1 (Universe):\n"
+    f"  <code>• 24h vol &gt;= ${MIN_24H_VOL_USDT:,} USD</code>\n"
+    f"  <code>• Exclude stables / wrapped tokens</code>\n"
+    f"  <code>• BTC daily close &gt; 200 EMA (bull regime)</code>\n"
     f"\n"
-    f"🎯 Dynamic Risk Setup (ATR Sized):\n"
-    f"  <code>• Take Profit : Entry + ({TP_ATR_MULT} × ATR)</code>\n"
-    f"  <code>• Stop Loss   : Entry - ({SL_ATR_MULT} × ATR) [2:1 Target Ratio]</code>\n"
-    f"⏱ Execution Base : <code>15m Timeframe</code>\n"
-    f"🔁 Scanning Delay: <code>Every {SCAN_INTERVAL} seconds</code>\n"
-    f"💰 Exposure      : <code>{CAPITAL_USDT} USDT Allocation × {LEVERAGE}x Leverage</code>"
+    f"🔍 Stage 2 (Structure):\n"
+    f"  <code>• 4H close &gt; 50 EMA</code>\n"
+    f"  <code>• 1H ATR(14) &lt; {ATR_COMPRESS_PCT}% (compression)</code>\n"
+    f"  <code>• 5-day swing &lt; {PUMP_SKIP_PCT}% (not extended)</code>\n"
+    f"\n"
+    f"🔍 Stage 3 (Signal):\n"
+    f"  <code>• 15m close &gt; {BREAKOUT_BARS}-bar high + {VOL_SPIKE_MULT}x vol spike</code>\n"
+    f"  <code>• 1H bullish candle + rising volume</code>\n"
+    f"\n"
+    f"📊 Stage 4 (Rank): <code>Top {MAX_OPEN_TRADES} by weighted score</code>\n"
+    f"🎯 TP : <code>+{TP_PCT}%</code>  |  🛑 SL: <code>-{SL_PCT}%</code>\n"
+    f"🔁 Scan: <code>Every {SCAN_INTERVAL}s</code>  |  "
+    f"💰 <code>{CAPITAL_USDT} USDT x {LEVERAGE}x</code>"
 )
 
 while True:
@@ -763,23 +1014,98 @@ while True:
         cycle += 1
         consecutive_errors = 0
 
-        print(f"\n===== CYCLE {cycle} | {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')} "
-              f"| positions={len(global_positions)} orders={len(global_orders)} =====")
+        print(f"\n===== CYCLE {cycle} | "
+              f"{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')} | "
+              f"positions={len(global_positions)} orders={len(global_orders)} =====")
 
-        symbols_checked = 0
+        # ── Build full symbol list from sheet ────────────────────────────────
+        all_symbols_rows = []
+        row_index        = {}   # symbol -> sheet row (for force-include)
         for row in range(len(df)):
             symbol = normalize_symbol(df.iloc[row, 0])
-            if not symbol:
-                continue
-            symbols_checked += 1
-            print(f"--- Row {row + 1}: {symbol} ---")
+            if symbol:
+                all_symbols_rows.append((symbol, row))
+                row_index[symbol] = row
+
+        # ── STAGE 1: BTC regime + universe filter ────────────────────────────
+        btc_bull, btc_close, btc_ema200 = get_btc_regime()
+        if not btc_bull:
+            print(f"[REGIME] Bear market (BTC {btc_close:,.2f} < EMA200 {btc_ema200:,.2f}) "
+                  f"— no new longs this cycle")
+
+        tickers  = fetch_24h_tickers()
+        eligible = build_eligible_universe(all_symbols_rows, tickers) if btc_bull else []
+
+        # Force-include symbols with active tracked state so TP monitoring and
+        # reconciliation still run even if the symbol was filtered by Stage 1
+        # (e.g. volume dropped, bear regime kicked in after entry).
+        # vol_24h=0 means they score 0 and will never win the ranking for new entries.
+        eligible_set = {s for s, _, _ in eligible}
+        for sym, sym_st in state.items():
+            if (sym_st.get("in_position") or sym_st.get("tp_level")) and sym not in eligible_set:
+                r = row_index.get(sym)
+                if r is not None:
+                    eligible.append((sym, r, 0.0))
+                    eligible_set.add(sym)
+                    print(f"[FORCE-INCLUDE] {sym} — active state, monitoring only")
+
+        # ── Slot calculation ─────────────────────────────────────────────────
+        active_count    = len(global_positions)
+        slots_available = max(0, MAX_OPEN_TRADES - active_count)
+        print(f"[SLOTS] {active_count} open / {MAX_OPEN_TRADES} max -> {slots_available} slot(s)")
+
+        # ── STAGES 2-3: Score each eligible symbol, collect candidates ───────
+        candidates = []
+
+        for symbol, row, vol_24h in eligible:
+            print(f"--- {symbol} (24h_vol=${vol_24h:,.0f}) ---")
             try:
-                check_and_trade(symbol, row, df, state, global_positions, global_orders)
+                cand = check_and_trade(
+                    symbol, row, df, state, global_positions, global_orders, vol_24h
+                )
+                if cand:
+                    candidates.append(cand)
             except Exception as e:
                 print(f"  [{symbol}] ERROR: {e}")
                 continue
 
-        print(f"===== CYCLE {cycle} DONE — {symbols_checked} symbols checked =====")
+        # ── STAGE 4: Rank and execute top N ──────────────────────────────────
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+
+        print(f"\n[RANKING] {len(candidates)} candidate(s) | {slots_available} slot(s) available")
+        for i, c in enumerate(candidates):
+            tag = f"EXECUTE #{i + 1}" if i < slots_available else "SKIP"
+            print(f"  [{tag}] {c['symbol']}  score={c['score']}  "
+                  f"vol_ratio={c['vol_ratio']}x  "
+                  f"breakout={c['breakout_pct']}%  "
+                  f"ema_prox={c['ema_prox_pct']}%")
+
+        for cand in candidates[:slots_available]:
+            try:
+                execute_entry(cand, state)
+            except Exception as e:
+                print(f"  [{cand['symbol']}] ENTRY ERROR: {e}")
+
+        # ── Telegram cycle summary (only when there are candidates) ───────────
+        if candidates:
+            executed = candidates[:slots_available]
+            skipped  = candidates[slots_available:]
+            msg = (
+                f"📊 <b>Cycle {cycle} — Ranking Summary</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🔍 Eligible : <code>{len(eligible)}</code>  "
+                f"✅ Qualified: <code>{len(candidates)}</code>\n"
+                f"🟢 Executed : <code>{len(executed)}</code>\n"
+            )
+            for c in executed:
+                msg += (f"  • {c['symbol']}  "
+                        f"score={c['score']}  entry={c['entry_price']}\n")
+            if skipped:
+                msg += (f"⏭ Skipped : "
+                        f"<code>{', '.join(c['symbol'] for c in skipped)}</code>")
+            send_telegram(msg)
+
+        print(f"===== CYCLE {cycle} DONE — {len(eligible)} symbols scanned =====")
         save_state(state)
         time.sleep(SCAN_INTERVAL)
 
@@ -788,10 +1114,9 @@ while True:
         print(f"BOT ERROR ({consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}): {e}")
         if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
             send_telegram(
-                f"🚨 <b>Bot Infrastructure Crash Alert</b>\n"
+                f"🚨 <b>Bot Crashed</b>\n"
                 f"❌ <code>{str(e)[:200]}</code>\n"
-                f"🔁 {consecutive_errors} consecutive failures recorded."
+                f"🔁 {consecutive_errors} consecutive errors"
             )
             raise SystemExit(1)
         time.sleep(60)
-
