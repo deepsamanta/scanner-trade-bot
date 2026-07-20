@@ -66,7 +66,7 @@ BASE_URL = "https://api.coindcx.com"
 # =============================================================================
 
 # ── Trade params ──────────────────────────────────────────────────────────────
-MAX_OPEN_TRADES   = 5
+MAX_OPEN_TRADES   = 12
 
 # ── ATR-based TP/SL ──────────────────────────────────────────────────────────
 ATR_TP_MULT       = 3.0
@@ -75,7 +75,7 @@ MIN_TP_PCT        = 4.0
 MIN_SL_PCT        = 2.0
 
 # ── Universe filter ───────────────────────────────────────────────────────────
-MIN_24H_VOL_USDT  = 1_000_000
+MIN_24H_VOL_USDT  = 5_000_000
 
 STABLECOINS = {
     "USDT","USDC","BUSD","DAI","TUSD","USDP","FRAX","UST","LUSD",
