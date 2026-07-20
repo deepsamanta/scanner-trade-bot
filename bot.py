@@ -18,37 +18,45 @@ BASE_URL = "https://api.coindcx.com"
 
 # =============================================================================
 # STRATEGY: Multi-Stage Momentum Breakout/Breakdown — Long + Short + ATR TP/SL
+#           + ORDER BOOK FINAL GATE
 #
-# VOLUME (FIXED — daily futures candle method):
-#   Volume is fetched per-coin from the DAILY (1D) futures candle on the same
-#   public candlestick endpoint the bot already trades from:
-#       pair=B-<COIN>_USDT, resolution=1D, pcode=f
-#   The candle `volume` field = total quantity of the pair traded that day.
-#   24h USD volume = volume x close.
-#   The raw candle is logged for every coin so you can verify against CoinDCX.
-#   No ticker API, no spot/futures key mismatch — futures data only.
+# ORDER BOOK GATE (new — runs only on qualified candidates, right before entry):
+#   Endpoint: public.coindcx.com/market_data/v3/orderbook/B-<COIN>_USDT-futures/50
+#   Three checks per candidate:
+#     ① SPREAD CHECK      — (best_ask - best_bid)/mid must be < MAX_SPREAD_PCT.
+#                           Wide spread = illiquid = instant loss on fill.
+#     ② SLIPPAGE CHECK    — walk the book with our order size (qty). The average
+#                           fill price must not deviate > MAX_SLIPPAGE_PCT from
+#                           the best price. Prevents our own order moving the
+#                           market on thin coins.
+#     ③ IMBALANCE SIGNAL  — sum bid qty vs ask qty within DEPTH_RANGE_PCT of mid.
+#                           imbalance = bid_depth / (bid_depth + ask_depth)
+#                           LONG  blocked if imbalance < MIN_IMBALANCE_LONG
+#                             (a heavy sell wall sits overhead — breakout will
+#                              likely get absorbed and reversed)
+#                           SHORT blocked if imbalance > MAX_IMBALANCE_SHORT
+#                             (a heavy buy wall sits below — breakdown will
+#                              likely bounce)
+#                           Imbalance also feeds the score (up to +10 pts) so
+#                           book-supported setups rank above book-opposed ones.
+#   Order book is fetched ONLY for Stage-3 survivors (a handful per cycle),
+#   not all 430 coins — one extra API call per candidate, negligible load.
+#   All raw numbers logged so every allow/block decision is auditable.
 #
-# ANTI-WHIPSAW FILTERS (4 layers):
-#   1. 2-CANDLE CONFIRMATION — signal candle breaks the level, next candle
-#      must also close beyond it.
-#   2. VOLUME SPIKE >= 2.0x
-#   3. EMA SLOPE FILTER — 4H EMA50 must be actively trending. Flat = skip.
-#   4. MIN BREAKOUT STRENGTH >= 0.3% beyond the level.
+# VOLUME (daily futures candle):
+#   Per-coin from 1D futures candle: vol_usd = volume x close. Raw candle logged.
 #
-# DIRECTION — per-coin:
-#   Every coin checked for both long AND short each cycle. 4H EMA50 decides.
-#   BTC daily 200 EMA = score bonus (+10 pts) only, never a hard gate.
+# ANTI-WHIPSAW FILTERS:
+#   ① 2-candle confirmation  ② vol spike >= 2.0x
+#   ③ 4H EMA50 slope filter  ④ min breakout strength 0.3%
 #
-# STAGE 1 — UNIVERSE: exclude stables/wrapped; 24h vol >= MIN_24H_VOL_USDT
-#            (from daily futures candle, logged raw).
-# STAGE 2 — STRUCTURE: 1H ATR compression + 5-day range + EMA slope + 4H trend.
-# STAGE 3 — SIGNAL: 2-candle 15m breakout/breakdown + vol spike + 1H confirm.
-# STAGE 4 — RANK: vol spike(30) + move(20) + EMA prox(20) + liquidity(30)
-#            + regime bonus(10). Top MAX_OPEN_TRADES executed.
+# DIRECTION — per-coin: both long AND short evaluated each cycle. 4H EMA50
+#   decides. BTC daily 200 EMA = +10 pts score bonus only, never a gate.
 #
-# TP/SL — ATR-BASED:
-#   TP = entry +/- max(ATR x ATR_TP_MULT, entry x MIN_TP_PCT%)
-#   SL = entry -/+ max(ATR x ATR_SL_MULT, entry x MIN_SL_PCT%)  R:R = 2:1
+# STAGES: 1 volume  →  2 structure  →  3 signal  →  3.5 ORDER BOOK GATE
+#         →  4 rank & execute top MAX_OPEN_TRADES.
+#
+# TP/SL — ATR-BASED: TP = ATR x 3.0, SL = ATR x 1.5 (floors 4% / 2%). R:R 2:1.
 # =============================================================================
 
 # ── Trade params ──────────────────────────────────────────────────────────────
@@ -61,7 +69,7 @@ MIN_TP_PCT        = 4.0
 MIN_SL_PCT        = 2.0
 
 # ── Universe filter ───────────────────────────────────────────────────────────
-MIN_24H_VOL_USDT  = 5_000_000
+MIN_24H_VOL_USDT  = 3_000_000
 
 STABLECOINS = {
     "USDT","USDC","BUSD","DAI","TUSD","USDP","FRAX","UST","LUSD",
@@ -82,6 +90,15 @@ HTF_VOL_BARS      = 2
 RANGE_LOOKBACK    = 480
 RANGE_SKIP_PCT    = 15
 REGIME_BONUS_PTS  = 10
+
+# ── Order book gate params ────────────────────────────────────────────────────
+OB_DEPTH            = 50     # order book depth to request (10 / 20 / 50)
+MAX_SPREAD_PCT      = 0.30   # max bid-ask spread % of mid price
+MAX_SLIPPAGE_PCT    = 0.50   # max avg-fill deviation % walking the book with our qty
+DEPTH_RANGE_PCT     = 1.0    # imbalance measured within this % of mid price
+MIN_IMBALANCE_LONG  = 0.40   # long blocked if bid share < 40% (sell wall overhead)
+MAX_IMBALANCE_SHORT = 0.60   # short blocked if bid share > 60% (buy wall below)
+OB_BONUS_MAX_PTS    = 10     # max score bonus from book imbalance alignment
 
 # ── Candle counts ─────────────────────────────────────────────────────────────
 CANDLES_15M       = 550
@@ -409,24 +426,150 @@ def compute_atr_tp_sl(entry, candles_15m, direction, precision):
 
 
 # =====================================================
+# ORDER BOOK GATE
+# =====================================================
+
+def fetch_orderbook(symbol):
+    """
+    Fetch futures order book:
+      GET public.coindcx.com/market_data/v3/orderbook/B-<COIN>_USDT-futures/50
+    Response: {"ts":..., "vs":..., "asks":{price:qty,...}, "bids":{price:qty,...}}
+    Returns (bids, asks) as sorted lists of (price, qty) floats, or (None, None).
+    bids sorted high->low (best bid first), asks sorted low->high (best ask first).
+    """
+    try:
+        url = (f"https://public.coindcx.com/market_data/v3/orderbook/"
+               f"{fut_pair(symbol)}-futures/{OB_DEPTH}")
+        r = requests.get(url, timeout=REQUEST_TIMEOUT)
+        if r.status_code != 200:
+            print(f"  [OB] {symbol}  HTTP {r.status_code}")
+            return None, None
+        data = r.json()
+        raw_bids = data.get("bids", {}) or {}
+        raw_asks = data.get("asks", {}) or {}
+        bids = sorted(((float(p), float(q)) for p, q in raw_bids.items()),
+                      key=lambda x: x[0], reverse=True)
+        asks = sorted(((float(p), float(q)) for p, q in raw_asks.items()),
+                      key=lambda x: x[0])
+        if not bids or not asks:
+            print(f"  [OB] {symbol}  empty book (bids={len(bids)} asks={len(asks)})")
+            return None, None
+        return bids, asks
+    except Exception as e:
+        print(f"  [OB] {symbol}  error: {e}")
+        return None, None
+
+
+def estimate_slippage(levels, qty_needed):
+    """
+    Walk the book with our order size and compute average fill price.
+    levels = list of (price, qty) starting from best price.
+    Returns (avg_fill_price, filled_fully: bool).
+    """
+    remaining = qty_needed
+    cost      = 0.0
+    for price, qty in levels:
+        take       = min(remaining, qty)
+        cost      += take * price
+        remaining -= take
+        if remaining <= 0:
+            break
+    filled_qty = qty_needed - max(remaining, 0)
+    if filled_qty <= 0:
+        return None, False
+    return cost / filled_qty, remaining <= 0
+
+
+def check_orderbook_gate(symbol, direction, entry_price, order_qty):
+    """
+    Final pre-entry gate using the live futures order book.
+
+    ① Spread   : (best_ask - best_bid) / mid < MAX_SPREAD_PCT
+    ② Slippage : walking the book with order_qty, avg fill must deviate
+                 < MAX_SLIPPAGE_PCT from the best price (asks for long,
+                 bids for short). Must also fully fill within visible depth.
+    ③ Imbalance: bid_depth / (bid_depth + ask_depth) within DEPTH_RANGE_PCT
+                 of mid. Long needs >= MIN_IMBALANCE_LONG (no big sell wall);
+                 short needs <= MAX_IMBALANCE_SHORT (no big buy wall).
+
+    Returns (passed: bool, reason: str, imbalance: float, spread_pct: float).
+    imbalance is returned even on failure for logging; 0.5 = neutral book.
+    """
+    bids, asks = fetch_orderbook(symbol)
+    if bids is None:
+        # Book unavailable — do not block the trade on a data hiccup,
+        # but flag it and give a neutral imbalance (no bonus).
+        return True, "book unavailable (not blocking)", 0.5, 0.0
+
+    best_bid = bids[0][0]
+    best_ask = asks[0][0]
+    mid      = (best_bid + best_ask) / 2
+
+    # ① Spread check
+    spread_pct = ((best_ask - best_bid) / mid) * 100 if mid > 0 else 999.0
+    if spread_pct > MAX_SPREAD_PCT:
+        return False, (f"spread {spread_pct:.3f}% > {MAX_SPREAD_PCT}%"), 0.5, round(spread_pct, 4)
+
+    # ② Slippage check — walk the side our order consumes
+    consume_side = asks if direction == "long" else bids
+    best_price   = best_ask if direction == "long" else best_bid
+    avg_fill, fully = estimate_slippage(consume_side, order_qty)
+    if avg_fill is None or not fully:
+        return False, (f"insufficient depth for qty={order_qty} "
+                       f"within visible {OB_DEPTH} levels"), 0.5, round(spread_pct, 4)
+    slip_pct = abs((avg_fill - best_price) / best_price) * 100 if best_price > 0 else 999.0
+    if slip_pct > MAX_SLIPPAGE_PCT:
+        return False, (f"slippage {slip_pct:.3f}% > {MAX_SLIPPAGE_PCT}% "
+                       f"(avg_fill={avg_fill:.8g} vs best={best_price:.8g})"), 0.5, round(spread_pct, 4)
+
+    # ③ Imbalance within DEPTH_RANGE_PCT of mid
+    lo_bound = mid * (1 - DEPTH_RANGE_PCT / 100)
+    hi_bound = mid * (1 + DEPTH_RANGE_PCT / 100)
+    bid_depth = sum(q for p, q in bids if p >= lo_bound)
+    ask_depth = sum(q for p, q in asks if p <= hi_bound)
+    total     = bid_depth + ask_depth
+    imbalance = (bid_depth / total) if total > 0 else 0.5
+
+    print(f"  [OB] {symbol}  spread={spread_pct:.3f}%  slip={slip_pct:.3f}%  "
+          f"bid_depth={bid_depth:,.2f}  ask_depth={ask_depth:,.2f}  "
+          f"imbalance={imbalance:.3f}  (0=all asks, 1=all bids)")
+
+    if direction == "long" and imbalance < MIN_IMBALANCE_LONG:
+        return False, (f"sell wall overhead — imbalance {imbalance:.3f} "
+                       f"< {MIN_IMBALANCE_LONG} (asks dominate)"), imbalance, round(spread_pct, 4)
+    if direction == "short" and imbalance > MAX_IMBALANCE_SHORT:
+        return False, (f"buy wall below — imbalance {imbalance:.3f} "
+                       f"> {MAX_IMBALANCE_SHORT} (bids dominate)"), imbalance, round(spread_pct, 4)
+
+    return True, "ok", imbalance, round(spread_pct, 4)
+
+
+def orderbook_score_bonus(imbalance, direction):
+    """
+    Up to +OB_BONUS_MAX_PTS when the book leans with the trade.
+    Long : bonus scales as imbalance goes 0.5 -> 1.0 (bids dominating)
+    Short: bonus scales as imbalance goes 0.5 -> 0.0 (asks dominating)
+    Neutral book (0.5) = 0 bonus.
+    """
+    if direction == "long":
+        lean = max(0.0, imbalance - 0.5) / 0.5
+    else:
+        lean = max(0.0, 0.5 - imbalance) / 0.5
+    return round(lean * OB_BONUS_MAX_PTS, 4)
+
+
+# =====================================================
 # STAGE 1 — VOLUME FROM DAILY FUTURES CANDLE
 # =====================================================
 
 def fetch_24h_volume(symbol):
     """
-    Fetch 24h volume from the DAILY (1D) futures candle — same endpoint,
-    same pair format (B-<COIN>_USDT, pcode=f) the bot trades on.
-
-    candle_list[-1] = today's active daily candle (rolling volume so far today)
-    The `volume` field = total quantity of the pair traded.
-    24h USD volume = volume x close.
-
-    Logs the raw candle so you can verify directly against CoinDCX.
-    Returns (vol_usd, raw_candle_dict | None).
+    Daily (1D) futures candle from the same endpoint the bot trades on.
+    vol_usd = daily volume (quantity of pair) x daily close. Raw candle logged.
     """
     try:
         now        = int(time.time())
-        from_time  = now - (3 * 24 * 60 * 60)   # 3-day lookback guarantees data
+        from_time  = now - (3 * 24 * 60 * 60)
         url        = "https://public.coindcx.com/market_data/candlesticks"
         params     = {
             "pair":       fut_pair(symbol),
@@ -439,20 +582,16 @@ def fetch_24h_volume(symbol):
         if response.status_code != 200:
             print(f"  [VOL] {symbol}  HTTP {response.status_code}")
             return 0.0, None
-
         data        = response.json()
         candle_list = data.get("data", data) if isinstance(data, dict) else data
         if not candle_list:
             print(f"  [VOL] {symbol}  no daily candles returned")
             return 0.0, None
-
         candle_list = sorted(candle_list, key=lambda x: x["time"])
-        daily       = candle_list[-1]   # today's active daily candle
-
-        volume_qty = float(daily.get("volume", 0) or 0)
-        close_px   = float(daily.get("close",  0) or 0)
-        vol_usd    = volume_qty * close_px
-
+        daily       = candle_list[-1]
+        volume_qty  = float(daily.get("volume", 0) or 0)
+        close_px    = float(daily.get("close",  0) or 0)
+        vol_usd     = volume_qty * close_px
         print(f"  [VOL] {symbol}  raw_daily_candle={daily}")
         print(f"  [VOL] {symbol}  volume_qty={volume_qty:,.2f} x close={close_px} "
               f"=> 24h_usd=${vol_usd:,.0f}")
@@ -468,7 +607,6 @@ def is_excluded(symbol):
 
 
 def build_eligible_universe(all_symbols_rows):
-    """Pre-filter only: remove stables/wrapped. Volume checked per-coin in check_and_trade."""
     eligible    = []
     skip_stable = 0
     for symbol, row in all_symbols_rows:
@@ -526,7 +664,6 @@ def check_4h_downtrend(candles_4h):
 
 
 def check_ema_slope(candles_4h, direction):
-    """EMA50 must be actively sloping in trade direction. Flat = ranging = skip."""
     needed = EMA50_4H_LEN + EMA_SLOPE_BARS + 1
     if len(candles_4h) < needed:
         return True, 0.0, 0.0
@@ -637,14 +774,14 @@ def check_1h_bearish_confirmation(candles_1h):
 # =====================================================
 
 def score_candidate(vol_ratio, move_strength_pct, ema_proximity_pct,
-                    vol_24h_usd, direction, btc_bull):
+                    vol_24h_usd, direction, btc_bull, ob_bonus=0.0):
     s1 = min(vol_ratio / 5.0,              1.0) * 30
     s2 = min(move_strength_pct / 5.0,      1.0) * 20
     s3 = max(0, 1 - ema_proximity_pct / 10)    * 20
     s4 = min(vol_24h_usd / 50_000_000,     1.0) * 30
     regime_aligned = (direction == "long" and btc_bull) or (direction == "short" and not btc_bull)
     s5 = REGIME_BONUS_PTS if regime_aligned else 0
-    return round(s1 + s2 + s3 + s4 + s5, 4)
+    return round(s1 + s2 + s3 + s4 + s5 + ob_bonus, 4)
 
 
 # =====================================================
@@ -817,7 +954,7 @@ def place_short_order(symbol, entry_price, tp_price, sl_price, precision):
 
 
 # =====================================================
-# EXECUTE ENTRY
+# EXECUTE ENTRY (with order book final gate)
 # =====================================================
 
 def execute_entry(cand, all_state):
@@ -829,13 +966,31 @@ def execute_entry(cand, all_state):
     precision   = cand["precision"]
     curr_ts     = cand["curr_ts"]
     direction   = cand["direction"]
+
+    # ── ORDER BOOK FINAL GATE — re-checked at execution moment ───────────────
+    order_qty = compute_qty(entry_price, symbol)
+    ob_ok, ob_reason, ob_imb, ob_spread = check_orderbook_gate(
+        symbol, direction, entry_price, order_qty)
+    if not ob_ok:
+        print(f"  [{symbol}] ENTRY BLOCKED by order book — {ob_reason}")
+        send_telegram(
+            f"🚫 <b>ENTRY BLOCKED (ORDER BOOK) — {symbol}</b>\n"
+            f"Direction: <code>{direction.upper()}</code>\n"
+            f"Reason: <code>{ob_reason}</code>"
+        )
+        return
+    print(f"  [{symbol}] Order book gate PASS — {ob_reason}  "
+          f"imbalance={ob_imb:.3f}  spread={ob_spread}%")
+
     st = all_state.setdefault(symbol, init_symbol_state())
+
     if direction == "long":
         placed, confirmed_entry, confirmed_tp = place_long_order(
             symbol, entry_price, tp_price, sl_price, precision)
     else:
         placed, confirmed_entry, confirmed_tp = place_short_order(
             symbol, entry_price, tp_price, sl_price, precision)
+
     if placed:
         st["in_position"]   = True
         st["direction"]     = direction
@@ -845,6 +1000,7 @@ def execute_entry(cand, all_state):
         st["last_entry_ts"] = curr_ts
         update_sheet_tp(row, st["tp_level"])
         update_sheet_sl(row, st["sl_price"])
+
     save_state(all_state)
 
 
@@ -1051,22 +1207,35 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders,
                           f"ref={prev_high}  vol={vol_ratio}x  strength={strength_pct}%")
                     entry_price        = round(bo_close, precision)
                     tp_price, sl_price = compute_atr_tp_sl(entry_price, candles_15m, "long", precision)
-                    move_pct     = ((bo_close - prev_high) / prev_high * 100) if prev_high > 0 else 0.0
-                    ema_prox_pct = ((bo_close / ema50_4h - 1) * 100) if ema50_4h > 0 else 0.0
-                    score  = score_candidate(vol_ratio, move_pct, ema_prox_pct, vol_24h_usd, "long", btc_bull)
-                    tp_pct = round(abs((tp_price - entry_price) / entry_price * 100), 2)
-                    sl_pct = round(abs((sl_price - entry_price) / entry_price * 100), 2)
-                    regime = "" if btc_bull else " [COUNTER-TREND]"
-                    print(f"  [{symbol}] ✅ LONG CANDIDATE  score={score}{regime}  "
-                          f"entry={entry_price}  tp={tp_price}(+{tp_pct}%)  sl={sl_price}(-{sl_pct}%)")
-                    found_candidates.append({
-                        "symbol": symbol, "row": row, "direction": "long",
-                        "score": score, "entry_price": entry_price,
-                        "tp_price": tp_price, "sl_price": sl_price,
-                        "precision": precision, "curr_ts": curr_ts,
-                        "vol_ratio": vol_ratio, "move_pct": round(move_pct, 4),
-                        "ema_prox_pct": round(ema_prox_pct, 4), "vol_24h_usd": round(vol_24h_usd, 0),
-                    })
+
+                    # ── ORDER BOOK: gate + score bonus ────────────────────────
+                    order_qty = compute_qty(entry_price, symbol)
+                    ob_ok, ob_reason, ob_imb, ob_spread = check_orderbook_gate(
+                        symbol, "long", entry_price, order_qty)
+                    if not ob_ok:
+                        print(f"  [{symbol}] LONG: DISCARDED — order book gate: {ob_reason}")
+                    else:
+                        ob_bonus = orderbook_score_bonus(ob_imb, "long")
+                        move_pct     = ((bo_close - prev_high) / prev_high * 100) if prev_high > 0 else 0.0
+                        ema_prox_pct = ((bo_close / ema50_4h - 1) * 100) if ema50_4h > 0 else 0.0
+                        score  = score_candidate(vol_ratio, move_pct, ema_prox_pct,
+                                                 vol_24h_usd, "long", btc_bull, ob_bonus)
+                        tp_pct = round(abs((tp_price - entry_price) / entry_price * 100), 2)
+                        sl_pct = round(abs((sl_price - entry_price) / entry_price * 100), 2)
+                        regime = "" if btc_bull else " [COUNTER-TREND]"
+                        print(f"  [{symbol}] ✅ LONG CANDIDATE  score={score}{regime}  "
+                              f"ob_imb={ob_imb:.3f}(+{ob_bonus})  "
+                              f"entry={entry_price}  tp={tp_price}(+{tp_pct}%)  sl={sl_price}(-{sl_pct}%)")
+                        found_candidates.append({
+                            "symbol": symbol, "row": row, "direction": "long",
+                            "score": score, "entry_price": entry_price,
+                            "tp_price": tp_price, "sl_price": sl_price,
+                            "precision": precision, "curr_ts": curr_ts,
+                            "vol_ratio": vol_ratio, "move_pct": round(move_pct, 4),
+                            "ema_prox_pct": round(ema_prox_pct, 4),
+                            "vol_24h_usd": round(vol_24h_usd, 0),
+                            "ob_imbalance": round(ob_imb, 4), "ob_bonus": ob_bonus,
+                        })
     else:
         print(f"  [{symbol}] LONG: 4H FAIL — close={close_4h} < ema50={ema50_4h}")
 
@@ -1093,22 +1262,35 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders,
                           f"ref={prev_low}  vol={vol_ratio}x  strength={strength_pct}%")
                     entry_price        = round(bd_close, precision)
                     tp_price, sl_price = compute_atr_tp_sl(entry_price, candles_15m, "short", precision)
-                    move_pct     = ((prev_low - bd_close) / prev_low * 100) if prev_low > 0 else 0.0
-                    ema_prox_pct = ((1 - bd_close / ema50_4h) * 100) if ema50_4h > 0 else 0.0
-                    score  = score_candidate(vol_ratio, move_pct, ema_prox_pct, vol_24h_usd, "short", btc_bull)
-                    tp_pct = round(abs((tp_price - entry_price) / entry_price * 100), 2)
-                    sl_pct = round(abs((sl_price - entry_price) / entry_price * 100), 2)
-                    regime = "" if not btc_bull else " [COUNTER-TREND]"
-                    print(f"  [{symbol}] ✅ SHORT CANDIDATE  score={score}{regime}  "
-                          f"entry={entry_price}  tp={tp_price}(-{tp_pct}%)  sl={sl_price}(+{sl_pct}%)")
-                    found_candidates.append({
-                        "symbol": symbol, "row": row, "direction": "short",
-                        "score": score, "entry_price": entry_price,
-                        "tp_price": tp_price, "sl_price": sl_price,
-                        "precision": precision, "curr_ts": curr_ts,
-                        "vol_ratio": vol_ratio, "move_pct": round(move_pct, 4),
-                        "ema_prox_pct": round(ema_prox_pct, 4), "vol_24h_usd": round(vol_24h_usd, 0),
-                    })
+
+                    # ── ORDER BOOK: gate + score bonus ────────────────────────
+                    order_qty = compute_qty(entry_price, symbol)
+                    ob_ok, ob_reason, ob_imb, ob_spread = check_orderbook_gate(
+                        symbol, "short", entry_price, order_qty)
+                    if not ob_ok:
+                        print(f"  [{symbol}] SHORT: DISCARDED — order book gate: {ob_reason}")
+                    else:
+                        ob_bonus = orderbook_score_bonus(ob_imb, "short")
+                        move_pct     = ((prev_low - bd_close) / prev_low * 100) if prev_low > 0 else 0.0
+                        ema_prox_pct = ((1 - bd_close / ema50_4h) * 100) if ema50_4h > 0 else 0.0
+                        score  = score_candidate(vol_ratio, move_pct, ema_prox_pct,
+                                                 vol_24h_usd, "short", btc_bull, ob_bonus)
+                        tp_pct = round(abs((tp_price - entry_price) / entry_price * 100), 2)
+                        sl_pct = round(abs((sl_price - entry_price) / entry_price * 100), 2)
+                        regime = "" if not btc_bull else " [COUNTER-TREND]"
+                        print(f"  [{symbol}] ✅ SHORT CANDIDATE  score={score}{regime}  "
+                              f"ob_imb={ob_imb:.3f}(+{ob_bonus})  "
+                              f"entry={entry_price}  tp={tp_price}(-{tp_pct}%)  sl={sl_price}(+{sl_pct}%)")
+                        found_candidates.append({
+                            "symbol": symbol, "row": row, "direction": "short",
+                            "score": score, "entry_price": entry_price,
+                            "tp_price": tp_price, "sl_price": sl_price,
+                            "precision": precision, "curr_ts": curr_ts,
+                            "vol_ratio": vol_ratio, "move_pct": round(move_pct, 4),
+                            "ema_prox_pct": round(ema_prox_pct, 4),
+                            "vol_24h_usd": round(vol_24h_usd, 0),
+                            "ob_imbalance": round(ob_imb, 4), "ob_bonus": ob_bonus,
+                        })
     else:
         print(f"  [{symbol}] SHORT: 4H FAIL — close={close_4h} > ema50={ema50_4h}")
 
@@ -1131,16 +1313,19 @@ consecutive_errors = 0
 MAX_CONSECUTIVE_ERRORS = 10
 
 send_telegram(
-    f"✅ <b>Momentum Bot Started</b>\n"
+    f"✅ <b>Momentum Bot Started — Order Book Edition</b>\n"
     f"━━━━━━━━━━━━━━━━━━\n"
-    f"🔧 <b>Volume:</b> per-coin from DAILY futures candle (raw candle logged)\n"
-    f"   <code>vol_usd = daily_volume x daily_close  |  min ${MIN_24H_VOL_USDT:,}</code>\n"
+    f"📖 <b>Order book gate (per candidate):</b>\n"
+    f"  <code>① Spread &lt; {MAX_SPREAD_PCT}%</code>\n"
+    f"  <code>② Slippage &lt; {MAX_SLIPPAGE_PCT}% walking book with our qty</code>\n"
+    f"  <code>③ LONG needs bid share &gt;= {MIN_IMBALANCE_LONG} | "
+    f"SHORT needs bid share &lt;= {MAX_IMBALANCE_SHORT}</code>\n"
+    f"  <code>+ up to {OB_BONUS_MAX_PTS} score pts when book leans with trade</code>\n"
     f"\n"
-    f"🛡 <b>Anti-whipsaw:</b>\n"
-    f"  <code>① 2-candle confirm  ② {VOL_SPIKE_MULT}x vol  "
-    f"③ EMA slope  ④ {MIN_BREAKOUT_PCT}% min strength</code>\n"
-    f"\n"
-    f"📐 <b>Strategy:</b> both long+short per coin | BTC regime = +{REGIME_BONUS_PTS} pts\n"
+    f"🔧 Volume: daily futures candle (raw logged) | min ${MIN_24H_VOL_USDT:,}\n"
+    f"🛡 Anti-whipsaw: <code>2-candle confirm | {VOL_SPIKE_MULT}x vol | "
+    f"EMA slope | {MIN_BREAKOUT_PCT}% strength</code>\n"
+    f"📐 Both long+short per coin | BTC regime = +{REGIME_BONUS_PTS} pts\n"
     f"💹 TP/SL: <code>ATR x {ATR_TP_MULT} / ATR x {ATR_SL_MULT} "
     f"(floor {MIN_TP_PCT}% / {MIN_SL_PCT}%)</code>\n"
     f"🔁 Scan: <code>Every {SCAN_INTERVAL}s</code>  |  "
@@ -1224,8 +1409,8 @@ while True:
             regime = "✅ aligned" if (c["direction"] == "long") == btc_bull else "⚡ counter-trend"
             print(f"  [{tag}] {emoji} {c['symbol']} ({c['direction'].upper()})  "
                   f"score={c['score']}  {regime}  "
-                  f"vol={c['vol_ratio']}x  move={c['move_pct']}%  "
-                  f"24h=${c['vol_24h_usd']:,.0f}")
+                  f"vol={c['vol_ratio']}x  ob_imb={c['ob_imbalance']}  "
+                  f"move={c['move_pct']}%  24h=${c['vol_24h_usd']:,.0f}")
 
         for cand in candidates[:slots_available]:
             try:
@@ -1247,7 +1432,8 @@ while True:
                 emoji  = "🟢" if c["direction"] == "long" else "🔴"
                 regime = "✅" if (c["direction"] == "long") == btc_bull else "⚡"
                 msg += (f"  {emoji}{regime} {c['symbol']}  "
-                        f"score={c['score']}  entry={c['entry_price']}\n")
+                        f"score={c['score']}  ob={c['ob_imbalance']}  "
+                        f"entry={c['entry_price']}\n")
             if skipped:
                 msg += f"⏭ Skipped : <code>{', '.join(c['symbol'] for c in skipped)}</code>"
             send_telegram(msg)
