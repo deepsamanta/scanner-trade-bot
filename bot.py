@@ -19,44 +19,32 @@ BASE_URL = "https://api.coindcx.com"
 # =============================================================================
 # STRATEGY: Multi-Stage Momentum Breakout/Breakdown — Long + Short + ATR TP/SL
 #
+# VOLUME (FIXED — daily futures candle method):
+#   Volume is fetched per-coin from the DAILY (1D) futures candle on the same
+#   public candlestick endpoint the bot already trades from:
+#       pair=B-<COIN>_USDT, resolution=1D, pcode=f
+#   The candle `volume` field = total quantity of the pair traded that day.
+#   24h USD volume = volume x close.
+#   The raw candle is logged for every coin so you can verify against CoinDCX.
+#   No ticker API, no spot/futures key mismatch — futures data only.
+#
 # ANTI-WHIPSAW FILTERS (4 layers):
-#   1. 2-CANDLE CONFIRMATION  — signal candle breaks the level, confirmation
-#      candle (next 15m bar) must ALSO close beyond it. Fake breakouts reverse
-#      on the very next candle. Real ones hold. This single filter removes ~50%
-#      of whipsaws.
-#   2. VOLUME SPIKE >= 2.0x   — raised from 1.5x. Real moves have real volume.
-#      1.5x triggers on normal market noise. 2.0x needs real participation.
-#   3. EMA SLOPE FILTER       — 4H EMA50 must be actively rising (longs) or
-#      falling (shorts). A flat EMA means ranging/choppy market = whipsaw zone.
-#      Compares EMA50 now vs EMA50 EMA_SLOPE_BARS bars ago.
-#   4. MIN BREAKOUT STRENGTH  — signal candle must close at least MIN_BREAKOUT_PCT%
-#      beyond the reference level. Filters micro-breaks (0.01% above high) that
-#      immediately reverse.
+#   1. 2-CANDLE CONFIRMATION — signal candle breaks the level, next candle
+#      must also close beyond it.
+#   2. VOLUME SPIKE >= 2.0x
+#   3. EMA SLOPE FILTER — 4H EMA50 must be actively trending. Flat = skip.
+#   4. MIN BREAKOUT STRENGTH >= 0.3% beyond the level.
 #
-# DIRECTION — per-coin, not global:
-#   Every coin evaluated for both long AND short independently each cycle.
-#   4H EMA50 determines each coin's own direction — no global BTC gate.
-#   BTC daily 200 EMA = score bonus (+10 pts) for regime-aligned trades only.
+# DIRECTION — per-coin:
+#   Every coin checked for both long AND short each cycle. 4H EMA50 decides.
+#   BTC daily 200 EMA = score bonus (+10 pts) only, never a hard gate.
 #
-# STAGE 1 — UNIVERSE FILTER  (per-coin, 24h vol from 96 x 15m candles):
-#   Exclude stables/wrapped. Discard if 24h vol < MIN_24H_VOL_USDT.
-#
-# STAGE 2 — STRUCTURAL SCREEN:
-#   Both : 1H ATR(14) < ATR_COMPRESS_PCT%  (price coiling)
-#   Both : 5-day range < RANGE_SKIP_PCT%   (not already extended)
-#   Both : EMA50 slope in right direction   (not ranging)
-#   LONG : 4H close > 50 EMA
-#   SHORT: 4H close < 50 EMA
-#
-# STAGE 3 — ENTRY SIGNAL (2-candle confirmation):
-#   LONG : signal candle  > 20-bar high + 2.0x vol + 0.3% strength
-#          confirm candle > same high (holds)    + 1H bullish
-#   SHORT: signal candle  < 20-bar low  + 2.0x vol + 0.3% strength
-#          confirm candle < same low  (holds)    + 1H bearish
-#
-# STAGE 4 — RANKING:
-#   vol spike (30) + move strength (20) + EMA proximity (20) + liquidity (30)
-#   + BTC regime bonus (+10 pts). Top MAX_OPEN_TRADES win.
+# STAGE 1 — UNIVERSE: exclude stables/wrapped; 24h vol >= MIN_24H_VOL_USDT
+#            (from daily futures candle, logged raw).
+# STAGE 2 — STRUCTURE: 1H ATR compression + 5-day range + EMA slope + 4H trend.
+# STAGE 3 — SIGNAL: 2-candle 15m breakout/breakdown + vol spike + 1H confirm.
+# STAGE 4 — RANK: vol spike(30) + move(20) + EMA prox(20) + liquidity(30)
+#            + regime bonus(10). Top MAX_OPEN_TRADES executed.
 #
 # TP/SL — ATR-BASED:
 #   TP = entry +/- max(ATR x ATR_TP_MULT, entry x MIN_TP_PCT%)
@@ -84,12 +72,12 @@ WRAPPED = {"WBTC","WETH","WBNB","WMATIC","WAVAX","WSOL","WFTM"}
 # ── Strategy params ───────────────────────────────────────────────────────────
 EMA200_DAILY_LEN  = 200
 EMA50_4H_LEN      = 50
-EMA_SLOPE_BARS    = 5      # compare EMA50 now vs N bars ago to detect slope
+EMA_SLOPE_BARS    = 5
 ATR_LEN           = 14
 ATR_COMPRESS_PCT  = 2.5
 BREAKOUT_BARS     = 20
-VOL_SPIKE_MULT    = 2.0    # raised from 1.5 — real moves need real volume
-MIN_BREAKOUT_PCT  = 0.3    # signal candle must close >= this % beyond the level
+VOL_SPIKE_MULT    = 2.0
+MIN_BREAKOUT_PCT  = 0.3
 HTF_VOL_BARS      = 2
 RANGE_LOOKBACK    = 480
 RANGE_SKIP_PCT    = 15
@@ -97,7 +85,7 @@ REGIME_BONUS_PTS  = 10
 
 # ── Candle counts ─────────────────────────────────────────────────────────────
 CANDLES_15M       = 550
-CANDLES_4H        = 70     # extra buffer for EMA slope comparison
+CANDLES_4H        = 70
 CANDLES_1H        = 30
 CANDLES_1M        = 5
 
@@ -114,7 +102,7 @@ CANDLE_SECONDS_DAY = 86400
 CANDLE_SECONDS_1H  = 3600
 CANDLE_SECONDS_4H  = 14400
 
-SCAN_INTERVAL          = 120
+SCAN_INTERVAL          = 300
 REQUEST_TIMEOUT        = 15
 TELEGRAM_TIMEOUT       = 10
 GSHEET_REAUTH_INTERVAL = 45 * 60
@@ -406,13 +394,6 @@ def compute_atr(candles, length):
     return atr
 
 
-def compute_24h_vol_usd(candles_15m):
-    if not candles_15m:
-        return 0.0
-    last_96 = candles_15m[-96:] if len(candles_15m) >= 96 else candles_15m
-    return sum(float(c["volume"]) * float(c["close"]) for c in last_96)
-
-
 def compute_atr_tp_sl(entry, candles_15m, direction, precision):
     atr = compute_atr(candles_15m[-50:], ATR_LEN) if len(candles_15m) >= ATR_LEN + 1 else None
     if atr and atr > 0:
@@ -428,8 +409,58 @@ def compute_atr_tp_sl(entry, candles_15m, direction, precision):
 
 
 # =====================================================
-# STAGE 1 — UNIVERSE FILTER
+# STAGE 1 — VOLUME FROM DAILY FUTURES CANDLE
 # =====================================================
+
+def fetch_24h_volume(symbol):
+    """
+    Fetch 24h volume from the DAILY (1D) futures candle — same endpoint,
+    same pair format (B-<COIN>_USDT, pcode=f) the bot trades on.
+
+    candle_list[-1] = today's active daily candle (rolling volume so far today)
+    The `volume` field = total quantity of the pair traded.
+    24h USD volume = volume x close.
+
+    Logs the raw candle so you can verify directly against CoinDCX.
+    Returns (vol_usd, raw_candle_dict | None).
+    """
+    try:
+        now        = int(time.time())
+        from_time  = now - (3 * 24 * 60 * 60)   # 3-day lookback guarantees data
+        url        = "https://public.coindcx.com/market_data/candlesticks"
+        params     = {
+            "pair":       fut_pair(symbol),
+            "from":       from_time,
+            "to":         now,
+            "resolution": RESOLUTION_DAILY,
+            "pcode":      "f",
+        }
+        response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        if response.status_code != 200:
+            print(f"  [VOL] {symbol}  HTTP {response.status_code}")
+            return 0.0, None
+
+        data        = response.json()
+        candle_list = data.get("data", data) if isinstance(data, dict) else data
+        if not candle_list:
+            print(f"  [VOL] {symbol}  no daily candles returned")
+            return 0.0, None
+
+        candle_list = sorted(candle_list, key=lambda x: x["time"])
+        daily       = candle_list[-1]   # today's active daily candle
+
+        volume_qty = float(daily.get("volume", 0) or 0)
+        close_px   = float(daily.get("close",  0) or 0)
+        vol_usd    = volume_qty * close_px
+
+        print(f"  [VOL] {symbol}  raw_daily_candle={daily}")
+        print(f"  [VOL] {symbol}  volume_qty={volume_qty:,.2f} x close={close_px} "
+              f"=> 24h_usd=${vol_usd:,.0f}")
+        return vol_usd, daily
+    except Exception as e:
+        print(f"  [VOL] {symbol}  error: {e}")
+        return 0.0, None
+
 
 def is_excluded(symbol):
     base = symbol.replace("USDT", "")
@@ -437,6 +468,7 @@ def is_excluded(symbol):
 
 
 def build_eligible_universe(all_symbols_rows):
+    """Pre-filter only: remove stables/wrapped. Volume checked per-coin in check_and_trade."""
     eligible    = []
     skip_stable = 0
     for symbol, row in all_symbols_rows:
@@ -494,24 +526,16 @@ def check_4h_downtrend(candles_4h):
 
 
 def check_ema_slope(candles_4h, direction):
-    """
-    ANTI-WHIPSAW: EMA50 must be actively sloping in the trade direction.
-    A flat EMA = ranging market = whipsaw zone. Skip it.
-    Compares EMA50 computed now vs EMA50 computed EMA_SLOPE_BARS bars ago.
-    Returns (slope_ok, ema_now, ema_prev).
-    """
+    """EMA50 must be actively sloping in trade direction. Flat = ranging = skip."""
     needed = EMA50_4H_LEN + EMA_SLOPE_BARS + 1
     if len(candles_4h) < needed:
-        return True, 0.0, 0.0   # not enough data — don't block
+        return True, 0.0, 0.0
     closes   = [float(c["close"]) for c in candles_4h]
-    ema_now  = compute_ema(closes,                EMA50_4H_LEN)
+    ema_now  = compute_ema(closes,                 EMA50_4H_LEN)
     ema_prev = compute_ema(closes[:-EMA_SLOPE_BARS], EMA50_4H_LEN)
     if ema_now is None or ema_prev is None:
         return True, 0.0, 0.0
-    if direction == "long":
-        ok = ema_now > ema_prev    # EMA must be rising
-    else:
-        ok = ema_now < ema_prev    # EMA must be falling
+    ok = ema_now > ema_prev if direction == "long" else ema_now < ema_prev
     return ok, round(ema_now, 8), round(ema_prev, 8)
 
 
@@ -539,70 +563,45 @@ def check_range_not_extended(candles_15m):
 # =====================================================
 
 def check_15m_breakout(candles_15m):
-    """
-    ANTI-WHIPSAW: 2-candle confirmation.
-    Signal candle  (candles[-2]): closes > 20-bar high + vol spike + min strength.
-    Confirm candle (candles[-1]): must ALSO close above same high.
-    Fake breakouts almost always fail on the confirmation candle.
-    Entry price = confirm candle close (candles[-1]).
-    Returns (ok, confirm_close, prev_high, vol_ratio, strength_pct).
-    """
     needed = BREAKOUT_BARS + 2
     if len(candles_15m) < needed:
         return False, 0.0, 0.0, 0.0, 0.0
-
     signal_candle  = candles_15m[-2]
     confirm_candle = candles_15m[-1]
     prev_bars      = candles_15m[-(BREAKOUT_BARS + 2):-2]
-
-    signal_close  = float(signal_candle["close"])
-    confirm_close = float(confirm_candle["close"])
-    signal_vol    = float(signal_candle["volume"])
-    prev_high     = max(float(c["close"]) for c in prev_bars)
-    avg_vol       = sum(float(c["volume"]) for c in prev_bars) / len(prev_bars) if prev_bars else 0
-
-    vol_ratio    = signal_vol / avg_vol if avg_vol > 0 else 0.0
-    strength_pct = ((signal_close - prev_high) / prev_high * 100) if prev_high > 0 else 0.0
-
-    signal_ok  = (signal_close  > prev_high and
-                  vol_ratio     >= VOL_SPIKE_MULT and
-                  strength_pct  >= MIN_BREAKOUT_PCT)
-    confirm_ok = confirm_close > prev_high   # must hold above level
-
+    signal_close   = float(signal_candle["close"])
+    confirm_close  = float(confirm_candle["close"])
+    signal_vol     = float(signal_candle["volume"])
+    prev_high      = max(float(c["close"]) for c in prev_bars)
+    avg_vol        = sum(float(c["volume"]) for c in prev_bars) / len(prev_bars) if prev_bars else 0
+    vol_ratio      = signal_vol / avg_vol if avg_vol > 0 else 0.0
+    strength_pct   = ((signal_close - prev_high) / prev_high * 100) if prev_high > 0 else 0.0
+    signal_ok      = (signal_close > prev_high and
+                      vol_ratio    >= VOL_SPIKE_MULT and
+                      strength_pct >= MIN_BREAKOUT_PCT)
+    confirm_ok     = confirm_close > prev_high
     return (signal_ok and confirm_ok), round(confirm_close, 8), round(prev_high, 8), \
            round(vol_ratio, 2), round(strength_pct, 4)
 
 
 def check_15m_breakdown(candles_15m):
-    """
-    ANTI-WHIPSAW: 2-candle confirmation (short side mirror of breakout).
-    Signal candle  (candles[-2]): closes < 20-bar low + vol spike + min strength.
-    Confirm candle (candles[-1]): must ALSO close below same low.
-    Entry price = confirm candle close (candles[-1]).
-    Returns (ok, confirm_close, prev_low, vol_ratio, strength_pct).
-    """
     needed = BREAKOUT_BARS + 2
     if len(candles_15m) < needed:
         return False, 0.0, 0.0, 0.0, 0.0
-
     signal_candle  = candles_15m[-2]
     confirm_candle = candles_15m[-1]
     prev_bars      = candles_15m[-(BREAKOUT_BARS + 2):-2]
-
-    signal_close  = float(signal_candle["close"])
-    confirm_close = float(confirm_candle["close"])
-    signal_vol    = float(signal_candle["volume"])
-    prev_low      = min(float(c["close"]) for c in prev_bars)
-    avg_vol       = sum(float(c["volume"]) for c in prev_bars) / len(prev_bars) if prev_bars else 0
-
-    vol_ratio    = signal_vol / avg_vol if avg_vol > 0 else 0.0
-    strength_pct = ((prev_low - signal_close) / prev_low * 100) if prev_low > 0 else 0.0
-
-    signal_ok  = (signal_close  < prev_low and
-                  vol_ratio     >= VOL_SPIKE_MULT and
-                  strength_pct  >= MIN_BREAKOUT_PCT)
-    confirm_ok = confirm_close < prev_low   # must hold below level
-
+    signal_close   = float(signal_candle["close"])
+    confirm_close  = float(confirm_candle["close"])
+    signal_vol     = float(signal_candle["volume"])
+    prev_low       = min(float(c["close"]) for c in prev_bars)
+    avg_vol        = sum(float(c["volume"]) for c in prev_bars) / len(prev_bars) if prev_bars else 0
+    vol_ratio      = signal_vol / avg_vol if avg_vol > 0 else 0.0
+    strength_pct   = ((prev_low - signal_close) / prev_low * 100) if prev_low > 0 else 0.0
+    signal_ok      = (signal_close < prev_low and
+                      vol_ratio    >= VOL_SPIKE_MULT and
+                      strength_pct >= MIN_BREAKOUT_PCT)
+    confirm_ok     = confirm_close < prev_low
     return (signal_ok and confirm_ok), round(confirm_close, 8), round(prev_low, 8), \
            round(vol_ratio, 2), round(strength_pct, 4)
 
@@ -830,16 +829,13 @@ def execute_entry(cand, all_state):
     precision   = cand["precision"]
     curr_ts     = cand["curr_ts"]
     direction   = cand["direction"]
-
     st = all_state.setdefault(symbol, init_symbol_state())
-
     if direction == "long":
         placed, confirmed_entry, confirmed_tp = place_long_order(
             symbol, entry_price, tp_price, sl_price, precision)
     else:
         placed, confirmed_entry, confirmed_tp = place_short_order(
             symbol, entry_price, tp_price, sl_price, precision)
-
     if placed:
         st["in_position"]   = True
         st["direction"]     = direction
@@ -849,7 +845,6 @@ def execute_entry(cand, all_state):
         st["last_entry_ts"] = curr_ts
         update_sheet_tp(row, st["tp_level"])
         update_sheet_sl(row, st["sl_price"])
-
     save_state(all_state)
 
 
@@ -894,7 +889,6 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders,
 
     # ── 4. TP COMPLETED check ─────────────────────────────────────────────────
     tp_raw = str(df.iloc[row, 1]).strip() if df.shape[1] > 1 else ""
-
     if tp_raw.upper() == "TP COMPLETED" or st.get("tp_completed") is True:
         print(f"  [{symbol}] SKIP — TP already completed")
         if st.get("in_position"):
@@ -906,7 +900,7 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders,
             save_state(all_state)
         return None
 
-    # ── 5. Resolve TP target + check if already hit ───────────────────────────
+    # ── 5. Resolve TP target + check if hit ───────────────────────────────────
     tp_stored = st.get("tp_level")
     if not tp_stored:
         try:
@@ -921,10 +915,7 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders,
         existing_dir = st.get("direction") or "long"
         last_1m    = fetch_candles(symbol, CANDLES_1M, RESOLUTION_1M, CANDLE_SECONDS_1M)
         last_close = float(last_1m[-1]["close"]) if last_1m else None
-        tp_hit     = False
-        hit_kind   = None
-        hit_price  = None
-
+        tp_hit = False; hit_kind = None; hit_price = None
         if existing_dir == "long":
             tp_threshold = tp_stored * 0.9999
             if last_close and last_close >= tp_threshold:
@@ -941,7 +932,6 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders,
                 rl = get_recent_low(symbol)
                 if rl and rl <= tp_threshold:
                     tp_hit, hit_kind, hit_price = True, "wick", rl
-
         if tp_hit:
             update_sheet_tp(row, "TP COMPLETED")
             print(f"  [{symbol}] TP HIT ({hit_kind}) price={hit_price} target={tp_stored}")
@@ -955,7 +945,6 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders,
 
     # ── 6. Reconcile with exchange ────────────────────────────────────────────
     position = next((p for p in global_positions if p.get("pair") == pair_name), None)
-
     if position is not None:
         if not st.get("in_position"):
             entry_px = float(position.get("avg_price") or position.get("entry_price") or 0)
@@ -965,20 +954,17 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders,
             st["direction"]   = "long" if float(qty_str) > 0 else "short"
             st["entry_price"] = entry_px
             print(f"  [{symbol}] RECONCILE — {st['direction']} found on exchange")
-
         tp_pos, sl_pos = extract_tp_sl(position)
         if st.get("tp_level") is None and tp_pos:
             st["tp_level"] = round(tp_pos, precision)
         if st.get("sl_price") is None and sl_pos:
             st["sl_price"] = round(sl_pos, precision)
-
         b_val = str(df.iloc[row, 1]).strip() if df.shape[1] > 1 else ""
         c_val = str(df.iloc[row, 2]).strip() if df.shape[1] > 2 else ""
         if st.get("tp_level") and b_val == "":
             update_sheet_tp(row, st["tp_level"])
         if st.get("sl_price") and c_val == "":
             update_sheet_sl(row, st["sl_price"])
-
         save_state(all_state)
         return None
 
@@ -998,15 +984,18 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders,
     # ── 7. Candle dedup guard ─────────────────────────────────────────────────
     curr    = candles_15m[-1]
     curr_ts = int(curr["time"])
-    curr_c  = float(curr["close"])
-
     if curr_ts <= st.get("last_candle_ts", 0):
         print(f"  [{symbol}] SKIP — same 15m candle already processed")
         save_state(all_state)
         return None
 
-    # ── 7b. Volume check ─────────────────────────────────────────────────────
-    vol_24h_usd = compute_24h_vol_usd(candles_15m)
+    # ── 7b. STAGE 1 — Volume from DAILY futures candle ────────────────────────
+    vol_24h_usd, raw_daily = fetch_24h_volume(symbol)
+    if raw_daily is None:
+        print(f"  [{symbol}] DISCARDED — could not fetch daily candle for volume")
+        st["last_candle_ts"] = curr_ts
+        save_state(all_state)
+        return None
     if vol_24h_usd < MIN_24H_VOL_USDT:
         print(f"  [{symbol}] DISCARDED — 24h vol ${vol_24h_usd:,.0f} "
               f"< threshold ${MIN_24H_VOL_USDT:,.0f}")
@@ -1018,7 +1007,6 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders,
     # ── 8. Fetch 4H and 1H candles ───────────────────────────────────────────
     candles_4h = fetch_candles(symbol, CANDLES_4H, RESOLUTION_4H, CANDLE_SECONDS_4H)
     candles_1h = fetch_candles(symbol, CANDLES_1H, RESOLUTION_1H, CANDLE_SECONDS_1H)
-
     if candles_4h and (now_ms - int(candles_4h[-1]["time"])) < CANDLE_SECONDS_4H * 1000:
         candles_4h = candles_4h[:-1]
     if candles_1h and (now_ms - int(candles_1h[-1]["time"])) < CANDLE_SECONDS_1H * 1000:
@@ -1027,62 +1015,49 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders,
     # ── 9. Shared structural checks ───────────────────────────────────────────
     compress_ok, atr_pct, _ = check_1h_compression(candles_1h)
     if not compress_ok:
-        print(f"  [{symbol}] DISCARDED — no compression "
-              f"(1H ATR={atr_pct}% >= {ATR_COMPRESS_PCT}%)")
-        st["last_candle_ts"] = curr_ts
-        save_state(all_state)
-        return None
+        print(f"  [{symbol}] DISCARDED — no compression (1H ATR={atr_pct}% >= {ATR_COMPRESS_PCT}%)")
+        st["last_candle_ts"] = curr_ts; save_state(all_state); return None
     print(f"  [{symbol}] Compression PASS — 1H ATR={atr_pct}%")
 
     extended, rng_pct = check_range_not_extended(candles_15m)
     if extended:
-        print(f"  [{symbol}] DISCARDED — already extended "
-              f"(5-day range={rng_pct}% >= {RANGE_SKIP_PCT}%)")
-        st["last_candle_ts"] = curr_ts
-        save_state(all_state)
-        return None
+        print(f"  [{symbol}] DISCARDED — already extended (5-day range={rng_pct}% >= {RANGE_SKIP_PCT}%)")
+        st["last_candle_ts"] = curr_ts; save_state(all_state); return None
     print(f"  [{symbol}] Range PASS — 5-day range={rng_pct}%")
 
     # ── 10. Evaluate BOTH directions ─────────────────────────────────────────
     found_candidates = []
 
-    # ── LONG check ───────────────────────────────────────────────────────────
+    # ── LONG ─────────────────────────────────────────────────────────────────
     trend_up, close_4h, ema50_4h = check_4h_uptrend(candles_4h)
     if trend_up:
         slope_ok, ema_now, ema_prev = check_ema_slope(candles_4h, "long")
         if not slope_ok:
-            print(f"  [{symbol}] LONG: DISCARDED — EMA50 slope flat/falling "
-                  f"(ema_now={ema_now} vs ema_{EMA_SLOPE_BARS}bars_ago={ema_prev}) — ranging market")
+            print(f"  [{symbol}] LONG: DISCARDED — EMA50 flat/falling ({ema_prev} -> {ema_now})")
         else:
-            print(f"  [{symbol}] LONG: 4H trend PASS  close={close_4h}  "
-                  f"ema50={ema50_4h}  slope RISING ({ema_prev} -> {ema_now})")
+            print(f"  [{symbol}] LONG: 4H PASS  close={close_4h}  "
+                  f"ema50={ema50_4h}  slope RISING ({ema_prev}->{ema_now})")
             bo_ok, bo_close, prev_high, vol_ratio, strength_pct = check_15m_breakout(candles_15m)
             if not bo_ok:
                 print(f"  [{symbol}] LONG: DISCARDED — 2-candle breakout fail "
-                      f"(signal_close vs high={prev_high}, "
-                      f"vol={vol_ratio}x needs >={VOL_SPIKE_MULT}x, "
-                      f"strength={strength_pct}% needs >={MIN_BREAKOUT_PCT}%)")
+                      f"(ref={prev_high}, vol={vol_ratio}x, strength={strength_pct}%)")
             else:
                 htf_ok, htf_r, htf_p, htf_conf = check_1h_bullish_confirmation(candles_1h)
                 if not htf_ok:
-                    print(f"  [{symbol}] LONG: DISCARDED — 1H bullish confirm fail "
-                          f"(bullish={htf_conf}, vol_recent={htf_r} vs prev={htf_p})")
+                    print(f"  [{symbol}] LONG: DISCARDED — 1H bullish fail "
+                          f"(bullish={htf_conf}, vol {htf_p}->{htf_r})")
                 else:
-                    print(f"  [{symbol}] LONG: ALL PASS  "
-                          f"breakout={bo_close}  ref={prev_high}  "
-                          f"vol={vol_ratio}x  strength={strength_pct}%  "
-                          f"1H_bullish={htf_conf}")
+                    print(f"  [{symbol}] LONG: ALL PASS  confirm={bo_close}  "
+                          f"ref={prev_high}  vol={vol_ratio}x  strength={strength_pct}%")
                     entry_price        = round(bo_close, precision)
-                    tp_price, sl_price = compute_atr_tp_sl(
-                        entry_price, candles_15m, "long", precision)
+                    tp_price, sl_price = compute_atr_tp_sl(entry_price, candles_15m, "long", precision)
                     move_pct     = ((bo_close - prev_high) / prev_high * 100) if prev_high > 0 else 0.0
-                    ema_prox_pct = ((bo_close / ema50_4h - 1) * 100)          if ema50_4h > 0 else 0.0
-                    score = score_candidate(vol_ratio, move_pct, ema_prox_pct,
-                                            vol_24h_usd, "long", btc_bull)
+                    ema_prox_pct = ((bo_close / ema50_4h - 1) * 100) if ema50_4h > 0 else 0.0
+                    score  = score_candidate(vol_ratio, move_pct, ema_prox_pct, vol_24h_usd, "long", btc_bull)
                     tp_pct = round(abs((tp_price - entry_price) / entry_price * 100), 2)
                     sl_pct = round(abs((sl_price - entry_price) / entry_price * 100), 2)
-                    regime_tag = "" if btc_bull else " [COUNTER-TREND]"
-                    print(f"  [{symbol}] ✅ LONG CANDIDATE  score={score}{regime_tag}  "
+                    regime = "" if btc_bull else " [COUNTER-TREND]"
+                    print(f"  [{symbol}] ✅ LONG CANDIDATE  score={score}{regime}  "
                           f"entry={entry_price}  tp={tp_price}(+{tp_pct}%)  sl={sl_price}(-{sl_pct}%)")
                     found_candidates.append({
                         "symbol": symbol, "row": row, "direction": "long",
@@ -1090,49 +1065,41 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders,
                         "tp_price": tp_price, "sl_price": sl_price,
                         "precision": precision, "curr_ts": curr_ts,
                         "vol_ratio": vol_ratio, "move_pct": round(move_pct, 4),
-                        "ema_prox_pct": round(ema_prox_pct, 4),
-                        "vol_24h_usd": round(vol_24h_usd, 0),
+                        "ema_prox_pct": round(ema_prox_pct, 4), "vol_24h_usd": round(vol_24h_usd, 0),
                     })
     else:
-        print(f"  [{symbol}] LONG: 4H trend FAIL — close={close_4h} < ema50={ema50_4h}")
+        print(f"  [{symbol}] LONG: 4H FAIL — close={close_4h} < ema50={ema50_4h}")
 
-    # ── SHORT check ──────────────────────────────────────────────────────────
+    # ── SHORT ────────────────────────────────────────────────────────────────
     trend_dn, close_4h, ema50_4h = check_4h_downtrend(candles_4h)
     if trend_dn:
         slope_ok, ema_now, ema_prev = check_ema_slope(candles_4h, "short")
         if not slope_ok:
-            print(f"  [{symbol}] SHORT: DISCARDED — EMA50 slope flat/rising "
-                  f"(ema_now={ema_now} vs ema_{EMA_SLOPE_BARS}bars_ago={ema_prev}) — ranging market")
+            print(f"  [{symbol}] SHORT: DISCARDED — EMA50 flat/rising ({ema_prev} -> {ema_now})")
         else:
-            print(f"  [{symbol}] SHORT: 4H trend PASS  close={close_4h}  "
-                  f"ema50={ema50_4h}  slope FALLING ({ema_prev} -> {ema_now})")
+            print(f"  [{symbol}] SHORT: 4H PASS  close={close_4h}  "
+                  f"ema50={ema50_4h}  slope FALLING ({ema_prev}->{ema_now})")
             bd_ok, bd_close, prev_low, vol_ratio, strength_pct = check_15m_breakdown(candles_15m)
             if not bd_ok:
                 print(f"  [{symbol}] SHORT: DISCARDED — 2-candle breakdown fail "
-                      f"(signal_close vs low={prev_low}, "
-                      f"vol={vol_ratio}x needs >={VOL_SPIKE_MULT}x, "
-                      f"strength={strength_pct}% needs >={MIN_BREAKOUT_PCT}%)")
+                      f"(ref={prev_low}, vol={vol_ratio}x, strength={strength_pct}%)")
             else:
                 htf_ok, htf_r, htf_p, htf_conf = check_1h_bearish_confirmation(candles_1h)
                 if not htf_ok:
-                    print(f"  [{symbol}] SHORT: DISCARDED — 1H bearish confirm fail "
-                          f"(bearish={htf_conf}, vol_recent={htf_r} vs prev={htf_p})")
+                    print(f"  [{symbol}] SHORT: DISCARDED — 1H bearish fail "
+                          f"(bearish={htf_conf}, vol {htf_p}->{htf_r})")
                 else:
-                    print(f"  [{symbol}] SHORT: ALL PASS  "
-                          f"breakdown={bd_close}  ref={prev_low}  "
-                          f"vol={vol_ratio}x  strength={strength_pct}%  "
-                          f"1H_bearish={htf_conf}")
+                    print(f"  [{symbol}] SHORT: ALL PASS  confirm={bd_close}  "
+                          f"ref={prev_low}  vol={vol_ratio}x  strength={strength_pct}%")
                     entry_price        = round(bd_close, precision)
-                    tp_price, sl_price = compute_atr_tp_sl(
-                        entry_price, candles_15m, "short", precision)
+                    tp_price, sl_price = compute_atr_tp_sl(entry_price, candles_15m, "short", precision)
                     move_pct     = ((prev_low - bd_close) / prev_low * 100) if prev_low > 0 else 0.0
-                    ema_prox_pct = ((1 - bd_close / ema50_4h) * 100)        if ema50_4h > 0 else 0.0
-                    score = score_candidate(vol_ratio, move_pct, ema_prox_pct,
-                                            vol_24h_usd, "short", btc_bull)
+                    ema_prox_pct = ((1 - bd_close / ema50_4h) * 100) if ema50_4h > 0 else 0.0
+                    score  = score_candidate(vol_ratio, move_pct, ema_prox_pct, vol_24h_usd, "short", btc_bull)
                     tp_pct = round(abs((tp_price - entry_price) / entry_price * 100), 2)
                     sl_pct = round(abs((sl_price - entry_price) / entry_price * 100), 2)
-                    regime_tag = "" if not btc_bull else " [COUNTER-TREND]"
-                    print(f"  [{symbol}] ✅ SHORT CANDIDATE  score={score}{regime_tag}  "
+                    regime = "" if not btc_bull else " [COUNTER-TREND]"
+                    print(f"  [{symbol}] ✅ SHORT CANDIDATE  score={score}{regime}  "
                           f"entry={entry_price}  tp={tp_price}(-{tp_pct}%)  sl={sl_price}(+{sl_pct}%)")
                     found_candidates.append({
                         "symbol": symbol, "row": row, "direction": "short",
@@ -1140,11 +1107,10 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders,
                         "tp_price": tp_price, "sl_price": sl_price,
                         "precision": precision, "curr_ts": curr_ts,
                         "vol_ratio": vol_ratio, "move_pct": round(move_pct, 4),
-                        "ema_prox_pct": round(ema_prox_pct, 4),
-                        "vol_24h_usd": round(vol_24h_usd, 0),
+                        "ema_prox_pct": round(ema_prox_pct, 4), "vol_24h_usd": round(vol_24h_usd, 0),
                     })
     else:
-        print(f"  [{symbol}] SHORT: 4H trend FAIL — close={close_4h} > ema50={ema50_4h}")
+        print(f"  [{symbol}] SHORT: 4H FAIL — close={close_4h} > ema50={ema50_4h}")
 
     st["last_candle_ts"] = curr_ts
 
@@ -1165,22 +1131,19 @@ consecutive_errors = 0
 MAX_CONSECUTIVE_ERRORS = 10
 
 send_telegram(
-    f"✅ <b>Momentum Bot Started — Anti-Whipsaw Edition</b>\n"
+    f"✅ <b>Momentum Bot Started</b>\n"
     f"━━━━━━━━━━━━━━━━━━\n"
-    f"🛡 <b>Anti-Whipsaw filters:</b>\n"
-    f"  <code>① 2-candle confirm — next candle must hold the level</code>\n"
-    f"  <code>② Vol spike >= {VOL_SPIKE_MULT}x avg (raised from 1.5x)</code>\n"
-    f"  <code>③ EMA50 slope — must trend, not range</code>\n"
-    f"  <code>④ Min breakout strength >= {MIN_BREAKOUT_PCT}% beyond level</code>\n"
+    f"🔧 <b>Volume:</b> per-coin from DAILY futures candle (raw candle logged)\n"
+    f"   <code>vol_usd = daily_volume x daily_close  |  min ${MIN_24H_VOL_USDT:,}</code>\n"
     f"\n"
-    f"📐 <b>Strategy:</b>\n"
-    f"  <code>Every coin checked BOTH long + short per cycle</code>\n"
-    f"  <code>4H EMA50 decides direction per coin</code>\n"
-    f"  <code>BTC regime = +{REGIME_BONUS_PTS} pts bonus (not a gate)</code>\n"
+    f"🛡 <b>Anti-whipsaw:</b>\n"
+    f"  <code>① 2-candle confirm  ② {VOL_SPIKE_MULT}x vol  "
+    f"③ EMA slope  ④ {MIN_BREAKOUT_PCT}% min strength</code>\n"
     f"\n"
+    f"📐 <b>Strategy:</b> both long+short per coin | BTC regime = +{REGIME_BONUS_PTS} pts\n"
     f"💹 TP/SL: <code>ATR x {ATR_TP_MULT} / ATR x {ATR_SL_MULT} "
     f"(floor {MIN_TP_PCT}% / {MIN_SL_PCT}%)</code>\n"
-    f"🔁 Scan : <code>Every {SCAN_INTERVAL}s</code>  |  "
+    f"🔁 Scan: <code>Every {SCAN_INTERVAL}s</code>  |  "
     f"💰 <code>{CAPITAL_USDT} USDT x {LEVERAGE}x</code>"
 )
 
@@ -1232,10 +1195,9 @@ while True:
         slots_available = max(0, MAX_OPEN_TRADES - active_count)
         btc_label       = "BULL" if btc_bull else "BEAR"
         print(f"[SLOTS] {active_count} open / {MAX_OPEN_TRADES} max -> {slots_available} slot(s)")
-        print(f"[BTC]   {btc_label} regime — aligned direction scores +{REGIME_BONUS_PTS} pts\n")
+        print(f"[BTC]   {btc_label} — aligned trades score +{REGIME_BONUS_PTS} pts\n")
 
         candidates = []
-
         for symbol, row in eligible:
             print(f"--- {symbol} ---")
             try:
@@ -1255,7 +1217,7 @@ while True:
         n_short = sum(1 for c in candidates if c["direction"] == "short")
 
         print(f"\n[RANKING] {len(candidates)} candidate(s) "
-              f"({n_long} long, {n_short} short) | {slots_available} slot(s)")
+              f"({n_long}L / {n_short}S) | {slots_available} slot(s)")
         for i, c in enumerate(candidates):
             tag    = f"EXECUTE #{i + 1}" if i < slots_available else "SKIP (no slot)"
             emoji  = "🟢" if c["direction"] == "long" else "🔴"
