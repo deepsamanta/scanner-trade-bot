@@ -65,7 +65,7 @@ BASE_URL = "https://api.coindcx.com"
 # =============================================================================
 
 # ── Trade params ──────────────────────────────────────────────────────────────
-MAX_OPEN_TRADES   = 5
+MAX_OPEN_TRADES   = 12
 
 # ── ATR-based TP/SL ──────────────────────────────────────────────────────────
 # Structure-based SL + R-multiple TP (fully volatility-adaptive, no fixed % floors)
@@ -89,7 +89,7 @@ PENDING_EXPIRY_CANDLES = 6     # cancel unfilled retest order after 6 x 15m (sta
 VWAP_FILTER            = True
 
 # ── Universe filter ───────────────────────────────────────────────────────────
-MIN_24H_VOL_USDT  = 1_000_000
+MIN_24H_VOL_USDT  = 3_000_000
 
 STABLECOINS = {
     "USDT","USDC","BUSD","DAI","TUSD","USDP","FRAX","UST","LUSD",
