@@ -81,7 +81,7 @@ WRAPPED = {"WBTC", "WETH", "WBNB", "WMATIC", "WAVAX", "WSOL", "WFTM"}
 # ── Strategy params ───────────────────────────────────────────────────────────
 EMA200_15M_LEN     = 200   # 15m 200 EMA — the TP target
 DAYS_LOOKBACK      = 3     # how many UTC days to check one-sidedness over
-VWAP_EXT_MIN_PCT   = 75    # >= this % of those bars on one side = "long time"
+VWAP_EXT_MIN_PCT   = 60    # >= this % of those bars on one side = "long time"
 VWAP_EXT_MIN_BARS  = 100   # need at least this many bars in the window to judge
 VWAP_SLOPE_BARS    = 5     # vwap[-1] vs vwap[-1-N] for the angle measurement
 MIN_VWAP_SLOPE_PCT = 0.05  # minimum VWAP angle % — flat VWAP is not a turn
@@ -101,7 +101,7 @@ CANDLE_SECONDS_15M = 900
 CANDLE_SECONDS_1M  = 60
 
 # ── Timing ───────────────────────────────────────────────────────────────────
-SCAN_INTERVAL          = 120
+SCAN_INTERVAL          = 300
 REQUEST_TIMEOUT        = 15
 TELEGRAM_TIMEOUT       = 10
 GSHEET_REAUTH_INTERVAL = 45 * 60
@@ -702,7 +702,7 @@ def compute_qty(entry_price, symbol):
 # PLACE ORDER (LONG + SHORT)
 # =====================================================
 
-def place_reversal_order(symbol, direction, entry_price, tp_price, sl_price, precision):
+def place_reversal_order(symbol, direction, entry_price, tp_price, sl_price, precision, vwap=None):
     entry = round(entry_price, precision)
     tp    = round(tp_price,    precision)
     sl    = round(sl_price,    precision)
@@ -752,6 +752,7 @@ def place_reversal_order(symbol, direction, entry_price, tp_price, sl_price, pre
         f"{emoji} <b>NEW {label} (VWAP REVERSAL) — {symbol}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📍 Entry : <code>{entry}</code>\n"
+        f"📉 VWAP  : <code>{vwap}</code>  (session hlc3)\n"
         f"🎯 TP    : <code>{tp}</code>  (+{tp_pct}%  = 200 EMA)\n"
         f"🛑 SL    : <code>{sl}</code>  (-{sl_pct}%  beyond VWAP)\n"
         f"📦 Qty   : <code>{qty}</code>\n"
@@ -782,7 +783,8 @@ def execute_entry(cand, all_state):
     st = all_state.setdefault(symbol, init_symbol_state())
 
     placed, confirmed_entry, confirmed_tp = place_reversal_order(
-        symbol, direction, entry_price, tp_price, sl_price, precision
+        symbol, direction, entry_price, tp_price, sl_price, precision,
+        cand.get("vwap")
     )
 
     if placed:
@@ -976,6 +978,16 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
 
     st["last_candle_ts"] = curr_ts
 
+    # Current session VWAP value (hlc3) — logged for every coin so the
+    # price-vs-VWAP relationship is visible even when the coin is skipped.
+    cur_vwap  = vwaps[-1] if vwaps else None
+    cur_close = float(candles_15m[-1]["close"])
+    if cur_vwap:
+        dist_pct = (cur_close / cur_vwap - 1) * 100
+        rel      = "ABOVE" if cur_close > cur_vwap else "BELOW"
+        print(f"  [{symbol}] session VWAP(hlc3)={cur_vwap:.8g}  close={cur_close:.8g}  "
+              f"{rel} by {abs(dist_pct):.3f}%  (session_bars={session_bars})")
+
     # Today's VWAP line must exist as more than 1-2 bars, otherwise vwap[-1]
     # is essentially the bar's own hlc3 and the reclaim/respect test is noise.
     if session_bars < MIN_TRIGGER_SESSION_BARS:
@@ -988,8 +1000,14 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
     direction, below_pct, above_pct, counted, per_day = check_extension(
         candles_15m, vwaps, day_keys)
 
+    # per-day report: % of bars below that day's own VWAP + that day's final VWAP value
+    day_last_vwap = {}
+    for i, d in enumerate(day_keys):
+        day_last_vwap[d] = vwaps[i]
+
     day_report = "  ".join(
-        f"{d[-5:]}:{(b / t * 100):.0f}%below({t}b)" if t else f"{d[-5:]}:--"
+        (f"{d[-5:]}:{(b / t * 100):.0f}%below({t}b,vwap={day_last_vwap.get(d, 0):.6g})"
+         if t else f"{d[-5:]}:--")
         for d, (b, t) in sorted(per_day.items())
     )
     print(f"  [{symbol}] {DAYS_LOOKBACK}d vs own-day VWAP -> {day_report}")
@@ -1051,7 +1069,7 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
     candidate_score = score_candidate(ext_ratio, tp_dist_pct, slope_pct, vol_24h_usd)
 
     print(f"  [{symbol}] CANDIDATE ({direction.upper()})  score={candidate_score}  "
-          f"entry={entry_price}  tp={tp_price}  sl={sl_price}")
+          f"vwap={vwap_now}  entry={entry_price}  tp={tp_price}  sl={sl_price}")
 
     return {
         "symbol":      symbol,
@@ -1061,6 +1079,7 @@ def check_and_trade(symbol, row, df, all_state, global_positions, global_orders)
         "entry_price": entry_price,
         "tp_price":    tp_price,
         "sl_price":    sl_price,
+        "vwap":        vwap_now,
         "precision":   precision,
         "curr_ts":     curr_ts,
         "ext_ratio":   round(ext_ratio, 4),
@@ -1176,6 +1195,7 @@ while True:
         for i, c in enumerate(candidates):
             tag = f"EXECUTE #{i + 1}" if i < slots_available else "SKIP"
             print(f"  [{tag}] {c['symbol']} ({c['direction']})  score={c['score']}  "
+                  f"vwap={c['vwap']}  "
                   f"ext={c['ext_ratio']}  "
                   f"tp_dist={c['tp_dist_pct']}%  "
                   f"slope={c['slope_pct']}%  "
