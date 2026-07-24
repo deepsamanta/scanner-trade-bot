@@ -65,7 +65,7 @@ BASE_URL = "https://api.coindcx.com"
 # =============================================================================
 
 # ── Trade params ──────────────────────────────────────────────────────────────
-MAX_OPEN_TRADES    = 5     # max concurrent positions
+MAX_OPEN_TRADES    = 12     # max concurrent positions
 MIN_TP_PCT         = 1.0   # skip if 200 EMA closer than this (reward too small)
 MAX_TP_PCT         = 15.0  # skip if 200 EMA farther than this (target unrealistic)
 
