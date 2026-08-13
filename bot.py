@@ -18,30 +18,23 @@ BASE_URL = "https://api.coindcx.com"
 # Pine logic replicated:
 #   vwap = ta.vwap(hlc3, timeframe.change(period))
 #   -> cumulative hlc3*vol / vol, RESET at each period boundary:
-#        DAILY   : new UTC day
-#        WEEKLY  : new ISO week (Monday)
-#        MONTHLY : new calendar month
-#   When a period ends, its final VWAP value is stored as the
-#   "VWAP Close Level" (the horizontal line the Pine script plots).
+#        DAILY   : new UTC day        (15m candles)
+#        WEEKLY  : new ISO week (Mon) (1h candles)
+#        MONTHLY : new calendar month (4h candles — full prev-month coverage)
+#   When a period ends, its final VWAP is stored as a "VWAP Close Level".
+#   Historical close levels kept (Pine defaults):
+#        DAILY x1  |  WEEKLY x3  |  MONTHLY x2
 #
-# THIS BOT DOES NOT TRADE. It:
-#   • Scans all sheet symbols (stables/wrapped excluded, 24h vol floor)
-#   • Computes D / W / M running VWAP per coin
-#   • Logs every coin's VWAP data every cycle
-#   • Telegram alert when close CROSSES above/below the running VWAP
-#     (checked on CLOSED candles only, deduped per candle)
-#   • Previous period's VWAP close level included in logs + alerts
-#
-# Candle sources (CoinDCX public candlesticks, pcode=f):
-#   DAILY  VWAP : 15m candles (4 days)
-#   WEEKLY VWAP : 1h candles  (~10 days)
-#   MONTHLY VWAP: 1h candles  (~37 days, same fetch as weekly)
+# THIS BOT DOES NOT TRADE. Alerts on close crossing the RUNNING VWAP
+# (closed candles only, deduped). All VWAP data + historical levels logged.
 # =============================================================================
 
-# ── Pine defaults (isdVWAPc / iswVWAPc / ismVWAPc = true; Q/Y = false) ───────
 ENABLE_DAILY   = True
 ENABLE_WEEKLY  = True
 ENABLE_MONTHLY = True
+
+# Pine "Historical Closes" defaults
+HISTORICAL_LEVELS = {"D": 1, "W": 3, "M": 2}
 
 # ── Universe filter ──────────────────────────────────────────────────────────
 MIN_24H_VOL_USDT = 1_000_000
@@ -55,13 +48,16 @@ WRAPPED = {"WBTC", "WETH", "WBNB", "WMATIC", "WAVAX", "WSOL", "WFTM"}
 # ── Candles ──────────────────────────────────────────────────────────────────
 RESOLUTION_15M   = "15"
 RESOLUTION_1H    = "60"
+RESOLUTION_4H    = "240"
 RESOLUTION_DAILY = "1D"
 
-CANDLES_15M      = 400    # ~4 UTC days of 15m
-CANDLES_1H       = 900    # ~37 days of 1h  (covers weekly + monthly anchors)
+CANDLES_15M      = 400    # ~4 UTC days (daily VWAP + 1 prev daily level)
+CANDLES_1H       = 900    # ~37 days (weekly VWAP + 3 prev weekly levels)
+CANDLES_4H       = 560    # ~93 days (monthly VWAP + 2 prev monthly levels)
 
 CANDLE_SECONDS_15M = 900
 CANDLE_SECONDS_1H  = 3600
+CANDLE_SECONDS_4H  = 14400
 
 # ── Timing ───────────────────────────────────────────────────────────────────
 SCAN_INTERVAL          = 300
@@ -136,7 +132,6 @@ def save_state(state):
 
 
 def init_symbol_state():
-    # per timeframe: last closed-candle ts processed + last known side of VWAP
     return {
         "D": {"last_ts": 0, "side": None},
         "W": {"last_ts": 0, "side": None},
@@ -226,7 +221,7 @@ _vol_cache = {}   # symbol -> (day_str, vol_usd)
 
 
 def fetch_24h_volume(symbol):
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     cached = _vol_cache.get(symbol)
     if cached and cached[0] == today:
         return cached[1]
@@ -252,7 +247,7 @@ def fetch_24h_volume(symbol):
 
 
 # =====================================================
-# PINE REPLICATION — periodic VWAP (hlc3, anchor reset)
+# PINE REPLICATION — periodic VWAP + historical close levels
 # =====================================================
 
 def period_key(ts_ms, tf):
@@ -267,30 +262,41 @@ def period_key(ts_ms, tf):
     raise ValueError(tf)
 
 
-def compute_periodic_vwap(candles, tf):
+def compute_periodic_vwap(candles, tf, max_levels):
     """
-    ta.vwap(hlc3, timeframe.change(tf)) replicated.
+    ta.vwap(hlc3, timeframe.change(tf)) replicated + Pine's Historical Closes.
     Returns:
-      vwaps           — per-bar running VWAP (aligned 1:1 with candles)
-      cur_key         — current period key
-      prev_close_lvl  — previous period's FINAL vwap (Pine 'VWAP Close Level')
-      prev_key        — previous period key
-      period_bars     — bars in the current period
+      vwaps        — per-bar running VWAP (aligned 1:1 with candles)
+      cur_key      — current period key
+      close_levels — list of (period_key, final_vwap), newest LAST,
+                     trimmed to max_levels (like Pine's shift/delete).
+                     close_levels[-1] = most recent completed period.
+                     NOTE: the FIRST period in the data window may be partial
+                     (window may not start exactly at a period boundary) —
+                     with the candle counts above, all kept levels are full.
+      period_bars  — bars in the current period
+      complete     — True if the first level's period started inside the window
+                     (i.e., we saw its opening bar), so all levels are exact
     """
-    vwaps          = []
-    cum_pv         = 0.0
-    cum_v          = 0.0
-    cur_key        = None
-    prev_close_lvl = None
-    prev_key       = None
-    period_bars    = 0
+    vwaps        = []
+    cum_pv       = 0.0
+    cum_v        = 0.0
+    cur_key      = None
+    close_levels = []
+    period_bars  = 0
+    first_key    = None
+    boundaries   = 0
 
     for c in candles:
         k = period_key(c["time"], tf)
         if k != cur_key:                      # timeframe.change -> anchor reset
-            if vwaps:
-                prev_close_lvl = vwaps[-1]    # final vwap of the period that just ended
-                prev_key       = cur_key
+            if vwaps:                         # close the period that just ended
+                close_levels.append((cur_key, vwaps[-1]))
+                if len(close_levels) > max_levels + 1:   # +1: drop partial-first later
+                    close_levels.pop(0)
+                boundaries += 1
+            else:
+                first_key = k
             cur_key     = k
             cum_pv      = 0.0
             cum_v       = 0.0
@@ -303,7 +309,17 @@ def compute_periodic_vwap(candles, tf):
         vwaps.append(cum_pv / cum_v if cum_v > 0 else cl)
         period_bars += 1
 
-    return vwaps, cur_key, prev_close_lvl, prev_key, period_bars
+    # The very first period in the window is likely partial (window start
+    # mid-period) — drop its level if it's still in the list, then trim.
+    if close_levels and first_key is not None and close_levels[0][0] == first_key:
+        # only trustworthy if the window happened to start exactly at the boundary;
+        # safest to keep it only when we have surplus levels
+        if len(close_levels) > max_levels:
+            close_levels.pop(0)
+    close_levels = close_levels[-max_levels:]
+
+    complete = len(close_levels) == max_levels
+    return vwaps, cur_key, close_levels, period_bars, complete
 
 
 def detect_cross(candles, vwaps):
@@ -311,7 +327,6 @@ def detect_cross(candles, vwaps):
     Cross on the LAST CLOSED bar:
       above: close[-2] <= vwap[-2] and close[-1] > vwap[-1]
       below: close[-2] >= vwap[-2] and close[-1] < vwap[-1]
-    Returns "above" | "below" | None.
     """
     if len(candles) < 2 or len(vwaps) < 2:
         return None
@@ -322,6 +337,16 @@ def detect_cross(candles, vwaps):
     if c2 >= v2 and c1 < v1:
         return "below"
     return None
+
+
+def fmt_levels(close_levels):
+    """'W32=0.074236 | W31=0.0812' style, newest first, numbered like Pine (1)=newest."""
+    if not close_levels:
+        return "--"
+    parts = []
+    for i, (k, v) in enumerate(reversed(close_levels), start=1):
+        parts.append(f"({i}){k}={v:.8g}")
+    return "  ".join(parts)
 
 
 # =====================================================
@@ -336,22 +361,24 @@ def scan_symbol(symbol, all_state):
     for k in ("D", "W", "M"):
         st.setdefault(k, {"last_ts": 0, "side": None})
 
-    # volume floor
     vol_usd = fetch_24h_volume(symbol)
     if vol_usd < MIN_24H_VOL_USDT:
         print(f"  [{symbol}] SKIP — 24h vol ${vol_usd:,.0f} < ${MIN_24H_VOL_USDT:,.0f}")
         return
 
-    # fetch series
     candles_15m = drop_forming_candle(
         fetch_candles(symbol, CANDLES_15M, RESOLUTION_15M, CANDLE_SECONDS_15M),
         CANDLE_SECONDS_15M)
     candles_1h  = drop_forming_candle(
         fetch_candles(symbol, CANDLES_1H, RESOLUTION_1H, CANDLE_SECONDS_1H),
         CANDLE_SECONDS_1H)
+    candles_4h  = drop_forming_candle(
+        fetch_candles(symbol, CANDLES_4H, RESOLUTION_4H, CANDLE_SECONDS_4H),
+        CANDLE_SECONDS_4H)
 
-    if len(candles_15m) < 10 or len(candles_1h) < 30:
-        print(f"  [{symbol}] SKIP — insufficient candles (15m={len(candles_15m)} 1h={len(candles_1h)})")
+    if len(candles_15m) < 10 or len(candles_1h) < 30 or len(candles_4h) < 30:
+        print(f"  [{symbol}] SKIP — insufficient candles "
+              f"(15m={len(candles_15m)} 1h={len(candles_1h)} 4h={len(candles_4h)})")
         return
 
     checks = []
@@ -360,45 +387,49 @@ def scan_symbol(symbol, all_state):
     if ENABLE_WEEKLY:
         checks.append(("W", candles_1h))
     if ENABLE_MONTHLY:
-        checks.append(("M", candles_1h))
+        checks.append(("M", candles_4h))          # FIX: full prev-month coverage
 
     for tf, candles in checks:
-        vwaps, cur_key, prev_lvl, prev_key, pbars = compute_periodic_vwap(candles, tf)
+        vwaps, cur_key, levels, pbars, complete = compute_periodic_vwap(
+            candles, tf, HISTORICAL_LEVELS[tf])
+
         close   = float(candles[-1]["close"])
         vwap    = vwaps[-1]
         curr_ts = int(candles[-1]["time"])
         side    = "ABOVE" if close > vwap else "BELOW"
         dist    = (close / vwap - 1) * 100 if vwap else 0
 
-        # ── LOG every coin's vwap data ───────────────────────────────────────
+        # ── LOG every coin's vwap data + historical levels ───────────────────
         print(f"  [{symbol}] {TF_LABEL[tf]:8s} vwap={vwap:.8g}  close={close:.8g}  "
-              f"{side} {abs(dist):.3f}%  period={cur_key}({pbars}b)  "
-              f"prev_close_lvl[{prev_key}]={prev_lvl:.8g}" if prev_lvl else
-              f"  [{symbol}] {TF_LABEL[tf]:8s} vwap={vwap:.8g}  close={close:.8g}  "
-              f"{side} {abs(dist):.3f}%  period={cur_key}({pbars}b)  prev_close_lvl=--")
+              f"{side} {abs(dist):.3f}%  period={cur_key}({pbars}b)"
+              f"{'' if complete else '  [levels partial]'}")
+        print(f"  [{symbol}] {TF_LABEL[tf]:8s} close_levels: {fmt_levels(levels)}")
 
         tf_st = st[tf]
-
-        # dedup: only evaluate a candle once
         if curr_ts <= tf_st.get("last_ts", 0):
             continue
         tf_st["last_ts"] = curr_ts
 
-        cross = detect_cross(candles, vwaps)
-        prev_side       = tf_st.get("side")
-        tf_st["side"]   = side
+        cross     = detect_cross(candles, vwaps)
+        prev_side = tf_st.get("side")
+        tf_st["side"] = side
 
-        if cross and prev_side is not None:      # skip first-observation "cross"
+        if cross and prev_side is not None:
             emoji = "🟢⬆️" if cross == "above" else "🔴⬇️"
             print(f"  [{symbol}] *** CROSS {cross.upper()} {TF_LABEL[tf]} VWAP ***")
+
+            lvl_lines = ""
+            for i, (k, v) in enumerate(reversed(levels), start=1):
+                lvl_lines += f"  ({i}) <code>{k}</code> = <code>{v:.8g}</code>\n"
+
             send_telegram(
                 f"{emoji} <b>{symbol} — CROSS {cross.upper()} {TF_LABEL[tf]} VWAP</b>\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f"📍 Close : <code>{close:.8g}</code>\n"
                 f"📉 VWAP  : <code>{vwap:.8g}</code>  (hlc3, {TF_LABEL[tf].lower()} anchor)\n"
                 f"📐 Dist  : <code>{dist:+.3f}%</code>\n"
-                f"🧱 Prev {TF_LABEL[tf].lower()} VWAP close: <code>{(f'{prev_lvl:.8g}') if prev_lvl else '--'}</code>\n"
                 f"🕐 Period: <code>{cur_key}</code> ({pbars} bars)\n"
+                f"🧱 Prev {TF_LABEL[tf].lower()} close levels:\n{lvl_lines}"
                 f"💵 24h vol: <code>${vol_usd:,.0f}</code>"
             )
 
@@ -428,9 +459,6 @@ def scan_symbol(symbol, all_state):
 #     payload, headers = sign_request(body)
 #     requests.post(BASE_URL + "/exchange/v1/derivatives/futures/orders/create",
 #                   data=payload, headers=headers, timeout=REQUEST_TIMEOUT)
-#
-# (sign_request / get_all_positions / get_all_open_orders / execute_entry
-#  from the previous bot go here when trading is re-enabled)
 
 
 # =====================================================
@@ -445,8 +473,9 @@ send_telegram(
     f"✅ <b>VWAP Periodic Close Bot Started (SIGNAL ONLY)</b>\n"
     f"━━━━━━━━━━━━━━━━━━\n"
     f"📐 Replicates: <code>LuxAlgo VWAP Periodic Close (hlc3)</code>\n"
-    f"🕐 Anchors : <code>D(15m){' + W(1h)' if ENABLE_WEEKLY else ''}"
-    f"{' + M(1h)' if ENABLE_MONTHLY else ''}</code>\n"
+    f"🕐 Anchors : <code>D(15m) + W(1h) + M(4h)</code>\n"
+    f"🧱 Levels  : <code>D x{HISTORICAL_LEVELS['D']} | W x{HISTORICAL_LEVELS['W']} | "
+    f"M x{HISTORICAL_LEVELS['M']}</code> (Pine defaults)\n"
     f"🔔 Alerts  : <code>Close crosses above/below running VWAP</code>\n"
     f"🚫 Trading : <code>DISABLED — alerts only</code>\n"
     f"💵 Filter  : <code>24h vol >= ${MIN_24H_VOL_USDT:,}</code>\n"
