@@ -5,7 +5,7 @@ import json
 import os
 import gspread
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from google.oauth2.service_account import Credentials
 
 from config import SHEET_ID, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
@@ -15,26 +15,27 @@ BASE_URL = "https://api.coindcx.com"
 # =============================================================================
 # STRATEGY: VWAP Periodic Close [LuxAlgo] — Python replication — SIGNAL ONLY
 #
-# Pine logic replicated:
-#   vwap = ta.vwap(hlc3, timeframe.change(period))
-#   -> cumulative hlc3*vol / vol, RESET at each period boundary:
+#   vwap = ta.vwap(hlc3, timeframe.change(period)) — reset at anchor:
 #        DAILY   : new UTC day        (15m candles)
 #        WEEKLY  : new ISO week (Mon) (1h candles)
-#        MONTHLY : new calendar month (4h candles — full prev-month coverage)
-#   When a period ends, its final VWAP is stored as a "VWAP Close Level".
-#   Historical close levels kept (Pine defaults):
-#        DAILY x1  |  WEEKLY x3  |  MONTHLY x2
+#        MONTHLY : new calendar month (4h candles)
+#   Historical close levels (Pine defaults): D x1 | W x3 | M x2
 #
-# THIS BOT DOES NOT TRADE. Alerts on close crossing the RUNNING VWAP
-# (closed candles only, deduped). All VWAP data + historical levels logged.
+# DATA COVERAGE FIX:
+#   CoinDCX caps candles per request -> old fixed-count fetch left the
+#   window starting mid-period ("[levels partial]", wrong old levels).
+#   Now: compute the EXACT period-boundary start ts (Monday of W-3,
+#   1st of M-2, start of D-1) and PAGINATE fetches in chunks until the
+#   full range is covered. Every kept level is complete by construction.
+#
+# NO TRADING. Alerts on close crossing running VWAP (closed candles only).
 # =============================================================================
 
 ENABLE_DAILY   = True
 ENABLE_WEEKLY  = True
 ENABLE_MONTHLY = True
 
-# Pine "Historical Closes" defaults
-HISTORICAL_LEVELS = {"D": 1, "W": 3, "M": 2}
+HISTORICAL_LEVELS = {"D": 1, "W": 3, "M": 2}   # Pine defaults
 
 # ── Universe filter ──────────────────────────────────────────────────────────
 MIN_24H_VOL_USDT = 1_000_000
@@ -51,13 +52,11 @@ RESOLUTION_1H    = "60"
 RESOLUTION_4H    = "240"
 RESOLUTION_DAILY = "1D"
 
-CANDLES_15M      = 400    # ~4 UTC days (daily VWAP + 1 prev daily level)
-CANDLES_1H       = 900    # ~37 days (weekly VWAP + 3 prev weekly levels)
-CANDLES_4H       = 560    # ~93 days (monthly VWAP + 2 prev monthly levels)
-
 CANDLE_SECONDS_15M = 900
 CANDLE_SECONDS_1H  = 3600
 CANDLE_SECONDS_4H  = 14400
+
+FETCH_CHUNK = 300          # candles per API request (safe under CoinDCX cap)
 
 # ── Timing ───────────────────────────────────────────────────────────────────
 SCAN_INTERVAL          = 300
@@ -185,25 +184,68 @@ def send_telegram(message):
 
 
 # =====================================================
-# CANDLE FETCHER
+# PERIOD BOUNDARY CALCULATION (the fix, part 1)
 # =====================================================
 
-def fetch_candles(symbol, num_candles, resolution_str, candle_seconds):
-    url    = "https://public.coindcx.com/market_data/candlesticks"
-    now    = int(time.time())
-    params = {
-        "pair":       fut_pair(symbol),
-        "from":       now - (num_candles + 5) * candle_seconds,
-        "to":         now,
-        "resolution": resolution_str,
-        "pcode":      "f",
-    }
-    try:
-        data = requests.get(url, params=params, timeout=REQUEST_TIMEOUT).json().get("data", [])
-        return sorted(data, key=lambda x: x["time"])
-    except Exception as e:
-        print(f"[CANDLES {resolution_str}] {symbol} error: {e}")
-        return []
+def period_start_ts(tf, n_hist):
+    """
+    UTC epoch seconds of the start of the OLDEST period we need:
+    current period minus n_hist periods, aligned to the period boundary.
+      D: 00:00 UTC of (today - n_hist days)
+      W: 00:00 UTC Monday of (this ISO week - n_hist weeks)
+      M: 00:00 UTC 1st of (this month - n_hist months)
+    """
+    now = datetime.now(timezone.utc)
+    if tf == "D":
+        start = (now - timedelta(days=n_hist)).replace(hour=0, minute=0, second=0, microsecond=0)
+    elif tf == "W":
+        monday = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        start  = monday - timedelta(weeks=n_hist)
+    elif tf == "M":
+        y, m = now.year, now.month - n_hist
+        while m <= 0:
+            m += 12
+            y -= 1
+        start = datetime(y, m, 1, tzinfo=timezone.utc)
+    else:
+        raise ValueError(tf)
+    return int(start.timestamp())
+
+
+# =====================================================
+# PAGINATED CANDLE FETCHER (the fix, part 2)
+# =====================================================
+
+def fetch_candles_range(symbol, from_ts, resolution_str, candle_seconds):
+    """
+    Fetch ALL candles from from_ts to now, in FETCH_CHUNK-sized requests,
+    deduped by candle time. Guarantees full range coverage regardless of
+    the API's per-request cap.
+    """
+    url     = "https://public.coindcx.com/market_data/candlesticks"
+    now     = int(time.time())
+    by_time = {}
+    cur     = from_ts
+
+    while cur < now:
+        chunk_to = min(cur + FETCH_CHUNK * candle_seconds, now)
+        params = {
+            "pair":       fut_pair(symbol),
+            "from":       cur,
+            "to":         chunk_to,
+            "resolution": resolution_str,
+            "pcode":      "f",
+        }
+        try:
+            data = requests.get(url, params=params, timeout=REQUEST_TIMEOUT).json().get("data", [])
+        except Exception as e:
+            print(f"[CANDLES {resolution_str}] {symbol} chunk error: {e}")
+            data = []
+        for c in data:
+            by_time[int(c["time"])] = c
+        cur = chunk_to
+
+    return sorted(by_time.values(), key=lambda x: x["time"])
 
 
 def drop_forming_candle(candles, candle_seconds):
@@ -217,7 +259,7 @@ def drop_forming_candle(candles, candle_seconds):
 # VOLUME FILTER (cached once per UTC day per symbol)
 # =====================================================
 
-_vol_cache = {}   # symbol -> (day_str, vol_usd)
+_vol_cache = {}
 
 
 def fetch_24h_volume(symbol):
@@ -255,7 +297,7 @@ def period_key(ts_ms, tf):
     if tf == "D":
         return dt.strftime("%Y-%m-%d")
     if tf == "W":
-        iso = dt.isocalendar()                      # week starts Monday (Pine 'W')
+        iso = dt.isocalendar()
         return f"{iso[0]}-W{iso[1]:02d}"
     if tf == "M":
         return dt.strftime("%Y-%m")
@@ -264,19 +306,10 @@ def period_key(ts_ms, tf):
 
 def compute_periodic_vwap(candles, tf, max_levels):
     """
-    ta.vwap(hlc3, timeframe.change(tf)) replicated + Pine's Historical Closes.
-    Returns:
-      vwaps        — per-bar running VWAP (aligned 1:1 with candles)
-      cur_key      — current period key
-      close_levels — list of (period_key, final_vwap), newest LAST,
-                     trimmed to max_levels (like Pine's shift/delete).
-                     close_levels[-1] = most recent completed period.
-                     NOTE: the FIRST period in the data window may be partial
-                     (window may not start exactly at a period boundary) —
-                     with the candle counts above, all kept levels are full.
-      period_bars  — bars in the current period
-      complete     — True if the first level's period started inside the window
-                     (i.e., we saw its opening bar), so all levels are exact
+    ta.vwap(hlc3, timeframe.change(tf)) + historical close levels.
+    Data window starts exactly at a period boundary (period_start_ts),
+    so every completed period in it is FULL — no partial handling needed.
+    close_levels: [(period_key, final_vwap)], newest LAST, max max_levels.
     """
     vwaps        = []
     cum_pv       = 0.0
@@ -284,19 +317,14 @@ def compute_periodic_vwap(candles, tf, max_levels):
     cur_key      = None
     close_levels = []
     period_bars  = 0
-    first_key    = None
-    boundaries   = 0
 
     for c in candles:
         k = period_key(c["time"], tf)
-        if k != cur_key:                      # timeframe.change -> anchor reset
-            if vwaps:                         # close the period that just ended
+        if k != cur_key:
+            if vwaps:
                 close_levels.append((cur_key, vwaps[-1]))
-                if len(close_levels) > max_levels + 1:   # +1: drop partial-first later
+                if len(close_levels) > max_levels:
                     close_levels.pop(0)
-                boundaries += 1
-            else:
-                first_key = k
             cur_key     = k
             cum_pv      = 0.0
             cum_v       = 0.0
@@ -309,25 +337,10 @@ def compute_periodic_vwap(candles, tf, max_levels):
         vwaps.append(cum_pv / cum_v if cum_v > 0 else cl)
         period_bars += 1
 
-    # The very first period in the window is likely partial (window start
-    # mid-period) — drop its level if it's still in the list, then trim.
-    if close_levels and first_key is not None and close_levels[0][0] == first_key:
-        # only trustworthy if the window happened to start exactly at the boundary;
-        # safest to keep it only when we have surplus levels
-        if len(close_levels) > max_levels:
-            close_levels.pop(0)
-    close_levels = close_levels[-max_levels:]
-
-    complete = len(close_levels) == max_levels
-    return vwaps, cur_key, close_levels, period_bars, complete
+    return vwaps, cur_key, close_levels, period_bars
 
 
 def detect_cross(candles, vwaps):
-    """
-    Cross on the LAST CLOSED bar:
-      above: close[-2] <= vwap[-2] and close[-1] > vwap[-1]
-      below: close[-2] >= vwap[-2] and close[-1] < vwap[-1]
-    """
     if len(candles) < 2 or len(vwaps) < 2:
         return None
     c2, c1 = float(candles[-2]["close"]), float(candles[-1]["close"])
@@ -340,13 +353,10 @@ def detect_cross(candles, vwaps):
 
 
 def fmt_levels(close_levels):
-    """'W32=0.074236 | W31=0.0812' style, newest first, numbered like Pine (1)=newest."""
     if not close_levels:
         return "--"
-    parts = []
-    for i, (k, v) in enumerate(reversed(close_levels), start=1):
-        parts.append(f"({i}){k}={v:.8g}")
-    return "  ".join(parts)
+    return "  ".join(f"({i}){k}={v:.8g}"
+                     for i, (k, v) in enumerate(reversed(close_levels), start=1))
 
 
 # =====================================================
@@ -354,6 +364,12 @@ def fmt_levels(close_levels):
 # =====================================================
 
 TF_LABEL = {"D": "DAILY", "W": "WEEKLY", "M": "MONTHLY"}
+
+TF_FETCH = {
+    "D": (RESOLUTION_15M, CANDLE_SECONDS_15M),
+    "W": (RESOLUTION_1H,  CANDLE_SECONDS_1H),
+    "M": (RESOLUTION_4H,  CANDLE_SECONDS_4H),
+}
 
 
 def scan_symbol(symbol, all_state):
@@ -366,31 +382,32 @@ def scan_symbol(symbol, all_state):
         print(f"  [{symbol}] SKIP — 24h vol ${vol_usd:,.0f} < ${MIN_24H_VOL_USDT:,.0f}")
         return
 
-    candles_15m = drop_forming_candle(
-        fetch_candles(symbol, CANDLES_15M, RESOLUTION_15M, CANDLE_SECONDS_15M),
-        CANDLE_SECONDS_15M)
-    candles_1h  = drop_forming_candle(
-        fetch_candles(symbol, CANDLES_1H, RESOLUTION_1H, CANDLE_SECONDS_1H),
-        CANDLE_SECONDS_1H)
-    candles_4h  = drop_forming_candle(
-        fetch_candles(symbol, CANDLES_4H, RESOLUTION_4H, CANDLE_SECONDS_4H),
-        CANDLE_SECONDS_4H)
-
-    if len(candles_15m) < 10 or len(candles_1h) < 30 or len(candles_4h) < 30:
-        print(f"  [{symbol}] SKIP — insufficient candles "
-              f"(15m={len(candles_15m)} 1h={len(candles_1h)} 4h={len(candles_4h)})")
-        return
-
     checks = []
     if ENABLE_DAILY:
-        checks.append(("D", candles_15m))
+        checks.append("D")
     if ENABLE_WEEKLY:
-        checks.append(("W", candles_1h))
+        checks.append("W")
     if ENABLE_MONTHLY:
-        checks.append(("M", candles_4h))          # FIX: full prev-month coverage
+        checks.append("M")
 
-    for tf, candles in checks:
-        vwaps, cur_key, levels, pbars, complete = compute_periodic_vwap(
+    for tf in checks:
+        res, secs = TF_FETCH[tf]
+        from_ts   = period_start_ts(tf, HISTORICAL_LEVELS[tf])
+        candles   = drop_forming_candle(
+            fetch_candles_range(symbol, from_ts, res, secs), secs)
+
+        if len(candles) < 5:
+            print(f"  [{symbol}] {TF_LABEL[tf]} SKIP — insufficient candles ({len(candles)})")
+            continue
+
+        # coverage check: first candle must sit in the oldest required period
+        first_key    = period_key(candles[0]["time"], tf)
+        expected_key = period_key(from_ts * 1000, tf)
+        if first_key != expected_key:
+            print(f"  [{symbol}] {TF_LABEL[tf]} WARN — data starts {first_key}, "
+                  f"needed {expected_key} (coin may be newly listed)")
+
+        vwaps, cur_key, levels, pbars = compute_periodic_vwap(
             candles, tf, HISTORICAL_LEVELS[tf])
 
         close   = float(candles[-1]["close"])
@@ -399,10 +416,8 @@ def scan_symbol(symbol, all_state):
         side    = "ABOVE" if close > vwap else "BELOW"
         dist    = (close / vwap - 1) * 100 if vwap else 0
 
-        # ── LOG every coin's vwap data + historical levels ───────────────────
         print(f"  [{symbol}] {TF_LABEL[tf]:8s} vwap={vwap:.8g}  close={close:.8g}  "
-              f"{side} {abs(dist):.3f}%  period={cur_key}({pbars}b)"
-              f"{'' if complete else '  [levels partial]'}")
+              f"{side} {abs(dist):.3f}%  period={cur_key}({pbars}b)")
         print(f"  [{symbol}] {TF_LABEL[tf]:8s} close_levels: {fmt_levels(levels)}")
 
         tf_st = st[tf]
@@ -475,7 +490,8 @@ send_telegram(
     f"📐 Replicates: <code>LuxAlgo VWAP Periodic Close (hlc3)</code>\n"
     f"🕐 Anchors : <code>D(15m) + W(1h) + M(4h)</code>\n"
     f"🧱 Levels  : <code>D x{HISTORICAL_LEVELS['D']} | W x{HISTORICAL_LEVELS['W']} | "
-    f"M x{HISTORICAL_LEVELS['M']}</code> (Pine defaults)\n"
+    f"M x{HISTORICAL_LEVELS['M']}</code>\n"
+    f"📡 Fetch   : <code>Paginated from exact period boundaries</code>\n"
     f"🔔 Alerts  : <code>Close crosses above/below running VWAP</code>\n"
     f"🚫 Trading : <code>DISABLED — alerts only</code>\n"
     f"💵 Filter  : <code>24h vol >= ${MIN_24H_VOL_USDT:,}</code>\n"
