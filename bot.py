@@ -28,6 +28,7 @@ BASE_URL = "https://api.coindcx.com"
 #   below: close[-2] >= level and close[-1] < level
 # Deduped per candle, first observation never alerts.
 #
+# UNIVERSE: ALL sheet coins (stables/wrapped excluded). NO volume filter.
 # NO TRADING.
 # =============================================================================
 
@@ -37,9 +38,6 @@ ENABLE_MONTHLY = True
 
 HISTORICAL_LEVELS = {"D": 1, "W": 3, "M": 2}   # Pine defaults
 
-# ── Universe filter ──────────────────────────────────────────────────────────
-MIN_24H_VOL_USDT = 1_000_000
-
 STABLECOINS = {
     "USDT", "USDC", "BUSD", "DAI", "TUSD", "USDP", "FRAX", "UST", "LUSD",
     "FDUSD", "PYUSD", "USDD", "USDN", "GUSD", "SUSD", "CUSD", "USDX", "OUSD",
@@ -47,10 +45,9 @@ STABLECOINS = {
 WRAPPED = {"WBTC", "WETH", "WBNB", "WMATIC", "WAVAX", "WSOL", "WFTM"}
 
 # ── Candles ──────────────────────────────────────────────────────────────────
-RESOLUTION_15M   = "15"
-RESOLUTION_1H    = "60"
-RESOLUTION_4H    = "240"
-RESOLUTION_DAILY = "1D"
+RESOLUTION_15M = "15"
+RESOLUTION_1H  = "60"
+RESOLUTION_4H  = "240"
 
 CANDLE_SECONDS_15M = 900
 CANDLE_SECONDS_1H  = 3600
@@ -248,39 +245,6 @@ def drop_forming_candle(candles, candle_seconds):
 
 
 # =====================================================
-# VOLUME FILTER (cached per UTC day)
-# =====================================================
-
-_vol_cache = {}
-
-
-def fetch_24h_volume(symbol):
-    today  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    cached = _vol_cache.get(symbol)
-    if cached and cached[0] == today:
-        return cached[1]
-    try:
-        now    = int(time.time())
-        params = {"pair": fut_pair(symbol), "from": now - 3 * 86400,
-                  "to": now, "resolution": RESOLUTION_DAILY, "pcode": "f"}
-        r = requests.get("https://public.coindcx.com/market_data/candlesticks",
-                         params=params, timeout=REQUEST_TIMEOUT)
-        if r.status_code != 200:
-            return 0.0
-        data = r.json()
-        candle_list = data.get("data", data) if isinstance(data, dict) else data
-        if not candle_list:
-            return 0.0
-        daily   = sorted(candle_list, key=lambda x: x["time"])[-1]
-        vol_usd = float(daily.get("volume", 0) or 0) * float(daily.get("close", 0) or 0)
-        _vol_cache[symbol] = (today, vol_usd)
-        return vol_usd
-    except Exception as e:
-        print(f"  [VOL] {symbol} error: {e}")
-        return 0.0
-
-
-# =====================================================
 # CLOSE LEVELS — completed periods ONLY
 # =====================================================
 
@@ -342,11 +306,6 @@ def scan_symbol(symbol, all_state):
     st.setdefault("levels", {})
     st.setdefault("last_ts", 0)
 
-    vol_usd = fetch_24h_volume(symbol)
-    if vol_usd < MIN_24H_VOL_USDT:
-        print(f"  [{symbol}] SKIP — 24h vol ${vol_usd:,.0f} < ${MIN_24H_VOL_USDT:,.0f}")
-        return
-
     tfs = []
     if ENABLE_DAILY:
         tfs.append("D")
@@ -356,7 +315,7 @@ def scan_symbol(symbol, all_state):
         tfs.append("M")
 
     # ── Build all close levels (completed periods only) ──────────────────────
-    all_levels = {}          # (tf, period_key) -> value
+    all_levels    = {}          # (tf, period_key) -> (index, value)
     daily_candles = None
 
     for tf in tfs:
@@ -382,14 +341,14 @@ def scan_symbol(symbol, all_state):
         return
 
     # ── Cross detection: 15m closed candle vs every level ────────────────────
-    c2 = float(daily_candles[-2]["close"])
-    c1 = float(daily_candles[-1]["close"])
+    c2      = float(daily_candles[-2]["close"])
+    c1      = float(daily_candles[-1]["close"])
     curr_ts = int(daily_candles[-1]["time"])
 
     already_processed = curr_ts <= st.get("last_ts", 0)
     st["last_ts"] = max(st.get("last_ts", 0), curr_ts)
 
-    lvl_state = st["levels"]
+    lvl_state  = st["levels"]
     valid_keys = set()
 
     for (tf, pkey), (idx, lvl) in all_levels.items():
@@ -397,7 +356,7 @@ def scan_symbol(symbol, all_state):
         valid_keys.add(skey)
         side = "ABOVE" if c1 > lvl else "BELOW"
 
-        prev_side = lvl_state.get(skey)
+        prev_side       = lvl_state.get(skey)
         lvl_state[skey] = side
 
         if already_processed or prev_side is None:
@@ -420,8 +379,7 @@ def scan_symbol(symbol, all_state):
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f"📍 Close : <code>{c1:.8g}</code>  (15m)\n"
                 f"🧱 Level : <code>{lvl:.8g}</code>  ({label} · {pkey})\n"
-                f"📐 Dist  : <code>{dist:+.3f}%</code>\n"
-                f"💵 24h vol: <code>${vol_usd:,.0f}</code>"
+                f"📐 Dist  : <code>{dist:+.3f}%</code>"
             )
 
     # prune stale level-side entries (rolled-off periods)
@@ -472,8 +430,8 @@ send_telegram(
     f"🧱 Tracked: <code>D x{HISTORICAL_LEVELS['D']} | W x{HISTORICAL_LEVELS['W']} | "
     f"M x{HISTORICAL_LEVELS['M']}</code>\n"
     f"🔔 Alerts : <code>15m close crosses above/below any level</code>\n"
+    f"🌐 Universe: <code>ALL sheet coins (no volume filter)</code>\n"
     f"🚫 Trading: <code>DISABLED — alerts only</code>\n"
-    f"💵 Filter : <code>24h vol >= ${MIN_24H_VOL_USDT:,}</code>\n"
     f"🔁 Scan   : <code>Every {SCAN_INTERVAL}s</code>"
 )
 
@@ -497,7 +455,7 @@ while True:
             if symbol and not is_excluded(symbol):
                 symbols.append(symbol)
 
-        print(f"[UNIVERSE] {len(symbols)} symbols after stable/wrapped filter")
+        print(f"[UNIVERSE] {len(symbols)} symbols — scanning ALL (no volume filter)")
 
         for symbol in symbols:
             print(f"--- {symbol} ---")
