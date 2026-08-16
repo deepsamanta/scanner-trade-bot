@@ -1,42 +1,58 @@
 import pandas as pd
 import requests
 import time
+import hmac
+import hashlib
 import json
 import os
 import gspread
 
+from decimal import Decimal, getcontext
 from datetime import datetime, timedelta, timezone
 from google.oauth2.service_account import Credentials
 
-from config import SHEET_ID, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+from config import COINDCX_KEY, COINDCX_SECRET, CAPITAL_USDT, LEVERAGE, SHEET_ID, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
+getcontext().prec = 28
 BASE_URL = "https://api.coindcx.com"
 
 # =============================================================================
-# STRATEGY: VWAP Periodic Close [LuxAlgo] — Python replication — SIGNAL ONLY
+# STRATEGY: VWAP Periodic Close [LuxAlgo] levels + Break-and-Hold entries
 #
-# Levels tracked (Pine defaults) — COMPLETED periods only:
-#   DAILY   x1  (from 15m candles)
-#   WEEKLY  x3  (from 1h candles)
-#   MONTHLY x2  (from 4h candles)
+# LEVELS (completed periods only, Pine defaults):
+#   DAILY x1 (15m) | WEEKLY x3 (1h) | MONTHLY x2 (4h)
+#   Running/current-period VWAP never shown, never used.
 #
-# The running/current-period VWAP is used ONLY internally to compute the
-# final close level when a period ends. It is NOT logged and NOT alerted.
+# ENTRY — SHORT:
+#   c3 close ABOVE ALL levels
+#   c2 close BELOW the HIGHEST level      (cross candle = candle 1)
+#   c1 close BELOW the HIGHEST level      (confirmation = candle 2)
+#   -> SHORT at c1 close
+#   SL = crossed level * (1 + 3%)
+#   TP = nearest level BELOW entry; if none or farther than 5% -> entry * (1 - 5%)
 #
-# ALERTS: 15m closed candle CROSSES above/below any tracked close level.
-#   above: close[-2] <= level and close[-1] > level
-#   below: close[-2] >= level and close[-1] < level
-# Deduped per candle, first observation never alerts.
+# ENTRY — LONG (mirror):
+#   c3 close BELOW ALL levels
+#   c2 close ABOVE the LOWEST level       (cross candle = candle 1)
+#   c1 close ABOVE the LOWEST level       (confirmation = candle 2)
+#   -> LONG at c1 close
+#   SL = crossed level * (1 - 3%)
+#   TP = nearest level ABOVE entry; if none or farther than 5% -> entry * (1 + 5%)
 #
-# UNIVERSE: ALL sheet coins (stables/wrapped excluded). NO volume filter.
-# NO TRADING.
+# Max 10 concurrent positions | 1 trade per coin | no re-entry while
+# position/order open | per-candle dedup | cross alerts still sent.
 # =============================================================================
 
 ENABLE_DAILY   = True
 ENABLE_WEEKLY  = True
 ENABLE_MONTHLY = True
 
-HISTORICAL_LEVELS = {"D": 1, "W": 3, "M": 2}   # Pine defaults
+HISTORICAL_LEVELS = {"D": 1, "W": 3, "M": 2}
+
+# ── Trade params ──────────────────────────────────────────────────────────────
+MAX_OPEN_TRADES = 10
+SL_PCT          = 3.0     # SL distance beyond the crossed level
+TP_MAX_PCT      = 5.0     # TP cap / fallback
 
 STABLECOINS = {
     "USDT", "USDC", "BUSD", "DAI", "TUSD", "USDP", "FRAX", "UST", "LUSD",
@@ -150,6 +166,25 @@ def is_excluded(symbol):
 
 
 # =====================================================
+# SIGN REQUEST
+# =====================================================
+
+def sign_request(body):
+    payload   = json.dumps(body, separators=(",", ":"))
+    signature = hmac.new(
+        bytes(COINDCX_SECRET, encoding="utf-8"),
+        payload.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    headers = {
+        "Content-Type":     "application/json",
+        "X-AUTH-APIKEY":    COINDCX_KEY,
+        "X-AUTH-SIGNATURE": signature,
+    }
+    return payload, headers
+
+
+# =====================================================
 # TELEGRAM
 # =====================================================
 
@@ -170,6 +205,98 @@ def send_telegram(message):
                 return
     except Exception as e:
         print(f"[TELEGRAM] Failed: {e}")
+
+
+# =====================================================
+# EXCHANGE FETCHERS
+# =====================================================
+
+def get_all_positions():
+    try:
+        body = {
+            "timestamp": int(time.time() * 1000),
+            "page": "1", "size": "100",
+            "margin_currency_short_name": ["USDT"],
+        }
+        payload, headers = sign_request(body)
+        r = requests.post(
+            BASE_URL + "/exchange/v1/derivatives/futures/positions",
+            data=payload, headers=headers, timeout=REQUEST_TIMEOUT,
+        )
+        if r.status_code != 200:
+            print(f"[API ERROR] positions: HTTP {r.status_code}")
+            return None
+        data      = r.json()
+        positions = data if isinstance(data, list) else data.get("data", [])
+        if not isinstance(positions, list):
+            return None
+        active = []
+        for p in positions:
+            qty = str(p.get("size") or p.get("active_pos") or p.get("net_size") or "0")
+            if abs(float(qty)) > 0:
+                active.append(p)
+        return active
+    except Exception as e:
+        print(f"[API ERROR] get_all_positions: {e}")
+        return None
+
+
+def get_all_open_orders():
+    try:
+        body = {
+            "timestamp": int(time.time() * 1000),
+            "status": "open,partially_filled",
+            "page": "1", "size": "100",
+            "margin_currency_short_name": ["USDT"],
+        }
+        payload, headers = sign_request(body)
+        r = requests.post(
+            BASE_URL + "/exchange/v1/derivatives/futures/orders",
+            data=payload, headers=headers, timeout=REQUEST_TIMEOUT,
+        )
+        if r.status_code != 200:
+            print(f"[API ERROR] orders: HTTP {r.status_code}")
+            return None
+        data   = r.json()
+        orders = data if isinstance(data, list) else data.get("data", [])
+        if not isinstance(orders, list):
+            return None
+        return orders
+    except Exception as e:
+        print(f"[API ERROR] get_all_open_orders: {e}")
+        return None
+
+
+# =====================================================
+# QUANTITY / PRECISION
+# =====================================================
+
+def get_precision(raw_close):
+    s = str(raw_close)
+    return len(s.split(".")[1]) if "." in s else 0
+
+
+def get_quantity_step(symbol):
+    try:
+        pair = fut_pair(symbol)
+        url  = (f"https://api.coindcx.com/exchange/v1/derivatives/futures/data/instrument"
+                f"?pair={pair}&margin_currency_short_name=USDT")
+        instrument = requests.get(url, timeout=REQUEST_TIMEOUT).json()["instrument"]
+        qty_inc    = Decimal(str(instrument["quantity_increment"]))
+        min_qty    = Decimal(str(instrument["min_quantity"]))
+        return max(qty_inc, min_qty)
+    except Exception:
+        return Decimal("1")
+
+
+def compute_qty(entry_price, symbol):
+    step     = get_quantity_step(symbol)
+    exposure = Decimal(str(CAPITAL_USDT)) * Decimal(str(LEVERAGE))
+    raw_qty  = exposure / Decimal(str(entry_price))
+    qty      = (raw_qty / step).quantize(Decimal("1")) * step
+    if qty <= 0:
+        qty = step
+    return float(qty.quantize(step))
 
 
 # =====================================================
@@ -249,11 +376,6 @@ def drop_forming_candle(candles, candle_seconds):
 # =====================================================
 
 def compute_close_levels(candles, tf, max_levels):
-    """
-    hlc3 VWAP per period; store ONLY completed periods' final values.
-    Current period's running VWAP is discarded (used internally only).
-    Returns [(period_key, final_vwap)], newest LAST, max max_levels.
-    """
     close_levels = []
     cum_pv       = 0.0
     cum_v        = 0.0
@@ -277,7 +399,6 @@ def compute_close_levels(candles, tf, max_levels):
         cum_v   += v
         last_vwap = cum_pv / cum_v if cum_v > 0 else cl
 
-    # current (unfinished) period intentionally NOT appended
     return close_levels
 
 
@@ -289,7 +410,68 @@ def fmt_levels(close_levels):
 
 
 # =====================================================
-# PER-SYMBOL SCAN — cross vs CLOSE LEVELS on 15m closed candles
+# ORDER PLACEMENT
+# =====================================================
+
+def place_order(symbol, direction, entry_price, tp_price, sl_price, precision,
+                crossed_label, crossed_level, tp_label):
+    entry = round(entry_price, precision)
+    tp    = round(tp_price,    precision)
+    sl    = round(sl_price,    precision)
+    qty   = compute_qty(entry_price, symbol)
+
+    if direction == "long":
+        side, emoji, label = "buy", "🟢", "LONG"
+        tp_pct = round(((tp - entry) / entry) * 100, 2)
+        sl_pct = round(((entry - sl) / entry) * 100, 2)
+    else:
+        side, emoji, label = "sell", "🔴", "SHORT"
+        tp_pct = round(((entry - tp) / entry) * 100, 2)
+        sl_pct = round(((sl - entry) / entry) * 100, 2)
+
+    print(f"  [{label}] Entry={entry}  TP={tp}(+{tp_pct}%)  SL={sl}(-{sl_pct}%)  Qty={qty}")
+
+    body = {
+        "timestamp": int(time.time() * 1000),
+        "order": {
+            "side": side, "pair": fut_pair(symbol),
+            "order_type": "limit_order", "price": entry,
+            "total_quantity": qty, "leverage": LEVERAGE,
+            "take_profit_price": tp, "stop_loss_price": sl,
+        },
+    }
+    payload, headers = sign_request(body)
+    try:
+        result = requests.post(
+            BASE_URL + "/exchange/v1/derivatives/futures/orders/create",
+            data=payload, headers=headers, timeout=REQUEST_TIMEOUT,
+        ).json()
+    except Exception as e:
+        print(f"  [ERROR] order failed: {e}")
+        return False
+
+    print(f"  [API] {symbol}: {result}")
+    if "order" not in result and not isinstance(result, list):
+        print(f"  [ERROR] {label.lower()} rejected: {result}")
+        send_telegram(f"❌ <b>{label} REJECTED — {symbol}</b>\n<code>{str(result)[:200]}</code>")
+        return False
+
+    send_telegram(
+        f"{emoji} <b>NEW {label} (VWAP LEVEL BREAK) — {symbol}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🧱 Broke  : <code>{crossed_label}</code> @ <code>{crossed_level:.8g}</code>\n"
+        f"✅ Held   : <code>2 consecutive 15m closes</code>\n"
+        f"📍 Entry  : <code>{entry}</code>\n"
+        f"🎯 TP     : <code>{tp}</code>  (+{tp_pct}%  = {tp_label})\n"
+        f"🛑 SL     : <code>{sl}</code>  (-{sl_pct}%  = {SL_PCT}% beyond level)\n"
+        f"📦 Qty    : <code>{qty}</code>\n"
+        f"💰 Margin : <code>{CAPITAL_USDT} USDT x {LEVERAGE}x</code>"
+    )
+    return True
+
+
+# =====================================================
+# PER-SYMBOL SCAN
 # =====================================================
 
 TF_LABEL = {"D": "DAILY", "W": "WEEKLY", "M": "MONTHLY"}
@@ -301,7 +483,10 @@ TF_FETCH = {
 }
 
 
-def scan_symbol(symbol, all_state):
+def scan_symbol(symbol, all_state, global_positions, global_orders, slots_left):
+    """
+    Returns True if a new trade was placed (consumes a slot).
+    """
     st = all_state.setdefault(symbol, {"levels": {}, "last_ts": 0})
     st.setdefault("levels", {})
     st.setdefault("last_ts", 0)
@@ -314,8 +499,8 @@ def scan_symbol(symbol, all_state):
     if ENABLE_MONTHLY:
         tfs.append("M")
 
-    # ── Build all close levels (completed periods only) ──────────────────────
-    all_levels    = {}          # (tf, period_key) -> (index, value)
+    # ── Build levels ──────────────────────────────────────────────────────────
+    all_levels    = {}          # (tf, pkey) -> (index, value)
     daily_candles = None
 
     for tf in tfs:
@@ -329,7 +514,7 @@ def scan_symbol(symbol, all_state):
             continue
 
         if tf == "D":
-            daily_candles = candles      # reuse 15m series for cross detection
+            daily_candles = candles
 
         levels = compute_close_levels(candles, tf, HISTORICAL_LEVELS[tf])
         print(f"  [{symbol}] {TF_LABEL[tf]:8s} close_levels: {fmt_levels(levels)}")
@@ -337,30 +522,39 @@ def scan_symbol(symbol, all_state):
         for i, (k, v) in enumerate(reversed(levels), start=1):
             all_levels[(tf, k)] = (i, v)
 
-    if not all_levels or daily_candles is None or len(daily_candles) < 2:
-        return
+    if not all_levels or daily_candles is None or len(daily_candles) < 3:
+        return False
 
-    # ── Cross detection: 15m closed candle vs every level ────────────────────
-    c2      = float(daily_candles[-2]["close"])
-    c1      = float(daily_candles[-1]["close"])
+    # sorted flat list: [(label, pkey, value)], ascending by value
+    flat = sorted(
+        [(f"{TF_LABEL[tf]}({idx})", pkey, lvl)
+         for (tf, pkey), (idx, lvl) in all_levels.items()],
+        key=lambda x: x[2],
+    )
+    level_values = [x[2] for x in flat]
+    lowest_label,  lowest_pkey,  lowest_lvl  = flat[0]
+    highest_label, highest_pkey, highest_lvl = flat[-1]
+
+    c3 = float(daily_candles[-3]["close"])
+    c2 = float(daily_candles[-2]["close"])
+    c1 = float(daily_candles[-1]["close"])
     curr_ts = int(daily_candles[-1]["time"])
 
     already_processed = curr_ts <= st.get("last_ts", 0)
-    st["last_ts"] = max(st.get("last_ts", 0), curr_ts)
 
+    # ── Cross alerts (kept from previous version) ─────────────────────────────
     lvl_state  = st["levels"]
     valid_keys = set()
 
     for (tf, pkey), (idx, lvl) in all_levels.items():
         skey = f"{tf}:{pkey}"
         valid_keys.add(skey)
-        side = "ABOVE" if c1 > lvl else "BELOW"
-
+        side            = "ABOVE" if c1 > lvl else "BELOW"
         prev_side       = lvl_state.get(skey)
         lvl_state[skey] = side
 
         if already_processed or prev_side is None:
-            continue                      # dedup / first observation — no alert
+            continue
 
         cross = None
         if c2 <= lvl and c1 > lvl:
@@ -372,8 +566,7 @@ def scan_symbol(symbol, all_state):
             label = f"{TF_LABEL[tf]}({idx})"
             dist  = (c1 / lvl - 1) * 100
             emoji = "🟢⬆️" if cross == "above" else "🔴⬇️"
-            print(f"  [{symbol}] *** CROSS {cross.upper()} {label} close level "
-                  f"{pkey}={lvl:.8g} ***")
+            print(f"  [{symbol}] *** CROSS {cross.upper()} {label} {pkey}={lvl:.8g} ***")
             send_telegram(
                 f"{emoji} <b>{symbol} — CROSS {cross.upper()} {label} VWAP CLOSE LEVEL</b>\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
@@ -382,37 +575,80 @@ def scan_symbol(symbol, all_state):
                 f"📐 Dist  : <code>{dist:+.3f}%</code>"
             )
 
-    # prune stale level-side entries (rolled-off periods)
     for k in list(lvl_state.keys()):
         if k not in valid_keys:
             del lvl_state[k]
 
+    if already_processed:
+        return False
+    st["last_ts"] = curr_ts
 
-# =====================================================
-# TRADING LOGIC — DISABLED (commented per request)
-# =====================================================
-# def compute_qty(entry_price, symbol):
-#     step     = get_quantity_step(symbol)
-#     exposure = Decimal(str(CAPITAL_USDT)) * Decimal(str(LEVERAGE))
-#     raw_qty  = exposure / Decimal(str(entry_price))
-#     qty      = (raw_qty / step).quantize(Decimal("1")) * step
-#     return float(qty.quantize(step))
-#
-# def place_reversal_order(symbol, direction, entry_price, tp_price, sl_price, precision, vwap=None):
-#     body = {
-#         "timestamp": int(time.time() * 1000),
-#         "order": {
-#             "side": "buy" if direction == "long" else "sell",
-#             "pair": fut_pair(symbol),
-#             "order_type": "limit_order", "price": round(entry_price, precision),
-#             "total_quantity": compute_qty(entry_price, symbol), "leverage": LEVERAGE,
-#             "take_profit_price": round(tp_price, precision),
-#             "stop_loss_price": round(sl_price, precision),
-#         },
-#     }
-#     payload, headers = sign_request(body)
-#     requests.post(BASE_URL + "/exchange/v1/derivatives/futures/orders/create",
-#                   data=payload, headers=headers, timeout=REQUEST_TIMEOUT)
+    # ── Trade guards ──────────────────────────────────────────────────────────
+    pair_name = fut_pair(symbol)
+    if any(p.get("pair") == pair_name for p in global_positions):
+        print(f"  [{symbol}] SKIP ENTRY — position open")
+        return False
+    if any(o.get("pair") == pair_name for o in global_orders):
+        print(f"  [{symbol}] SKIP ENTRY — order on book")
+        return False
+    if slots_left <= 0:
+        return False
+
+    precision = get_precision(float(daily_candles[-1]["close"]))
+    direction = None
+
+    # ── SHORT: above ALL -> 2 closes below HIGHEST level ─────────────────────
+    if c3 > highest_lvl and c2 < highest_lvl and c1 < highest_lvl:
+        direction     = "short"
+        crossed_label = f"{highest_label} · {highest_pkey}"
+        crossed_lvl   = highest_lvl
+        entry         = c1
+        sl            = crossed_lvl * (1 + SL_PCT / 100)
+        below = [(lb, pk, lv) for lb, pk, lv in flat if lv < entry]
+        if below:
+            tp_label_, tp_pkey_, nearest = max(below, key=lambda x: x[2])
+            dist_pct = (1 - nearest / entry) * 100
+            if dist_pct <= TP_MAX_PCT:
+                tp, tp_label = nearest, f"{tp_label_} · {tp_pkey_}"
+            else:
+                tp, tp_label = entry * (1 - TP_MAX_PCT / 100), f"{TP_MAX_PCT}% cap"
+        else:
+            tp, tp_label = entry * (1 - TP_MAX_PCT / 100), f"{TP_MAX_PCT}% (no level below)"
+
+    # ── LONG: below ALL -> 2 closes above LOWEST level ───────────────────────
+    elif c3 < lowest_lvl and c2 > lowest_lvl and c1 > lowest_lvl:
+        direction     = "long"
+        crossed_label = f"{lowest_label} · {lowest_pkey}"
+        crossed_lvl   = lowest_lvl
+        entry         = c1
+        sl            = crossed_lvl * (1 - SL_PCT / 100)
+        above = [(lb, pk, lv) for lb, pk, lv in flat if lv > entry]
+        if above:
+            tp_label_, tp_pkey_, nearest = min(above, key=lambda x: x[2])
+            dist_pct = (nearest / entry - 1) * 100
+            if dist_pct <= TP_MAX_PCT:
+                tp, tp_label = nearest, f"{tp_label_} · {tp_pkey_}"
+            else:
+                tp, tp_label = entry * (1 + TP_MAX_PCT / 100), f"{TP_MAX_PCT}% cap"
+        else:
+            tp, tp_label = entry * (1 + TP_MAX_PCT / 100), f"{TP_MAX_PCT}% (no level above)"
+
+    if direction is None:
+        return False
+
+    # sanity: TP/SL must be on correct sides of entry
+    if direction == "short" and (tp >= entry or sl <= entry):
+        print(f"  [{symbol}] SKIP ENTRY — invalid TP/SL geometry (short)")
+        return False
+    if direction == "long" and (tp <= entry or sl >= entry):
+        print(f"  [{symbol}] SKIP ENTRY — invalid TP/SL geometry (long)")
+        return False
+
+    print(f"  [{symbol}] SIGNAL {direction.upper()} — broke {crossed_label} @ {crossed_lvl:.8g}, "
+          f"held 2 candles (c3={c3:.8g} c2={c2:.8g} c1={c1:.8g})")
+
+    return place_order(symbol, direction, entry, tp, sl, precision,
+                       crossed_label, crossed_lvl, tp_label)
 
 
 # =====================================================
@@ -424,15 +660,16 @@ consecutive_errors = 0
 MAX_CONSECUTIVE_ERRORS = 10
 
 send_telegram(
-    f"✅ <b>VWAP Close Level Bot Started (SIGNAL ONLY)</b>\n"
+    f"✅ <b>VWAP Level Break Bot Started (LIVE TRADING)</b>\n"
     f"━━━━━━━━━━━━━━━━━━\n"
-    f"📐 Levels : <code>Completed-period VWAP closes only (LuxAlgo)</code>\n"
-    f"🧱 Tracked: <code>D x{HISTORICAL_LEVELS['D']} | W x{HISTORICAL_LEVELS['W']} | "
-    f"M x{HISTORICAL_LEVELS['M']}</code>\n"
-    f"🔔 Alerts : <code>15m close crosses above/below any level</code>\n"
-    f"🌐 Universe: <code>ALL sheet coins (no volume filter)</code>\n"
-    f"🚫 Trading: <code>DISABLED — alerts only</code>\n"
-    f"🔁 Scan   : <code>Every {SCAN_INTERVAL}s</code>"
+    f"🧱 Levels : <code>D x{HISTORICAL_LEVELS['D']} | W x{HISTORICAL_LEVELS['W']} | "
+    f"M x{HISTORICAL_LEVELS['M']} (completed periods)</code>\n"
+    f"🔴 SHORT : <code>Above ALL -> 2x 15m closes below highest level</code>\n"
+    f"🟢 LONG  : <code>Below ALL -> 2x 15m closes above lowest level</code>\n"
+    f"🛑 SL    : <code>{SL_PCT}% beyond crossed level</code>\n"
+    f"🎯 TP    : <code>Nearest level (max {TP_MAX_PCT}%) or {TP_MAX_PCT}%</code>\n"
+    f"📊 Max   : <code>{MAX_OPEN_TRADES} concurrent positions</code>\n"
+    f"💰 <code>{CAPITAL_USDT} USDT x {LEVERAGE}x</code> | 🔁 <code>{SCAN_INTERVAL}s</code>"
 )
 
 while True:
@@ -443,11 +680,24 @@ while True:
             time.sleep(SCAN_INTERVAL)
             continue
 
+        global_positions = get_all_positions()
+        global_orders    = get_all_open_orders()
+
+        if global_positions is None or global_orders is None:
+            print("[WARN] Exchange API fetch failed — skipping cycle")
+            time.sleep(SCAN_INTERVAL)
+            continue
+
         state  = load_state()
         cycle += 1
         consecutive_errors = 0
 
-        print(f"\n===== CYCLE {cycle} | {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')} =====")
+        active_count = len(global_positions)
+        slots_left   = max(0, MAX_OPEN_TRADES - active_count)
+
+        print(f"\n===== CYCLE {cycle} | "
+              f"{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')} | "
+              f"positions={active_count}/{MAX_OPEN_TRADES} slots={slots_left} =====")
 
         symbols = []
         for row in range(len(df)):
@@ -455,12 +705,15 @@ while True:
             if symbol and not is_excluded(symbol):
                 symbols.append(symbol)
 
-        print(f"[UNIVERSE] {len(symbols)} symbols — scanning ALL (no volume filter)")
+        print(f"[UNIVERSE] {len(symbols)} symbols — scanning ALL")
 
         for symbol in symbols:
             print(f"--- {symbol} ---")
             try:
-                scan_symbol(symbol, state)
+                placed = scan_symbol(symbol, state, global_positions,
+                                     global_orders, slots_left)
+                if placed:
+                    slots_left -= 1
             except Exception as e:
                 print(f"  [{symbol}] ERROR: {e}")
 
