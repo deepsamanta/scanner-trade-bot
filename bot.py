@@ -17,27 +17,28 @@ getcontext().prec = 28
 BASE_URL = "https://api.coindcx.com"
 
 # =============================================================================
-# STRATEGY: VWAP Periodic Close [LuxAlgo] levels + Break-and-Hold entries
+# STRATEGY: VWAP Periodic Close [LuxAlgo] levels + Break-and-Hold RETEST entries
 #
 # LEVELS (completed periods only, Pine defaults):
 #   DAILY x1 (15m) | WEEKLY x3 (1h) | MONTHLY x2 (4h)
 #   Running/current-period VWAP never shown, never used.
 #
-# ENTRY — SHORT:
+# SIGNAL — SHORT:
 #   c3 close ABOVE ALL levels
 #   c2 close BELOW the HIGHEST level      (cross candle = candle 1)
 #   c1 close BELOW the HIGHEST level      (confirmation = candle 2)
-#   -> SHORT at c1 close
-#   SL = crossed level * (1 + 3%)
-#   TP = nearest level BELOW entry; if none or farther than 5% -> entry * (1 - 5%)
-#
-# ENTRY — LONG (mirror):
+# SIGNAL — LONG (mirror):
 #   c3 close BELOW ALL levels
-#   c2 close ABOVE the LOWEST level       (cross candle = candle 1)
-#   c1 close ABOVE the LOWEST level       (confirmation = candle 2)
-#   -> LONG at c1 close
-#   SL = crossed level * (1 - 3%)
-#   TP = nearest level ABOVE entry; if none or farther than 5% -> entry * (1 + 5%)
+#   c2 close ABOVE the LOWEST level
+#   c1 close ABOVE the LOWEST level
+#
+# ENTRY (RETEST):
+#   Limit order placed AT the crossed level. Price must pull back to fill.
+#   Not filled within RETEST_EXPIRY_CANDLES x 15m -> order cancelled, freed.
+#
+#   SL = crossed level -/+ 3%    (clean 3% risk from the level entry)
+#   TP = nearest level in profit direction from the level;
+#        if none or farther than 5% -> 5% from the level.
 #
 # Max 10 concurrent positions | 1 trade per coin | no re-entry while
 # position/order open | per-candle dedup | cross alerts still sent.
@@ -50,9 +51,10 @@ ENABLE_MONTHLY = True
 HISTORICAL_LEVELS = {"D": 1, "W": 3, "M": 2}
 
 # ── Trade params ──────────────────────────────────────────────────────────────
-MAX_OPEN_TRADES = 10
-SL_PCT          = 3.0     # SL distance beyond the crossed level
-TP_MAX_PCT      = 5.0     # TP cap / fallback
+MAX_OPEN_TRADES       = 10
+SL_PCT                = 3.0    # SL distance beyond the crossed level
+TP_MAX_PCT            = 5.0    # TP cap / fallback
+RETEST_EXPIRY_CANDLES = 8      # cancel unfilled retest order after 8 x 15m (2h)
 
 STABLECOINS = {
     "USDT", "USDC", "BUSD", "DAI", "TUSD", "USDP", "FRAX", "UST", "LUSD",
@@ -267,6 +269,21 @@ def get_all_open_orders():
         return None
 
 
+def cancel_order(order_id):
+    try:
+        body = {"timestamp": int(time.time() * 1000), "id": order_id}
+        payload, headers = sign_request(body)
+        r = requests.post(
+            BASE_URL + "/exchange/v1/derivatives/futures/orders/cancel",
+            data=payload, headers=headers, timeout=REQUEST_TIMEOUT,
+        )
+        print(f"  [CANCEL] order {order_id}: HTTP {r.status_code}")
+        return r.status_code == 200
+    except Exception as e:
+        print(f"  [CANCEL] error: {e}")
+        return False
+
+
 # =====================================================
 # QUANTITY / PRECISION
 # =====================================================
@@ -399,6 +416,7 @@ def compute_close_levels(candles, tf, max_levels):
         cum_v   += v
         last_vwap = cum_pv / cum_v if cum_v > 0 else cl
 
+    # current (unfinished) period intentionally NOT appended
     return close_levels
 
 
@@ -410,7 +428,7 @@ def fmt_levels(close_levels):
 
 
 # =====================================================
-# ORDER PLACEMENT
+# ORDER PLACEMENT (retest limit at level)
 # =====================================================
 
 def place_order(symbol, direction, entry_price, tp_price, sl_price, precision,
@@ -429,7 +447,7 @@ def place_order(symbol, direction, entry_price, tp_price, sl_price, precision,
         tp_pct = round(((entry - tp) / entry) * 100, 2)
         sl_pct = round(((sl - entry) / entry) * 100, 2)
 
-    print(f"  [{label}] Entry={entry}  TP={tp}(+{tp_pct}%)  SL={sl}(-{sl_pct}%)  Qty={qty}")
+    print(f"  [{label}] RETEST Entry={entry}  TP={tp}(+{tp_pct}%)  SL={sl}(-{sl_pct}%)  Qty={qty}")
 
     body = {
         "timestamp": int(time.time() * 1000),
@@ -448,26 +466,40 @@ def place_order(symbol, direction, entry_price, tp_price, sl_price, precision,
         ).json()
     except Exception as e:
         print(f"  [ERROR] order failed: {e}")
-        return False
+        return None
 
     print(f"  [API] {symbol}: {result}")
     if "order" not in result and not isinstance(result, list):
         print(f"  [ERROR] {label.lower()} rejected: {result}")
         send_telegram(f"❌ <b>{label} REJECTED — {symbol}</b>\n<code>{str(result)[:200]}</code>")
-        return False
+        return None
+
+    order_id = None
+    try:
+        if isinstance(result, list) and result:
+            order_id = result[0].get("id")
+        elif isinstance(result, dict):
+            o = result.get("order")
+            if isinstance(o, list) and o:
+                order_id = o[0].get("id")
+            elif isinstance(o, dict):
+                order_id = o.get("id")
+    except Exception:
+        pass
 
     send_telegram(
-        f"{emoji} <b>NEW {label} (VWAP LEVEL BREAK) — {symbol}</b>\n"
+        f"{emoji} <b>NEW {label} (VWAP LEVEL BREAK + RETEST) — {symbol}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"🧱 Broke  : <code>{crossed_label}</code> @ <code>{crossed_level:.8g}</code>\n"
         f"✅ Held   : <code>2 consecutive 15m closes</code>\n"
-        f"📍 Entry  : <code>{entry}</code>\n"
+        f"📍 Entry  : <code>{entry}</code>  (RETEST limit @ level)\n"
+        f"⏳ Expiry : <code>{RETEST_EXPIRY_CANDLES} x 15m candles</code>\n"
         f"🎯 TP     : <code>{tp}</code>  (+{tp_pct}%  = {tp_label})\n"
         f"🛑 SL     : <code>{sl}</code>  (-{sl_pct}%  = {SL_PCT}% beyond level)\n"
         f"📦 Qty    : <code>{qty}</code>\n"
         f"💰 Margin : <code>{CAPITAL_USDT} USDT x {LEVERAGE}x</code>"
     )
-    return True
+    return order_id or True
 
 
 # =====================================================
@@ -485,11 +517,12 @@ TF_FETCH = {
 
 def scan_symbol(symbol, all_state, global_positions, global_orders, slots_left):
     """
-    Returns True if a new trade was placed (consumes a slot).
+    Returns True if a new retest order was placed (consumes a slot).
     """
-    st = all_state.setdefault(symbol, {"levels": {}, "last_ts": 0})
+    st = all_state.setdefault(symbol, {"levels": {}, "last_ts": 0, "pending": None})
     st.setdefault("levels", {})
     st.setdefault("last_ts", 0)
+    st.setdefault("pending", None)
 
     tfs = []
     if ENABLE_DAILY:
@@ -525,13 +558,11 @@ def scan_symbol(symbol, all_state, global_positions, global_orders, slots_left):
     if not all_levels or daily_candles is None or len(daily_candles) < 3:
         return False
 
-    # sorted flat list: [(label, pkey, value)], ascending by value
     flat = sorted(
         [(f"{TF_LABEL[tf]}({idx})", pkey, lvl)
          for (tf, pkey), (idx, lvl) in all_levels.items()],
         key=lambda x: x[2],
     )
-    level_values = [x[2] for x in flat]
     lowest_label,  lowest_pkey,  lowest_lvl  = flat[0]
     highest_label, highest_pkey, highest_lvl = flat[-1]
 
@@ -542,7 +573,7 @@ def scan_symbol(symbol, all_state, global_positions, global_orders, slots_left):
 
     already_processed = curr_ts <= st.get("last_ts", 0)
 
-    # ── Cross alerts (kept from previous version) ─────────────────────────────
+    # ── Cross alerts ──────────────────────────────────────────────────────────
     lvl_state  = st["levels"]
     valid_keys = set()
 
@@ -579,30 +610,53 @@ def scan_symbol(symbol, all_state, global_positions, global_orders, slots_left):
         if k not in valid_keys:
             del lvl_state[k]
 
+    # ── Position / pending-order management ───────────────────────────────────
+    pair_name = fut_pair(symbol)
+
+    if any(p.get("pair") == pair_name for p in global_positions):
+        if st.get("pending"):
+            st["pending"] = None          # retest filled — position guard owns it now
+        print(f"  [{symbol}] SKIP ENTRY — position open")
+        if not already_processed:
+            st["last_ts"] = curr_ts
+        return False
+
+    open_order = next((o for o in global_orders if o.get("pair") == pair_name), None)
+    if open_order is not None:
+        pend = st.get("pending")
+        if pend and curr_ts >= pend.get("expire_ts", 0):
+            print(f"  [{symbol}] RETEST EXPIRED — cancelling order")
+            if cancel_order(pend.get("order_id") or open_order.get("id")):
+                send_telegram(
+                    f"⏳ <b>RETEST EXPIRED — {symbol}</b>\n"
+                    f"Order cancelled (no retest within {RETEST_EXPIRY_CANDLES} x 15m)"
+                )
+                st["pending"] = None
+        else:
+            print(f"  [{symbol}] SKIP ENTRY — pending retest order on book")
+        if not already_processed:
+            st["last_ts"] = curr_ts
+        return False
+    else:
+        if st.get("pending"):
+            st["pending"] = None          # cancelled/expired externally — freed
+
     if already_processed:
         return False
     st["last_ts"] = curr_ts
 
-    # ── Trade guards ──────────────────────────────────────────────────────────
-    pair_name = fut_pair(symbol)
-    if any(p.get("pair") == pair_name for p in global_positions):
-        print(f"  [{symbol}] SKIP ENTRY — position open")
-        return False
-    if any(o.get("pair") == pair_name for o in global_orders):
-        print(f"  [{symbol}] SKIP ENTRY — order on book")
-        return False
     if slots_left <= 0:
         return False
 
     precision = get_precision(float(daily_candles[-1]["close"]))
     direction = None
 
-    # ── SHORT: above ALL -> 2 closes below HIGHEST level ─────────────────────
+    # ── SHORT: above ALL -> 2 closes below HIGHEST level -> retest limit ─────
     if c3 > highest_lvl and c2 < highest_lvl and c1 < highest_lvl:
         direction     = "short"
         crossed_label = f"{highest_label} · {highest_pkey}"
         crossed_lvl   = highest_lvl
-        entry         = c1
+        entry         = crossed_lvl                    # RETEST: limit at the level
         sl            = crossed_lvl * (1 + SL_PCT / 100)
         below = [(lb, pk, lv) for lb, pk, lv in flat if lv < entry]
         if below:
@@ -615,12 +669,12 @@ def scan_symbol(symbol, all_state, global_positions, global_orders, slots_left):
         else:
             tp, tp_label = entry * (1 - TP_MAX_PCT / 100), f"{TP_MAX_PCT}% (no level below)"
 
-    # ── LONG: below ALL -> 2 closes above LOWEST level ───────────────────────
+    # ── LONG: below ALL -> 2 closes above LOWEST level -> retest limit ───────
     elif c3 < lowest_lvl and c2 > lowest_lvl and c1 > lowest_lvl:
         direction     = "long"
         crossed_label = f"{lowest_label} · {lowest_pkey}"
         crossed_lvl   = lowest_lvl
-        entry         = c1
+        entry         = crossed_lvl                    # RETEST: limit at the level
         sl            = crossed_lvl * (1 - SL_PCT / 100)
         above = [(lb, pk, lv) for lb, pk, lv in flat if lv > entry]
         if above:
@@ -645,10 +699,17 @@ def scan_symbol(symbol, all_state, global_positions, global_orders, slots_left):
         return False
 
     print(f"  [{symbol}] SIGNAL {direction.upper()} — broke {crossed_label} @ {crossed_lvl:.8g}, "
-          f"held 2 candles (c3={c3:.8g} c2={c2:.8g} c1={c1:.8g})")
+          f"held 2 candles (c3={c3:.8g} c2={c2:.8g} c1={c1:.8g}) — placing retest limit")
 
-    return place_order(symbol, direction, entry, tp, sl, precision,
-                       crossed_label, crossed_lvl, tp_label)
+    result = place_order(symbol, direction, entry, tp, sl, precision,
+                         crossed_label, crossed_lvl, tp_label)
+    if result:
+        st["pending"] = {
+            "order_id":  result if isinstance(result, str) else None,
+            "expire_ts": curr_ts + RETEST_EXPIRY_CANDLES * CANDLE_SECONDS_15M * 1000,
+        }
+        return True
+    return False
 
 
 # =====================================================
@@ -660,12 +721,14 @@ consecutive_errors = 0
 MAX_CONSECUTIVE_ERRORS = 10
 
 send_telegram(
-    f"✅ <b>VWAP Level Break Bot Started (LIVE TRADING)</b>\n"
+    f"✅ <b>VWAP Level Break + Retest Bot Started (LIVE TRADING)</b>\n"
     f"━━━━━━━━━━━━━━━━━━\n"
     f"🧱 Levels : <code>D x{HISTORICAL_LEVELS['D']} | W x{HISTORICAL_LEVELS['W']} | "
     f"M x{HISTORICAL_LEVELS['M']} (completed periods)</code>\n"
     f"🔴 SHORT : <code>Above ALL -> 2x 15m closes below highest level</code>\n"
     f"🟢 LONG  : <code>Below ALL -> 2x 15m closes above lowest level</code>\n"
+    f"📍 Entry : <code>RETEST limit at the broken level</code>\n"
+    f"⏳ Expiry: <code>{RETEST_EXPIRY_CANDLES} x 15m candles (then cancelled)</code>\n"
     f"🛑 SL    : <code>{SL_PCT}% beyond crossed level</code>\n"
     f"🎯 TP    : <code>Nearest level (max {TP_MAX_PCT}%) or {TP_MAX_PCT}%</code>\n"
     f"📊 Max   : <code>{MAX_OPEN_TRADES} concurrent positions</code>\n"
