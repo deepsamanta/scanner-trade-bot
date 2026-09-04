@@ -51,7 +51,7 @@ ENABLE_MONTHLY = True
 HISTORICAL_LEVELS = {"D": 1, "W": 3, "M": 2}
 
 # ── Trade params ──────────────────────────────────────────────────────────────
-MAX_OPEN_TRADES       = 10
+MAX_OPEN_TRADES       = 50
 SL_PCT                = 2.3    # SL distance beyond the crossed level
 TP_MAX_PCT            = 5.0    # TP cap / fallback
 RETEST_EXPIRY_CANDLES = 8      # cancel unfilled retest order after 8 x 15m (2h)
