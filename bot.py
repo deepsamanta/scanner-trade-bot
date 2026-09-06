@@ -32,6 +32,12 @@ BASE_URL = "https://api.coindcx.com"
 #   c2 close ABOVE the LOWEST level
 #   c1 close ABOVE the LOWEST level
 #
+# EMA200 GATE (15m, only when within 1% of crossed VWAP extreme):
+#   SHORT -> if EMA200 is just below highest VWAP, wait for EMA retest hold
+#            OR 2 closes below EMA200 before placing the normal VWAP retest order.
+#   LONG  -> if EMA200 is just above lowest VWAP, wait for EMA retest hold
+#            OR 2 closes above EMA200 before placing the normal VWAP retest order.
+#
 # ENTRY (RETEST):
 #   Limit order placed AT the crossed level. Price must pull back to fill.
 #   Not filled within RETEST_EXPIRY_CANDLES x 15m -> order cancelled, freed.
@@ -52,9 +58,14 @@ HISTORICAL_LEVELS = {"D": 1, "W": 3, "M": 2}
 
 # ── Trade params ──────────────────────────────────────────────────────────────
 MAX_OPEN_TRADES       = 50
-SL_PCT                = 2.2    # SL distance beyond the crossed level
+SL_PCT                = 1.8   # SL distance beyond the crossed level
 TP_MAX_PCT            = 5.0    # TP cap / fallback
 RETEST_EXPIRY_CANDLES = 8      # cancel unfilled retest order after 8 x 15m (2h)
+
+# ── 15m EMA200 proximity gate ─────────────────────────────────────────────────
+EMA_PERIOD             = 200
+EMA_PROXIMITY_PCT      = 1.0    # gate only when EMA200 is within 1% of crossed VWAP extreme
+EMA_LOOKBACK_DAYS      = 10     # enough 15m history for a stable EMA200 calculation
 
 STABLECOINS = {
     "USDT", "USDC", "BUSD", "DAI", "TUSD", "USDP", "FRAX", "UST", "LUSD",
@@ -389,6 +400,88 @@ def drop_forming_candle(candles, candle_seconds):
 
 
 # =====================================================
+# 15m EMA200 HELPERS
+# =====================================================
+
+def get_ema200_15m_context(symbol):
+    """
+    Fetch enough CLOSED 15m candles to calculate EMA200 reliably.
+    Returns a list of dicts containing candle OHLC + the aligned EMA value.
+    """
+    from_ts = int((datetime.now(timezone.utc) - timedelta(days=EMA_LOOKBACK_DAYS)).timestamp())
+    candles = drop_forming_candle(
+        fetch_candles_range(symbol, from_ts, RESOLUTION_15M, CANDLE_SECONDS_15M),
+        CANDLE_SECONDS_15M,
+    )
+
+    if len(candles) < EMA_PERIOD:
+        print(f"  [{symbol}] EMA200 SKIP — insufficient 15m candles ({len(candles)}/{EMA_PERIOD})")
+        return None
+
+    closes = pd.Series([float(c["close"]) for c in candles], dtype="float64")
+    emas = closes.ewm(span=EMA_PERIOD, adjust=False).mean().tolist()
+
+    ctx = []
+    for c, ema in zip(candles, emas):
+        ctx.append({
+            "time":  int(c["time"]),
+            "open":  float(c["open"]),
+            "high":  float(c["high"]),
+            "low":   float(c["low"]),
+            "close": float(c["close"]),
+            "ema":   float(ema),
+        })
+    return ctx
+
+
+def ema_gate_required(direction, crossed_lvl, ema_value):
+    """
+    The EMA gate applies ONLY in the user's specified geometry:
+      SHORT -> EMA200 is just BELOW the highest crossed VWAP level.
+      LONG  -> EMA200 is just ABOVE the lowest crossed VWAP level.
+    In both cases EMA200 must be within EMA_PROXIMITY_PCT of that VWAP level.
+    """
+    if direction == "short":
+        if ema_value >= crossed_lvl:
+            return False, None
+        proximity = ((crossed_lvl - ema_value) / crossed_lvl) * 100
+    else:
+        if ema_value <= crossed_lvl:
+            return False, None
+        proximity = ((ema_value - crossed_lvl) / crossed_lvl) * 100
+
+    return proximity <= EMA_PROXIMITY_PCT, proximity
+
+
+def ema_two_close_confirmed(ctx, direction):
+    """True when the latest TWO closed 15m candles are on the trade side of EMA200."""
+    if not ctx or len(ctx) < 2:
+        return False
+
+    prev_c, curr_c = ctx[-2], ctx[-1]
+    if direction == "short":
+        return prev_c["close"] < prev_c["ema"] and curr_c["close"] < curr_c["ema"]
+    return prev_c["close"] > prev_c["ema"] and curr_c["close"] > curr_c["ema"]
+
+
+def ema_retest_confirmed(ctx, direction, side_seen_before_current):
+    """
+    Retest confirmation:
+      SHORT -> EMA had already been broken/closed below; latest candle touches EMA
+               from below (high >= EMA) and closes back below it.
+      LONG  -> EMA had already been broken/closed above; latest candle touches EMA
+               from above (low <= EMA) and closes back above it.
+    """
+    if not ctx or not side_seen_before_current:
+        return False
+
+    curr_c = ctx[-1]
+    if direction == "short":
+        return curr_c["high"] >= curr_c["ema"] and curr_c["close"] < curr_c["ema"]
+    return curr_c["low"] <= curr_c["ema"] and curr_c["close"] > curr_c["ema"]
+
+
+# =====================================================
 # CLOSE LEVELS — completed periods ONLY
 # =====================================================
 
@@ -519,10 +612,13 @@ def scan_symbol(symbol, all_state, global_positions, global_orders, slots_left):
     """
     Returns True if a new retest order was placed (consumes a slot).
     """
-    st = all_state.setdefault(symbol, {"levels": {}, "last_ts": 0, "pending": None})
+    st = all_state.setdefault(
+        symbol, {"levels": {}, "last_ts": 0, "pending": None, "ema_wait": None}
+    )
     st.setdefault("levels", {})
     st.setdefault("last_ts", 0)
     st.setdefault("pending", None)
+    st.setdefault("ema_wait", None)
 
     tfs = []
     if ENABLE_DAILY:
@@ -616,6 +712,8 @@ def scan_symbol(symbol, all_state, global_positions, global_orders, slots_left):
     if any(p.get("pair") == pair_name for p in global_positions):
         if st.get("pending"):
             st["pending"] = None          # retest filled — position guard owns it now
+        if st.get("ema_wait"):
+            st["ema_wait"] = None
         print(f"  [{symbol}] SKIP ENTRY — position open")
         if not already_processed:
             st["last_ts"] = curr_ts
@@ -623,6 +721,8 @@ def scan_symbol(symbol, all_state, global_positions, global_orders, slots_left):
 
     open_order = next((o for o in global_orders if o.get("pair") == pair_name), None)
     if open_order is not None:
+        if st.get("ema_wait"):
+            st["ema_wait"] = None
         pend = st.get("pending")
         if pend and curr_ts >= pend.get("expire_ts", 0):
             print(f"  [{symbol}] RETEST EXPIRED — cancelling order")
@@ -649,6 +749,99 @@ def scan_symbol(symbol, all_state, global_positions, global_orders, slots_left):
         return False
 
     precision = get_precision(float(daily_candles[-1]["close"]))
+
+    # ── Existing VWAP signal waiting for EMA200 confirmation ───────────────────
+    ema_wait = st.get("ema_wait")
+    if ema_wait:
+        wait_direction = ema_wait["direction"]
+        wait_level     = float(ema_wait["crossed_lvl"])
+
+        # If price closes back through the original crossed VWAP extreme,
+        # the old break is invalidated and must not create a stale trade later.
+        invalidated = (
+            (wait_direction == "short" and c1 >= wait_level) or
+            (wait_direction == "long"  and c1 <= wait_level)
+        )
+        if invalidated:
+            print(f"  [{symbol}] EMA WAIT CANCELLED — VWAP break invalidated")
+            send_telegram(
+                f"⚪ <b>EMA200 WAIT CANCELLED — {symbol}</b>\n"
+                f"Price closed back through <code>{ema_wait['crossed_label']}</code>"
+            )
+            st["ema_wait"] = None
+        else:
+            ema_ctx = get_ema200_15m_context(symbol)
+            if not ema_ctx:
+                print(f"  [{symbol}] EMA WAIT — EMA200 unavailable")
+                return False
+
+            latest = ema_ctx[-1]
+            if latest["time"] != curr_ts:
+                print(f"  [{symbol}] EMA WAIT — latest 15m EMA candle not aligned")
+                return False
+
+            side_seen_before = bool(ema_wait.get("side_seen", False))
+
+            two_close = ema_two_close_confirmed(ema_ctx, wait_direction)
+            retest = ema_retest_confirmed(
+                ema_ctx, wait_direction, side_seen_before_current=side_seen_before
+            )
+
+            # Update whether EMA has been closed through at least once.
+            if wait_direction == "short" and latest["close"] < latest["ema"]:
+                ema_wait["side_seen"] = True
+            elif wait_direction == "long" and latest["close"] > latest["ema"]:
+                ema_wait["side_seen"] = True
+
+            if not (two_close or retest):
+                side_word = "below" if wait_direction == "short" else "above"
+                print(
+                    f"  [{symbol}] EMA WAIT — {wait_direction.upper()} | "
+                    f"close={latest['close']:.8g} EMA200={latest['ema']:.8g} | "
+                    f"waiting for retest or 2 closes {side_word} EMA"
+                )
+                return False
+
+            confirm_reason = "EMA200 retest held" if retest else "2 consecutive closes beyond EMA200"
+            print(
+                f"  [{symbol}] EMA200 CONFIRMED — {wait_direction.upper()} | "
+                f"{confirm_reason} | EMA200={latest['ema']:.8g}"
+            )
+            send_telegram(
+                f"✅ <b>EMA200 CONFIRMED — {symbol} {wait_direction.upper()}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"📈 EMA200 : <code>{latest['ema']:.8g}</code> (15m)\n"
+                f"✅ Rule   : <code>{confirm_reason}</code>\n"
+                f"📍 Now placing the original VWAP retest order"
+            )
+
+            direction     = wait_direction
+            crossed_label = ema_wait["crossed_label"]
+            crossed_lvl   = wait_level
+            entry         = float(ema_wait["entry"])
+            tp            = float(ema_wait["tp"])
+            sl            = float(ema_wait["sl"])
+            tp_label      = ema_wait["tp_label"]
+            st["ema_wait"] = None
+
+            # Sanity remains unchanged.
+            if direction == "short" and (tp >= entry or sl <= entry):
+                print(f"  [{symbol}] SKIP ENTRY — invalid TP/SL geometry (short)")
+                return False
+            if direction == "long" and (tp <= entry or sl >= entry):
+                print(f"  [{symbol}] SKIP ENTRY — invalid TP/SL geometry (long)")
+                return False
+
+            result = place_order(symbol, direction, entry, tp, sl, precision,
+                                 crossed_label, crossed_lvl, tp_label)
+            if result:
+                st["pending"] = {
+                    "order_id":  result if isinstance(result, str) else None,
+                    "expire_ts": curr_ts + RETEST_EXPIRY_CANDLES * CANDLE_SECONDS_15M * 1000,
+                }
+                return True
+            return False
+
     direction = None
 
     # ── SHORT: above ALL -> 2 closes below HIGHEST level -> retest limit ─────
@@ -699,7 +892,85 @@ def scan_symbol(symbol, all_state, global_positions, global_orders, slots_left):
         return False
 
     print(f"  [{symbol}] SIGNAL {direction.upper()} — broke {crossed_label} @ {crossed_lvl:.8g}, "
-          f"held 2 candles (c3={c3:.8g} c2={c2:.8g} c1={c1:.8g}) — placing retest limit")
+          f"held 2 candles (c3={c3:.8g} c2={c2:.8g} c1={c1:.8g})")
+
+    # ── NEW: 15m EMA200 proximity gate ────────────────────────────────────────
+    # Only applies when:
+    #   SHORT -> EMA200 is BELOW the crossed highest VWAP and within 1%.
+    #   LONG  -> EMA200 is ABOVE the crossed lowest VWAP and within 1%.
+    # Otherwise behavior is exactly the same as before.
+    ema_ctx = get_ema200_15m_context(symbol)
+    if not ema_ctx:
+        print(f"  [{symbol}] SKIP ENTRY — could not calculate 15m EMA200")
+        return False
+
+    latest = ema_ctx[-1]
+    if latest["time"] != curr_ts:
+        print(f"  [{symbol}] SKIP ENTRY — EMA200 candle not aligned with latest closed 15m candle")
+        return False
+
+    gate_required, proximity = ema_gate_required(direction, crossed_lvl, latest["ema"])
+
+    if gate_required:
+        two_close = ema_two_close_confirmed(ema_ctx, direction)
+
+        # At the moment the VWAP signal is detected, a true retest is only
+        # accepted if the prior closed candle was already beyond EMA and the
+        # latest candle touched EMA and closed back on the trade side.
+        prev = ema_ctx[-2] if len(ema_ctx) >= 2 else None
+        prev_side = False
+        if prev:
+            if direction == "short":
+                prev_side = prev["close"] < prev["ema"]
+            else:
+                prev_side = prev["close"] > prev["ema"]
+        retest = ema_retest_confirmed(
+            ema_ctx, direction, side_seen_before_current=prev_side
+        )
+
+        if not (two_close or retest):
+            side_word = "below" if direction == "short" else "above"
+            print(
+                f"  [{symbol}] EMA200 GATE ACTIVE — EMA={latest['ema']:.8g}, "
+                f"VWAP={crossed_lvl:.8g}, proximity={proximity:.3f}% | "
+                f"waiting for retest or 2 closes {side_word} EMA"
+            )
+
+            side_seen = (
+                latest["close"] < latest["ema"]
+                if direction == "short"
+                else latest["close"] > latest["ema"]
+            )
+            st["ema_wait"] = {
+                "direction":     direction,
+                "crossed_label": crossed_label,
+                "crossed_lvl":   crossed_lvl,
+                "entry":         entry,
+                "tp":            tp,
+                "sl":            sl,
+                "tp_label":      tp_label,
+                "armed_ts":      curr_ts,
+                "side_seen":     side_seen,
+            }
+
+            send_telegram(
+                f"⏸️ <b>EMA200 FILTER — WAITING ({symbol} {direction.upper()})</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🧱 VWAP   : <code>{crossed_lvl:.8g}</code> ({crossed_label})\n"
+                f"📈 EMA200 : <code>{latest['ema']:.8g}</code> (15m)\n"
+                f"📐 Gap    : <code>{proximity:.3f}%</code> (≤ {EMA_PROXIMITY_PCT}%)\n"
+                f"⏳ Need   : <code>EMA retest hold OR 2 closes {side_word} EMA200</code>\n"
+                f"🚫 No order placed yet"
+            )
+            return False
+
+        confirm_reason = "EMA200 retest held" if retest else "2 consecutive closes beyond EMA200"
+        print(
+            f"  [{symbol}] EMA200 GATE PASSED IMMEDIATELY — "
+            f"{confirm_reason} | EMA200={latest['ema']:.8g}"
+        )
+
+    print(f"  [{symbol}] placing retest limit at crossed VWAP level")
 
     result = place_order(symbol, direction, entry, tp, sl, precision,
                          crossed_label, crossed_lvl, tp_label)
@@ -727,6 +998,8 @@ send_telegram(
     f"M x{HISTORICAL_LEVELS['M']} (completed periods)</code>\n"
     f"🔴 SHORT : <code>Above ALL -> 2x 15m closes below highest level</code>\n"
     f"🟢 LONG  : <code>Below ALL -> 2x 15m closes above lowest level</code>\n"
+    f"📈 EMA200: <code>15m | within {EMA_PROXIMITY_PCT}% of crossed extreme -> "
+    f"EMA retest hold OR 2 closes beyond EMA</code>\n"
     f"📍 Entry : <code>RETEST limit at the broken level</code>\n"
     f"⏳ Expiry: <code>{RETEST_EXPIRY_CANDLES} x 15m candles (then cancelled)</code>\n"
     f"🛑 SL    : <code>{SL_PCT}% beyond crossed level</code>\n"
