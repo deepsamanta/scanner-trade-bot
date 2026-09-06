@@ -32,11 +32,16 @@ BASE_URL = "https://api.coindcx.com"
 #   c2 close ABOVE the LOWEST level
 #   c1 close ABOVE the LOWEST level
 #
-# EMA200 GATE (15m, only when within 1% of crossed VWAP extreme):
-#   SHORT -> if EMA200 is just below highest VWAP, wait for EMA retest hold
-#            OR 2 closes below EMA200 before placing the normal VWAP retest order.
-#   LONG  -> if EMA200 is just above lowest VWAP, wait for EMA retest hold
-#            OR 2 closes above EMA200 before placing the normal VWAP retest order.
+# 200 EMA GATE (only when 200 EMA (15m) sits within EMA_PROXIMITY_PCT of the
+# crossed level):
+#   Entry is held back until BOTH:
+#     - price confirms beyond that EMA, via EITHER a retest (a 15m candle
+#       wicks into the EMA but still closes on the correct side) OR 2
+#       consecutive 15m closes beyond the EMA, AND
+#     - the EMA's own slope supports the trade (falling for a short,
+#       rising for a long, vs. its value EMA_SLOPE_LOOKBACK_CANDLES back).
+#   The wait is dropped if price re-crosses back over the originally
+#   crossed level.
 #
 # ENTRY (RETEST):
 #   Limit order placed AT the crossed level. Price must pull back to fill.
@@ -62,10 +67,11 @@ SL_PCT                = 2.2    # SL distance beyond the crossed level
 TP_MAX_PCT            = 5.0    # TP cap / fallback
 RETEST_EXPIRY_CANDLES = 8      # cancel unfilled retest order after 8 x 15m (2h)
 
-# ── 15m EMA200 proximity gate ─────────────────────────────────────────────────
-EMA_PERIOD             = 200
-EMA_PROXIMITY_PCT      = 1.0    # gate only when EMA200 is within 1% of crossed VWAP extreme
-EMA_LOOKBACK_DAYS      = 10     # enough 15m history for a stable EMA200 calculation
+# ── 200 EMA proximity gate ───────────────────────────────────────────────────
+EMA_LEN                    = 200   # EMA period, computed on 15m closes
+EMA_LOOKBACK_DAYS          = 5     # extra 15m history fetched just to seed the EMA
+EMA_PROXIMITY_PCT          = 1.0   # gate engages only if EMA200 sits within this % of the crossed level
+EMA_SLOPE_LOOKBACK_CANDLES = 5     # 15m candles back used to read the EMA's own slope
 
 STABLECOINS = {
     "USDT", "USDC", "BUSD", "DAI", "TUSD", "USDP", "FRAX", "UST", "LUSD",
@@ -400,97 +406,6 @@ def drop_forming_candle(candles, candle_seconds):
 
 
 # =====================================================
-# 15m EMA200 HELPERS
-# =====================================================
-
-def get_ema200_15m_context(symbol):
-    """
-    Fetch enough CLOSED 15m candles to calculate EMA200 reliably.
-    Returns a list of dicts containing candle OHLC + the aligned EMA value.
-    """
-    from_ts = int((datetime.now(timezone.utc) - timedelta(days=EMA_LOOKBACK_DAYS)).timestamp())
-    candles = drop_forming_candle(
-        fetch_candles_range(symbol, from_ts, RESOLUTION_15M, CANDLE_SECONDS_15M),
-        CANDLE_SECONDS_15M,
-    )
-
-    if len(candles) < EMA_PERIOD:
-        print(f"  [{symbol}] EMA200 SKIP — insufficient 15m candles ({len(candles)}/{EMA_PERIOD})")
-        return None
-
-    closes = pd.Series([float(c["close"]) for c in candles], dtype="float64")
-    emas = closes.ewm(span=EMA_PERIOD, adjust=False).mean().tolist()
-
-    ctx = []
-    for c, ema in zip(candles, emas):
-        ctx.append({
-            "time":  int(c["time"]),
-            "open":  float(c["open"]),
-            "high":  float(c["high"]),
-            "low":   float(c["low"]),
-            "close": float(c["close"]),
-            "ema":   float(ema),
-        })
-    return ctx
-
-
-def ema_gate_required(direction, crossed_lvl, ema_value):
-    """
-    EMA200 direction is STRICT:
-      SHORT -> EMA200 must be BELOW the crossed HIGHEST VWAP level.
-      LONG  -> EMA200 must be ABOVE the crossed LOWEST VWAP level.
-
-    Only after that directional-side check do we test the 1% proximity.
-    If EMA200 is on the opposite side of the VWAP, this special EMA waiting
-    filter does not apply and the original VWAP logic remains unchanged.
-    """
-    if direction == "short":
-        # Strict SHORT geometry: EMA200 must sit BELOW the top VWAP.
-        if not (ema_value < crossed_lvl):
-            return False, None
-        proximity = ((crossed_lvl - ema_value) / crossed_lvl) * 100
-
-    elif direction == "long":
-        # Strict LONG geometry: EMA200 must sit ABOVE the bottom VWAP.
-        if not (ema_value > crossed_lvl):
-            return False, None
-        proximity = ((ema_value - crossed_lvl) / crossed_lvl) * 100
-
-    else:
-        return False, None
-
-    return proximity <= EMA_PROXIMITY_PCT, proximity
-
-
-def ema_two_close_confirmed(ctx, direction):
-    """True when the latest TWO closed 15m candles are on the trade side of EMA200."""
-    if not ctx or len(ctx) < 2:
-        return False
-
-    prev_c, curr_c = ctx[-2], ctx[-1]
-    if direction == "short":
-        return prev_c["close"] < prev_c["ema"] and curr_c["close"] < curr_c["ema"]
-    return prev_c["close"] > prev_c["ema"] and curr_c["close"] > curr_c["ema"]
-
-
-def ema_retest_confirmed(ctx, direction, side_seen_before_current):
-    """
-    Retest confirmation:
-      SHORT -> EMA had already been broken/closed below; latest candle touches EMA
-               from below (high >= EMA) and closes back below it.
-      LONG  -> EMA had already been broken/closed above; latest candle touches EMA
-               from above (low <= EMA) and closes back above it.
-    """
-    if not ctx or not side_seen_before_current:
-        return False
-
-    curr_c = ctx[-1]
-    if direction == "short":
-        return curr_c["high"] >= curr_c["ema"] and curr_c["close"] < curr_c["ema"]
-    return curr_c["low"] <= curr_c["ema"] and curr_c["close"] > curr_c["ema"]
-
-
-# =====================================================
 # CLOSE LEVELS — completed periods ONLY
 # =====================================================
 
@@ -527,6 +442,87 @@ def fmt_levels(close_levels):
         return "--"
     return "  ".join(f"({i}){k}={v:.8g}"
                      for i, (k, v) in enumerate(reversed(close_levels), start=1))
+
+
+# =====================================================
+# 200 EMA CONFIRMATION GATE
+# =====================================================
+
+def compute_ema_series(candles, length):
+    """
+    Full EMA series (one value per candle from the `length`-th candle
+    onward), seeded with an SMA of the first `length` closes. Returns
+    None if there isn't enough history yet.
+    """
+    if len(candles) < length:
+        return None
+    closes = [float(c["close"]) for c in candles]
+    k      = 2 / (length + 1)
+    ema    = sum(closes[:length]) / length
+    series = [ema]
+    for price in closes[length:]:
+        ema = price * k + ema * (1 - k)
+        series.append(ema)
+    return series
+
+
+def compute_ema(candles, length):
+    """Current EMA value (last point of the series), or None."""
+    series = compute_ema_series(candles, length)
+    return series[-1] if series else None
+
+
+def fetch_ema200_15m(symbol):
+    """
+    Fetches enough 15m history to seed a 200-period EMA. Returns
+    (ema_now, ema_prior) — ema_prior is the EMA value
+    EMA_SLOPE_LOOKBACK_CANDLES candles earlier, used to read its slope.
+    Either value is None if there isn't enough history yet.
+    """
+    from_ts = int(time.time()) - EMA_LOOKBACK_DAYS * 86400
+    candles = drop_forming_candle(
+        fetch_candles_range(symbol, from_ts, RESOLUTION_15M, CANDLE_SECONDS_15M),
+        CANDLE_SECONDS_15M,
+    )
+    series = compute_ema_series(candles, EMA_LEN)
+    if not series:
+        return None, None
+    ema_now   = series[-1]
+    ema_prior = series[-1 - EMA_SLOPE_LOOKBACK_CANDLES] if len(series) > EMA_SLOPE_LOOKBACK_CANDLES else None
+    return ema_now, ema_prior
+
+
+def ema_slope_ok(direction, ema_now, ema_prior):
+    """
+    True if the 200 EMA's own slope supports the trade direction —
+    falling for a short, rising for a long, compared to its value
+    EMA_SLOPE_LOOKBACK_CANDLES candles back. Doesn't veto if the slope
+    can't be measured yet (falls back to the price check alone).
+    """
+    if ema_now is None or ema_prior is None:
+        return True
+    if direction == "short":
+        return ema_now < ema_prior
+    return ema_now > ema_prior
+
+
+def ema_confirmed(direction, ema_now, c2, c1, last_candle):
+    """
+    True once price has confirmed beyond the 200 EMA in the trade
+    direction, via EITHER:
+      - a retest: the latest 15m candle wicks into/through the EMA but
+        still CLOSES on the correct side (rejection at the EMA), or
+      - 2 consecutive 15m closes (c2 and c1) on the correct side of the EMA.
+    """
+    high = float(last_candle["high"])
+    low  = float(last_candle["low"])
+    if direction == "short":
+        retest    = (c1 < ema_now) and (high >= ema_now)
+        two_close = (c2 < ema_now) and (c1 < ema_now)
+    else:
+        retest    = (c1 > ema_now) and (low <= ema_now)
+        two_close = (c2 > ema_now) and (c1 > ema_now)
+    return retest or two_close
 
 
 # =====================================================
@@ -617,13 +613,48 @@ TF_FETCH = {
 }
 
 
+def compute_trade_levels(direction, flat, highest_label, highest_pkey, highest_lvl,
+                          lowest_label, lowest_pkey, lowest_lvl):
+    """Given a direction and the current level set, returns
+    (crossed_label, crossed_lvl, entry, sl, tp, tp_label)."""
+    if direction == "short":
+        crossed_label = f"{highest_label} · {highest_pkey}"
+        crossed_lvl   = highest_lvl
+        entry         = crossed_lvl                    # RETEST: limit at the level
+        sl            = crossed_lvl * (1 + SL_PCT / 100)
+        below = [(lb, pk, lv) for lb, pk, lv in flat if lv < entry]
+        if below:
+            tp_label_, tp_pkey_, nearest = max(below, key=lambda x: x[2])
+            dist_pct = (1 - nearest / entry) * 100
+            if dist_pct <= TP_MAX_PCT:
+                tp, tp_label = nearest, f"{tp_label_} · {tp_pkey_}"
+            else:
+                tp, tp_label = entry * (1 - TP_MAX_PCT / 100), f"{TP_MAX_PCT}% cap"
+        else:
+            tp, tp_label = entry * (1 - TP_MAX_PCT / 100), f"{TP_MAX_PCT}% (no level below)"
+    else:  # long
+        crossed_label = f"{lowest_label} · {lowest_pkey}"
+        crossed_lvl   = lowest_lvl
+        entry         = crossed_lvl                    # RETEST: limit at the level
+        sl            = crossed_lvl * (1 - SL_PCT / 100)
+        above = [(lb, pk, lv) for lb, pk, lv in flat if lv > entry]
+        if above:
+            tp_label_, tp_pkey_, nearest = min(above, key=lambda x: x[2])
+            dist_pct = (nearest / entry - 1) * 100
+            if dist_pct <= TP_MAX_PCT:
+                tp, tp_label = nearest, f"{tp_label_} · {tp_pkey_}"
+            else:
+                tp, tp_label = entry * (1 + TP_MAX_PCT / 100), f"{TP_MAX_PCT}% cap"
+        else:
+            tp, tp_label = entry * (1 + TP_MAX_PCT / 100), f"{TP_MAX_PCT}% (no level above)"
+    return crossed_label, crossed_lvl, entry, sl, tp, tp_label
+
+
 def scan_symbol(symbol, all_state, global_positions, global_orders, slots_left):
     """
     Returns True if a new retest order was placed (consumes a slot).
     """
-    st = all_state.setdefault(
-        symbol, {"levels": {}, "last_ts": 0, "pending": None, "ema_wait": None}
-    )
+    st = all_state.setdefault(symbol, {"levels": {}, "last_ts": 0, "pending": None, "ema_wait": None})
     st.setdefault("levels", {})
     st.setdefault("last_ts", 0)
     st.setdefault("pending", None)
@@ -721,8 +752,7 @@ def scan_symbol(symbol, all_state, global_positions, global_orders, slots_left):
     if any(p.get("pair") == pair_name for p in global_positions):
         if st.get("pending"):
             st["pending"] = None          # retest filled — position guard owns it now
-        if st.get("ema_wait"):
-            st["ema_wait"] = None
+        st["ema_wait"] = None             # drop any stale EMA wait
         print(f"  [{symbol}] SKIP ENTRY — position open")
         if not already_processed:
             st["last_ts"] = curr_ts
@@ -730,8 +760,6 @@ def scan_symbol(symbol, all_state, global_positions, global_orders, slots_left):
 
     open_order = next((o for o in global_orders if o.get("pair") == pair_name), None)
     if open_order is not None:
-        if st.get("ema_wait"):
-            st["ema_wait"] = None
         pend = st.get("pending")
         if pend and curr_ts >= pend.get("expire_ts", 0):
             print(f"  [{symbol}] RETEST EXPIRED — cancelling order")
@@ -758,228 +786,83 @@ def scan_symbol(symbol, all_state, global_positions, global_orders, slots_left):
         return False
 
     precision = get_precision(float(daily_candles[-1]["close"]))
-
-    # ── Existing VWAP signal waiting for EMA200 confirmation ───────────────────
-    ema_wait = st.get("ema_wait")
-    if ema_wait:
-        wait_direction = ema_wait["direction"]
-        wait_level     = float(ema_wait["crossed_lvl"])
-
-        # If price closes back through the original crossed VWAP extreme,
-        # the old break is invalidated and must not create a stale trade later.
-        invalidated = (
-            (wait_direction == "short" and c1 >= wait_level) or
-            (wait_direction == "long"  and c1 <= wait_level)
-        )
-        if invalidated:
-            print(f"  [{symbol}] EMA WAIT CANCELLED — VWAP break invalidated")
-            send_telegram(
-                f"⚪ <b>EMA200 WAIT CANCELLED — {symbol}</b>\n"
-                f"Price closed back through <code>{ema_wait['crossed_label']}</code>"
-            )
-            st["ema_wait"] = None
-        else:
-            ema_ctx = get_ema200_15m_context(symbol)
-            if not ema_ctx:
-                print(f"  [{symbol}] EMA WAIT — EMA200 unavailable")
-                return False
-
-            latest = ema_ctx[-1]
-            if latest["time"] != curr_ts:
-                print(f"  [{symbol}] EMA WAIT — latest 15m EMA candle not aligned")
-                return False
-
-            side_seen_before = bool(ema_wait.get("side_seen", False))
-
-            two_close = ema_two_close_confirmed(ema_ctx, wait_direction)
-            retest = ema_retest_confirmed(
-                ema_ctx, wait_direction, side_seen_before_current=side_seen_before
-            )
-
-            # Update whether EMA has been closed through at least once.
-            if wait_direction == "short" and latest["close"] < latest["ema"]:
-                ema_wait["side_seen"] = True
-            elif wait_direction == "long" and latest["close"] > latest["ema"]:
-                ema_wait["side_seen"] = True
-
-            if not (two_close or retest):
-                side_word = "below" if wait_direction == "short" else "above"
-                print(
-                    f"  [{symbol}] EMA WAIT — {wait_direction.upper()} | "
-                    f"close={latest['close']:.8g} EMA200={latest['ema']:.8g} | "
-                    f"waiting for retest or 2 closes {side_word} EMA"
-                )
-                return False
-
-            confirm_reason = "EMA200 retest held" if retest else "2 consecutive closes beyond EMA200"
-            print(
-                f"  [{symbol}] EMA200 CONFIRMED — {wait_direction.upper()} | "
-                f"{confirm_reason} | EMA200={latest['ema']:.8g}"
-            )
-            send_telegram(
-                f"✅ <b>EMA200 CONFIRMED — {symbol} {wait_direction.upper()}</b>\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"📈 EMA200 : <code>{latest['ema']:.8g}</code> (15m)\n"
-                f"✅ Rule   : <code>{confirm_reason}</code>\n"
-                f"📍 Now placing the original VWAP retest order"
-            )
-
-            direction     = wait_direction
-            crossed_label = ema_wait["crossed_label"]
-            crossed_lvl   = wait_level
-            entry         = float(ema_wait["entry"])
-            tp            = float(ema_wait["tp"])
-            sl            = float(ema_wait["sl"])
-            tp_label      = ema_wait["tp_label"]
-            st["ema_wait"] = None
-
-            # Sanity remains unchanged.
-            if direction == "short" and (tp >= entry or sl <= entry):
-                print(f"  [{symbol}] SKIP ENTRY — invalid TP/SL geometry (short)")
-                return False
-            if direction == "long" and (tp <= entry or sl >= entry):
-                print(f"  [{symbol}] SKIP ENTRY — invalid TP/SL geometry (long)")
-                return False
-
-            result = place_order(symbol, direction, entry, tp, sl, precision,
-                                 crossed_label, crossed_lvl, tp_label)
-            if result:
-                st["pending"] = {
-                    "order_id":  result if isinstance(result, str) else None,
-                    "expire_ts": curr_ts + RETEST_EXPIRY_CANDLES * CANDLE_SECONDS_15M * 1000,
-                }
-                return True
-            return False
-
     direction = None
 
-    # ── SHORT: above ALL -> 2 closes below HIGHEST level -> retest limit ─────
+    # ── SHORT: above ALL -> 2 closes below HIGHEST level ──────────────────────
     if c3 > highest_lvl and c2 < highest_lvl and c1 < highest_lvl:
-        direction     = "short"
-        crossed_label = f"{highest_label} · {highest_pkey}"
-        crossed_lvl   = highest_lvl
-        entry         = crossed_lvl                    # RETEST: limit at the level
-        sl            = crossed_lvl * (1 + SL_PCT / 100)
-        below = [(lb, pk, lv) for lb, pk, lv in flat if lv < entry]
-        if below:
-            tp_label_, tp_pkey_, nearest = max(below, key=lambda x: x[2])
-            dist_pct = (1 - nearest / entry) * 100
-            if dist_pct <= TP_MAX_PCT:
-                tp, tp_label = nearest, f"{tp_label_} · {tp_pkey_}"
-            else:
-                tp, tp_label = entry * (1 - TP_MAX_PCT / 100), f"{TP_MAX_PCT}% cap"
-        else:
-            tp, tp_label = entry * (1 - TP_MAX_PCT / 100), f"{TP_MAX_PCT}% (no level below)"
+        direction = "short"
 
-    # ── LONG: below ALL -> 2 closes above LOWEST level -> retest limit ───────
+    # ── LONG: below ALL -> 2 closes above LOWEST level ────────────────────────
     elif c3 < lowest_lvl and c2 > lowest_lvl and c1 > lowest_lvl:
-        direction     = "long"
-        crossed_label = f"{lowest_label} · {lowest_pkey}"
-        crossed_lvl   = lowest_lvl
-        entry         = crossed_lvl                    # RETEST: limit at the level
-        sl            = crossed_lvl * (1 - SL_PCT / 100)
-        above = [(lb, pk, lv) for lb, pk, lv in flat if lv > entry]
-        if above:
-            tp_label_, tp_pkey_, nearest = min(above, key=lambda x: x[2])
-            dist_pct = (nearest / entry - 1) * 100
-            if dist_pct <= TP_MAX_PCT:
-                tp, tp_label = nearest, f"{tp_label_} · {tp_pkey_}"
-            else:
-                tp, tp_label = entry * (1 + TP_MAX_PCT / 100), f"{TP_MAX_PCT}% cap"
-        else:
-            tp, tp_label = entry * (1 + TP_MAX_PCT / 100), f"{TP_MAX_PCT}% (no level above)"
+        direction = "long"
+
+    pending_dir  = st.get("ema_wait")
+    from_pending = False
+
+    if direction is None and pending_dir is not None:
+        # No fresh cross this candle, but an earlier cross is waiting on
+        # 200 EMA confirmation. Drop the wait if price has round-tripped
+        # back over the level that originally triggered it.
+        if (pending_dir == "short" and c1 >= highest_lvl) or \
+           (pending_dir == "long"  and c1 <= lowest_lvl):
+            print(f"  [{symbol}] EMA WAIT CANCELLED — price recrossed the level")
+            st["ema_wait"] = None
+            return False
+
+        ema_now, ema_prior = fetch_ema200_15m(symbol)
+        if ema_now is None or not (
+                ema_confirmed(pending_dir, ema_now, c2, c1, daily_candles[-1])
+                and ema_slope_ok(pending_dir, ema_now, ema_prior)):
+            print(f"  [{symbol}] EMA WAIT — still waiting for retest/2 closes + matching 200 EMA slope")
+            return False
+
+        print(f"  [{symbol}] EMA CONFIRMED — {pending_dir.upper()} cleared 200 EMA={ema_now:.8g} "
+              f"with matching slope")
+        direction    = pending_dir
+        from_pending = True
 
     if direction is None:
         return False
 
+    crossed_label, crossed_lvl, entry, sl, tp, tp_label = compute_trade_levels(
+        direction, flat, highest_label, highest_pkey, highest_lvl,
+        lowest_label, lowest_pkey, lowest_lvl,
+    )
+
     # sanity: TP/SL must be on correct sides of entry
     if direction == "short" and (tp >= entry or sl <= entry):
         print(f"  [{symbol}] SKIP ENTRY — invalid TP/SL geometry (short)")
+        if from_pending:
+            st["ema_wait"] = None
         return False
     if direction == "long" and (tp <= entry or sl >= entry):
         print(f"  [{symbol}] SKIP ENTRY — invalid TP/SL geometry (long)")
+        if from_pending:
+            st["ema_wait"] = None
         return False
 
-    print(f"  [{symbol}] SIGNAL {direction.upper()} — broke {crossed_label} @ {crossed_lvl:.8g}, "
-          f"held 2 candles (c3={c3:.8g} c2={c2:.8g} c1={c1:.8g})")
+    # ── 200 EMA proximity gate (fresh signals only — a signal already
+    #    confirmed via ema_wait falls straight through) ───────────────────────
+    if not from_pending:
+        ema_now, ema_prior = fetch_ema200_15m(symbol)
+        if ema_now is not None:
+            proximity_pct = abs(ema_now - crossed_lvl) / crossed_lvl * 100
+            if proximity_pct <= EMA_PROXIMITY_PCT and not (
+                    ema_confirmed(direction, ema_now, c2, c1, daily_candles[-1])
+                    and ema_slope_ok(direction, ema_now, ema_prior)):
+                print(f"  [{symbol}] EMA200={ema_now:.8g} within {proximity_pct:.2f}% of "
+                      f"{crossed_label} — holding for retest/2 closes + matching EMA slope")
+                st["ema_wait"] = direction
+                return False
 
-    # ── NEW: 15m EMA200 proximity gate ────────────────────────────────────────
-    # Only applies when:
-    #   SHORT -> EMA200 is BELOW the crossed highest VWAP and within 1%.
-    #   LONG  -> EMA200 is ABOVE the crossed lowest VWAP and within 1%.
-    # Otherwise behavior is exactly the same as before.
-    ema_ctx = get_ema200_15m_context(symbol)
-    if not ema_ctx:
-        print(f"  [{symbol}] SKIP ENTRY — could not calculate 15m EMA200")
-        return False
+    st["ema_wait"] = None
 
-    latest = ema_ctx[-1]
-    if latest["time"] != curr_ts:
-        print(f"  [{symbol}] SKIP ENTRY — EMA200 candle not aligned with latest closed 15m candle")
-        return False
-
-    gate_required, proximity = ema_gate_required(direction, crossed_lvl, latest["ema"])
-
-    if gate_required:
-        two_close = ema_two_close_confirmed(ema_ctx, direction)
-
-        # At the moment the VWAP signal is detected, a true retest is only
-        # accepted if the prior closed candle was already beyond EMA and the
-        # latest candle touched EMA and closed back on the trade side.
-        prev = ema_ctx[-2] if len(ema_ctx) >= 2 else None
-        prev_side = False
-        if prev:
-            if direction == "short":
-                prev_side = prev["close"] < prev["ema"]
-            else:
-                prev_side = prev["close"] > prev["ema"]
-        retest = ema_retest_confirmed(
-            ema_ctx, direction, side_seen_before_current=prev_side
-        )
-
-        if not (two_close or retest):
-            side_word = "below" if direction == "short" else "above"
-            print(
-                f"  [{symbol}] EMA200 GATE ACTIVE — EMA={latest['ema']:.8g}, "
-                f"VWAP={crossed_lvl:.8g}, proximity={proximity:.3f}% | "
-                f"waiting for retest or 2 closes {side_word} EMA"
-            )
-
-            side_seen = (
-                latest["close"] < latest["ema"]
-                if direction == "short"
-                else latest["close"] > latest["ema"]
-            )
-            st["ema_wait"] = {
-                "direction":     direction,
-                "crossed_label": crossed_label,
-                "crossed_lvl":   crossed_lvl,
-                "entry":         entry,
-                "tp":            tp,
-                "sl":            sl,
-                "tp_label":      tp_label,
-                "armed_ts":      curr_ts,
-                "side_seen":     side_seen,
-            }
-
-            send_telegram(
-                f"⏸️ <b>EMA200 FILTER — WAITING ({symbol} {direction.upper()})</b>\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"🧱 VWAP   : <code>{crossed_lvl:.8g}</code> ({crossed_label})\n"
-                f"📈 EMA200 : <code>{latest['ema']:.8g}</code> (15m)\n"
-                f"📐 Gap    : <code>{proximity:.3f}%</code> (≤ {EMA_PROXIMITY_PCT}%)\n"
-                f"⏳ Need   : <code>EMA retest hold OR 2 closes {side_word} EMA200</code>\n"
-                f"🚫 No order placed yet"
-            )
-            return False
-
-        confirm_reason = "EMA200 retest held" if retest else "2 consecutive closes beyond EMA200"
-        print(
-            f"  [{symbol}] EMA200 GATE PASSED IMMEDIATELY — "
-            f"{confirm_reason} | EMA200={latest['ema']:.8g}"
-        )
-
-    print(f"  [{symbol}] placing retest limit at crossed VWAP level")
+    if from_pending:
+        print(f"  [{symbol}] SIGNAL {direction.upper()} — broke {crossed_label} @ {crossed_lvl:.8g}, "
+              f"200 EMA confirmed — placing retest limit")
+    else:
+        print(f"  [{symbol}] SIGNAL {direction.upper()} — broke {crossed_label} @ {crossed_lvl:.8g}, "
+              f"held 2 candles (c3={c3:.8g} c2={c2:.8g} c1={c1:.8g}) — placing retest limit")
 
     result = place_order(symbol, direction, entry, tp, sl, precision,
                          crossed_label, crossed_lvl, tp_label)
@@ -1007,12 +890,12 @@ send_telegram(
     f"M x{HISTORICAL_LEVELS['M']} (completed periods)</code>\n"
     f"🔴 SHORT : <code>Above ALL -> 2x 15m closes below highest level</code>\n"
     f"🟢 LONG  : <code>Below ALL -> 2x 15m closes above lowest level</code>\n"
-    f"📈 EMA200: <code>15m | within {EMA_PROXIMITY_PCT}% of crossed extreme -> "
-    f"EMA retest hold OR 2 closes beyond EMA</code>\n"
     f"📍 Entry : <code>RETEST limit at the broken level</code>\n"
     f"⏳ Expiry: <code>{RETEST_EXPIRY_CANDLES} x 15m candles (then cancelled)</code>\n"
     f"🛑 SL    : <code>{SL_PCT}% beyond crossed level</code>\n"
     f"🎯 TP    : <code>Nearest level (max {TP_MAX_PCT}%) or {TP_MAX_PCT}%</code>\n"
+    f"📈 EMA   : <code>200 EMA(15m) gate if within {EMA_PROXIMITY_PCT}% of level -> "
+    f"wait for retest/2 closes + matching EMA slope</code>\n"
     f"📊 Max   : <code>{MAX_OPEN_TRADES} concurrent positions</code>\n"
     f"💰 <code>{CAPITAL_USDT} USDT x {LEVERAGE}x</code> | 🔁 <code>{SCAN_INTERVAL}s</code>"
 )
