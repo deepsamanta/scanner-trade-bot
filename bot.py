@@ -58,7 +58,7 @@ HISTORICAL_LEVELS = {"D": 1, "W": 3, "M": 2}
 
 # ── Trade params ──────────────────────────────────────────────────────────────
 MAX_OPEN_TRADES       = 50
-SL_PCT                = 1.8   # SL distance beyond the crossed level
+SL_PCT                = 2.2    # SL distance beyond the crossed level
 TP_MAX_PCT            = 5.0    # TP cap / fallback
 RETEST_EXPIRY_CANDLES = 8      # cancel unfilled retest order after 8 x 15m (2h)
 
@@ -436,19 +436,28 @@ def get_ema200_15m_context(symbol):
 
 def ema_gate_required(direction, crossed_lvl, ema_value):
     """
-    The EMA gate applies ONLY in the user's specified geometry:
-      SHORT -> EMA200 is just BELOW the highest crossed VWAP level.
-      LONG  -> EMA200 is just ABOVE the lowest crossed VWAP level.
-    In both cases EMA200 must be within EMA_PROXIMITY_PCT of that VWAP level.
+    EMA200 direction is STRICT:
+      SHORT -> EMA200 must be BELOW the crossed HIGHEST VWAP level.
+      LONG  -> EMA200 must be ABOVE the crossed LOWEST VWAP level.
+
+    Only after that directional-side check do we test the 1% proximity.
+    If EMA200 is on the opposite side of the VWAP, this special EMA waiting
+    filter does not apply and the original VWAP logic remains unchanged.
     """
     if direction == "short":
-        if ema_value >= crossed_lvl:
+        # Strict SHORT geometry: EMA200 must sit BELOW the top VWAP.
+        if not (ema_value < crossed_lvl):
             return False, None
         proximity = ((crossed_lvl - ema_value) / crossed_lvl) * 100
-    else:
-        if ema_value <= crossed_lvl:
+
+    elif direction == "long":
+        # Strict LONG geometry: EMA200 must sit ABOVE the bottom VWAP.
+        if not (ema_value > crossed_lvl):
             return False, None
         proximity = ((ema_value - crossed_lvl) / crossed_lvl) * 100
+
+    else:
+        return False, None
 
     return proximity <= EMA_PROXIMITY_PCT, proximity
 
