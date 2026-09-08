@@ -810,18 +810,9 @@ def scan_symbol(symbol, all_state, global_positions, global_orders, slots_left):
             return False
 
         ema_now, ema_prior = fetch_ema200_15m(symbol)
-        if ema_now is None:
-            print(f"  [{symbol}] EMA WAIT — EMA200 unavailable (insufficient 15m history), still waiting")
-            return False
-
-        ref_lvl    = highest_lvl if pending_dir == "short" else lowest_lvl
-        price_side = "BELOW" if c1 < ema_now else "ABOVE"
-        confirmed  = ema_confirmed(pending_dir, ema_now, c2, c1, daily_candles[-1])
-        slope_ok   = ema_slope_ok(pending_dir, ema_now, ema_prior)
-        print(f"  [{symbol}] EMA WAIT CHECK — EMA200={ema_now:.8g} vs level={ref_lvl:.8g} "
-              f"| c2={c2:.8g} c1={c1:.8g} price {price_side} EMA | confirmed={confirmed} slope_ok={slope_ok}")
-
-        if not (confirmed and slope_ok):
+        if ema_now is None or not (
+                ema_confirmed(pending_dir, ema_now, c2, c1, daily_candles[-1])
+                and ema_slope_ok(pending_dir, ema_now, ema_prior)):
             print(f"  [{symbol}] EMA WAIT — still waiting for retest/2 closes + matching 200 EMA slope")
             return False
 
@@ -856,26 +847,13 @@ def scan_symbol(symbol, all_state, global_positions, global_orders, slots_left):
         ema_now, ema_prior = fetch_ema200_15m(symbol)
         if ema_now is not None:
             proximity_pct = abs(ema_now - crossed_lvl) / crossed_lvl * 100
-            ema_vs_level  = "ABOVE" if ema_now > crossed_lvl else "BELOW"
-            price_side    = "BELOW" if c1 < ema_now else "ABOVE"
-            print(f"  [{symbol}] EMA200={ema_now:.8g} is {ema_vs_level} {crossed_label} "
-                  f"({proximity_pct:.2f}% away) | c1={c1:.8g} price is {price_side} EMA")
-
-            if proximity_pct <= EMA_PROXIMITY_PCT:
-                confirmed = ema_confirmed(direction, ema_now, c2, c1, daily_candles[-1])
-                slope_ok  = ema_slope_ok(direction, ema_now, ema_prior)
-                print(f"  [{symbol}] EMA GATE ENGAGED (<= {EMA_PROXIMITY_PCT}% proximity) — "
-                      f"confirmed={confirmed} slope_ok={slope_ok}")
-                if not (confirmed and slope_ok):
-                    print(f"  [{symbol}] EMA200={ema_now:.8g} within {proximity_pct:.2f}% of "
-                          f"{crossed_label} — holding for retest/2 closes + matching EMA slope")
-                    st["ema_wait"] = direction
-                    return False
-            else:
-                print(f"  [{symbol}] EMA GATE SKIPPED — {proximity_pct:.2f}% from {crossed_label} "
-                      f"is beyond {EMA_PROXIMITY_PCT}% threshold, taking signal directly")
-        else:
-            print(f"  [{symbol}] EMA200 unavailable (insufficient 15m history) — skipping EMA gate")
+            if proximity_pct <= EMA_PROXIMITY_PCT and not (
+                    ema_confirmed(direction, ema_now, c2, c1, daily_candles[-1])
+                    and ema_slope_ok(direction, ema_now, ema_prior)):
+                print(f"  [{symbol}] EMA200={ema_now:.8g} within {proximity_pct:.2f}% of "
+                      f"{crossed_label} — holding for retest/2 closes + matching EMA slope")
+                st["ema_wait"] = direction
+                return False
 
     st["ema_wait"] = None
 
