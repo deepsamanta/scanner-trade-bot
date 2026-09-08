@@ -70,7 +70,7 @@ RETEST_EXPIRY_CANDLES = 8      # cancel unfilled retest order after 8 x 15m (2h)
 # ── 200 EMA proximity gate ───────────────────────────────────────────────────
 EMA_LEN                    = 200   # EMA period, computed on 15m closes
 EMA_LOOKBACK_DAYS          = 5     # extra 15m history fetched just to seed the EMA
-EMA_PROXIMITY_PCT          = 1.0   # gate engages only if EMA200 sits within this % of the crossed level
+EMA_PROXIMITY_PCT          = 2.0   # gate engages only if EMA200 sits within this % of the crossed level
 EMA_SLOPE_LOOKBACK_CANDLES = 5     # 15m candles back used to read the EMA's own slope
 
 STABLECOINS = {
