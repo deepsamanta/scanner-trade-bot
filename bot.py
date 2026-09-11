@@ -32,14 +32,10 @@ BASE_URL = "https://api.coindcx.com"
 #   c2 close ABOVE the LOWEST level
 #   c1 close ABOVE the LOWEST level
 #
-# 200 EMA GATE (only when 200 EMA (15m) sits within EMA_PROXIMITY_PCT of the
-# crossed level):
-#   Entry is held back until BOTH:
-#     - price confirms beyond that EMA, via EITHER a retest (a 15m candle
-#       wicks into the EMA but still closes on the correct side) OR 2
-#       consecutive 15m closes beyond the EMA, AND
-#     - the EMA's own slope supports the trade (falling for a short,
-#       rising for a long, vs. its value EMA_SLOPE_LOOKBACK_CANDLES back).
+# 4H CLOSE CONFIRMATION:
+#   After the SIGNAL fires, entry is held back until a 4-hour candle
+#   CLOSES beyond the crossed level in the trade direction (below it
+#   for a short, above it for a long).
 #   The wait is dropped if price re-crosses back over the originally
 #   crossed level.
 #
@@ -67,11 +63,8 @@ SL_PCT                = 3   # SL distance beyond the crossed level
 TP_MAX_PCT            = 5.0    # TP cap / fallback
 RETEST_EXPIRY_CANDLES = 8      # cancel unfilled retest order after 8 x 15m (2h)
 
-# ── 200 EMA proximity gate ───────────────────────────────────────────────────
-EMA_LEN                    = 200   # EMA period, computed on 15m closes
-EMA_LOOKBACK_DAYS          = 5     # extra 15m history fetched just to seed the EMA
-EMA_PROXIMITY_PCT          = 1.0   # gate engages only if EMA200 sits within this % of the crossed level
-EMA_SLOPE_LOOKBACK_CANDLES = 5     # 15m candles back used to read the EMA's own slope
+# ── 4H close confirmation ────────────────────────────────────────────────────
+H4_LOOKBACK_DAYS = 2   # history fetched to find the latest completed 4h candle
 
 STABLECOINS = {
     "USDT", "USDC", "BUSD", "DAI", "TUSD", "USDP", "FRAX", "UST", "LUSD",
@@ -445,84 +438,34 @@ def fmt_levels(close_levels):
 
 
 # =====================================================
-# 200 EMA CONFIRMATION GATE
+# 4H CANDLE CLOSE CONFIRMATION
 # =====================================================
 
-def compute_ema_series(candles, length):
+def fetch_last_4h_close(symbol):
     """
-    Full EMA series (one value per candle from the `length`-th candle
-    onward), seeded with an SMA of the first `length` closes. Returns
-    None if there isn't enough history yet.
+    Fetches recent 4h candles and returns the close of the most
+    recently COMPLETED 4h candle, or None if there isn't one yet.
     """
-    if len(candles) < length:
-        return None
-    closes = [float(c["close"]) for c in candles]
-    k      = 2 / (length + 1)
-    ema    = sum(closes[:length]) / length
-    series = [ema]
-    for price in closes[length:]:
-        ema = price * k + ema * (1 - k)
-        series.append(ema)
-    return series
-
-
-def compute_ema(candles, length):
-    """Current EMA value (last point of the series), or None."""
-    series = compute_ema_series(candles, length)
-    return series[-1] if series else None
-
-
-def fetch_ema200_15m(symbol):
-    """
-    Fetches enough 15m history to seed a 200-period EMA. Returns
-    (ema_now, ema_prior) — ema_prior is the EMA value
-    EMA_SLOPE_LOOKBACK_CANDLES candles earlier, used to read its slope.
-    Either value is None if there isn't enough history yet.
-    """
-    from_ts = int(time.time()) - EMA_LOOKBACK_DAYS * 86400
+    from_ts = int(time.time()) - H4_LOOKBACK_DAYS * 86400
     candles = drop_forming_candle(
-        fetch_candles_range(symbol, from_ts, RESOLUTION_15M, CANDLE_SECONDS_15M),
-        CANDLE_SECONDS_15M,
+        fetch_candles_range(symbol, from_ts, RESOLUTION_4H, CANDLE_SECONDS_4H),
+        CANDLE_SECONDS_4H,
     )
-    series = compute_ema_series(candles, EMA_LEN)
-    if not series:
-        return None, None
-    ema_now   = series[-1]
-    ema_prior = series[-1 - EMA_SLOPE_LOOKBACK_CANDLES] if len(series) > EMA_SLOPE_LOOKBACK_CANDLES else None
-    return ema_now, ema_prior
+    if not candles:
+        return None
+    return float(candles[-1]["close"])
 
 
-def ema_slope_ok(direction, ema_now, ema_prior):
+def h4_close_confirms(direction, h4_close, level):
     """
-    True if the 200 EMA's own slope supports the trade direction —
-    falling for a short, rising for a long, compared to its value
-    EMA_SLOPE_LOOKBACK_CANDLES candles back. Doesn't veto if the slope
-    can't be measured yet (falls back to the price check alone).
+    True once the latest COMPLETED 4h candle has closed beyond `level`
+    in the trade direction (below it for a short, above it for a long).
     """
-    if ema_now is None or ema_prior is None:
-        return True
+    if h4_close is None:
+        return False
     if direction == "short":
-        return ema_now < ema_prior
-    return ema_now > ema_prior
-
-
-def ema_confirmed(direction, ema_now, c2, c1, last_candle):
-    """
-    True once price has confirmed beyond the 200 EMA in the trade
-    direction, via EITHER:
-      - a retest: the latest 15m candle wicks into/through the EMA but
-        still CLOSES on the correct side (rejection at the EMA), or
-      - 2 consecutive 15m closes (c2 and c1) on the correct side of the EMA.
-    """
-    high = float(last_candle["high"])
-    low  = float(last_candle["low"])
-    if direction == "short":
-        retest    = (c1 < ema_now) and (high >= ema_now)
-        two_close = (c2 < ema_now) and (c1 < ema_now)
-    else:
-        retest    = (c1 > ema_now) and (low <= ema_now)
-        two_close = (c2 > ema_now) and (c1 > ema_now)
-    return retest or two_close
+        return h4_close < level
+    return h4_close > level
 
 
 # =====================================================
@@ -654,11 +597,11 @@ def scan_symbol(symbol, all_state, global_positions, global_orders, slots_left):
     """
     Returns True if a new retest order was placed (consumes a slot).
     """
-    st = all_state.setdefault(symbol, {"levels": {}, "last_ts": 0, "pending": None, "ema_wait": None})
+    st = all_state.setdefault(symbol, {"levels": {}, "last_ts": 0, "pending": None, "h4_wait": None})
     st.setdefault("levels", {})
     st.setdefault("last_ts", 0)
     st.setdefault("pending", None)
-    st.setdefault("ema_wait", None)
+    st.setdefault("h4_wait", None)
 
     tfs = []
     if ENABLE_DAILY:
@@ -752,7 +695,7 @@ def scan_symbol(symbol, all_state, global_positions, global_orders, slots_left):
     if any(p.get("pair") == pair_name for p in global_positions):
         if st.get("pending"):
             st["pending"] = None          # retest filled — position guard owns it now
-        st["ema_wait"] = None             # drop any stale EMA wait
+        st["h4_wait"] = None              # drop any stale 4h wait
         print(f"  [{symbol}] SKIP ENTRY — position open")
         if not already_processed:
             st["last_ts"] = curr_ts
@@ -796,28 +739,26 @@ def scan_symbol(symbol, all_state, global_positions, global_orders, slots_left):
     elif c3 < lowest_lvl and c2 > lowest_lvl and c1 > lowest_lvl:
         direction = "long"
 
-    pending_dir  = st.get("ema_wait")
+    pending_dir  = st.get("h4_wait")
     from_pending = False
 
     if direction is None and pending_dir is not None:
         # No fresh cross this candle, but an earlier cross is waiting on
-        # 200 EMA confirmation. Drop the wait if price has round-tripped
-        # back over the level that originally triggered it.
+        # 4h candle close confirmation. Drop the wait if price has
+        # round-tripped back over the level that originally triggered it.
         if (pending_dir == "short" and c1 >= highest_lvl) or \
            (pending_dir == "long"  and c1 <= lowest_lvl):
-            print(f"  [{symbol}] EMA WAIT CANCELLED — price recrossed the level")
-            st["ema_wait"] = None
+            print(f"  [{symbol}] 4H WAIT CANCELLED — price recrossed the level")
+            st["h4_wait"] = None
             return False
 
-        ema_now, ema_prior = fetch_ema200_15m(symbol)
-        if ema_now is None or not (
-                ema_confirmed(pending_dir, ema_now, c2, c1, daily_candles[-1])
-                and ema_slope_ok(pending_dir, ema_now, ema_prior)):
-            print(f"  [{symbol}] EMA WAIT — still waiting for retest/2 closes + matching 200 EMA slope")
+        wait_lvl = highest_lvl if pending_dir == "short" else lowest_lvl
+        h4_close = fetch_last_4h_close(symbol)
+        if not h4_close_confirms(pending_dir, h4_close, wait_lvl):
+            print(f"  [{symbol}] 4H WAIT — still waiting for a 4h candle close beyond the level")
             return False
 
-        print(f"  [{symbol}] EMA CONFIRMED — {pending_dir.upper()} cleared 200 EMA={ema_now:.8g} "
-              f"with matching slope")
+        print(f"  [{symbol}] 4H CONFIRMED — {pending_dir.upper()} closed 4h candle beyond {wait_lvl:.8g}")
         direction    = pending_dir
         from_pending = True
 
@@ -833,36 +774,32 @@ def scan_symbol(symbol, all_state, global_positions, global_orders, slots_left):
     if direction == "short" and (tp >= entry or sl <= entry):
         print(f"  [{symbol}] SKIP ENTRY — invalid TP/SL geometry (short)")
         if from_pending:
-            st["ema_wait"] = None
+            st["h4_wait"] = None
         return False
     if direction == "long" and (tp <= entry or sl >= entry):
         print(f"  [{symbol}] SKIP ENTRY — invalid TP/SL geometry (long)")
         if from_pending:
-            st["ema_wait"] = None
+            st["h4_wait"] = None
         return False
 
-    # ── 200 EMA proximity gate (fresh signals only — a signal already
-    #    confirmed via ema_wait falls straight through) ───────────────────────
+    # ── 4h candle close confirmation (fresh signals only — a signal
+    #    already confirmed via h4_wait falls straight through) ───────────────
     if not from_pending:
-        ema_now, ema_prior = fetch_ema200_15m(symbol)
-        if ema_now is not None:
-            proximity_pct = abs(ema_now - crossed_lvl) / crossed_lvl * 100
-            if proximity_pct <= EMA_PROXIMITY_PCT and not (
-                    ema_confirmed(direction, ema_now, c2, c1, daily_candles[-1])
-                    and ema_slope_ok(direction, ema_now, ema_prior)):
-                print(f"  [{symbol}] EMA200={ema_now:.8g} within {proximity_pct:.2f}% of "
-                      f"{crossed_label} — holding for retest/2 closes + matching EMA slope")
-                st["ema_wait"] = direction
-                return False
+        h4_close = fetch_last_4h_close(symbol)
+        if not h4_close_confirms(direction, h4_close, crossed_lvl):
+            print(f"  [{symbol}] Waiting for a 4h candle close beyond {crossed_label} "
+                  f"@ {crossed_lvl:.8g} to confirm {direction.upper()}")
+            st["h4_wait"] = direction
+            return False
 
-    st["ema_wait"] = None
+    st["h4_wait"] = None
 
     if from_pending:
         print(f"  [{symbol}] SIGNAL {direction.upper()} — broke {crossed_label} @ {crossed_lvl:.8g}, "
-              f"200 EMA confirmed — placing retest limit")
+              f"4h close confirmed — placing retest limit")
     else:
         print(f"  [{symbol}] SIGNAL {direction.upper()} — broke {crossed_label} @ {crossed_lvl:.8g}, "
-              f"held 2 candles (c3={c3:.8g} c2={c2:.8g} c1={c1:.8g}) — placing retest limit")
+              f"held 2 candles (c3={c3:.8g} c2={c2:.8g} c1={c1:.8g}), 4h close confirmed — placing retest limit")
 
     result = place_order(symbol, direction, entry, tp, sl, precision,
                          crossed_label, crossed_lvl, tp_label)
@@ -894,8 +831,7 @@ send_telegram(
     f"⏳ Expiry: <code>{RETEST_EXPIRY_CANDLES} x 15m candles (then cancelled)</code>\n"
     f"🛑 SL    : <code>{SL_PCT}% beyond crossed level</code>\n"
     f"🎯 TP    : <code>Nearest level (max {TP_MAX_PCT}%) or {TP_MAX_PCT}%</code>\n"
-    f"📈 EMA   : <code>200 EMA(15m) gate if within {EMA_PROXIMITY_PCT}% of level -> "
-    f"wait for retest/2 closes + matching EMA slope</code>\n"
+    f"📈 Confirm: <code>Requires a 4h candle close beyond the crossed level</code>\n"
     f"📊 Max   : <code>{MAX_OPEN_TRADES} concurrent positions</code>\n"
     f"💰 <code>{CAPITAL_USDT} USDT x {LEVERAGE}x</code> | 🔁 <code>{SCAN_INTERVAL}s</code>"
 )
